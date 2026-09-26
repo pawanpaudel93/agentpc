@@ -4,7 +4,7 @@
 ![Platform: macOS on Apple Silicon](https://img.shields.io/badge/platform-macOS%20%7C%20Apple%20Silicon-lightgrey)
 ![MCP server](https://img.shields.io/badge/MCP-server-8A2BE2)
 
-**Disposable Windows 11 and Ubuntu desktops for AI agents, on your Mac.**
+**Disposable Windows 11 and Linux (Ubuntu 24.04) desktops for AI agents, on your Mac.**
 
 agentpc gives AI agents (Claude Code, Claude Desktop, Codex, Cursor, Gemini CLI, VS Code, or
 any MCP client) real desktop computers to work in: create a VM in about a second, let the agent click,
@@ -38,6 +38,10 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
   themselves. Works with any MCP client; `agentpc mcp-install` sets up the popular ones.
 - **Shell and screen access.** Run PowerShell or bash over SSH; take PNG screenshots straight
   from the hypervisor in ~40 ms, even while a guest is booting or hung.
+- **Files and ports.** Copy files and folders between your Mac and a VM, and reach servers
+  running inside a VM from your Mac.
+- **Agent-ready guests.** 1280x800 desktops with a browser (Edge on Windows, Chrome on Ubuntu)
+  and the pop-ups, update restarts and background jobs that interrupt unattended work turned off.
 - **Watch along.** Every VM has a browser viewer, so you can see what the agent is doing.
 - **Versioned images.** Each image records its OS version, source and build date; the
   Ubuntu image can be downloaded instead of built.
@@ -47,11 +51,11 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 
 | Requirement | Details |
 | --- | --- |
-| Hardware | Apple Silicon Mac (M1 or later) |
-| OS | macOS 14 or later (developed on macOS 15) |
+| Hardware | Apple Silicon Mac (M1 or later; tested on M4) |
+| OS | macOS 14 or later (tested on macOS 15) |
 | Runtime | [QEMU](https://www.qemu.org) from Homebrew (the installer handles it) |
 | Memory | 4 GB per running Ubuntu VM, 8 GB per running Windows VM |
-| Disk | ~8 GB for the Ubuntu image, ~30 GB for the Windows image (each including its snapshot) |
+| Disk | ~10 GB for the Ubuntu image, ~30 GB for the Windows image (each including its snapshot) |
 | Windows only | A Windows 11 ARM64 ISO from Microsoft; `colima` and `docker` for the first image build |
 
 ## Installation
@@ -84,7 +88,7 @@ To build from source instead, see [Development](#development).
 **Ubuntu:**
 
 ```sh
-agentpc create ubuntu        # first run downloads the image (~1.2 GB); then ~1 s per VM
+agentpc create ubuntu        # first run: downloads (~1.2 GB) and prepares the image; then ~1 s per VM
 ```
 
 **Windows:** Microsoft's license doesn't allow redistributing Windows images, so you build
@@ -148,17 +152,17 @@ pick the server up automatically.
 
 | Tool | Description |
 | --- | --- |
-| `vm_list` | VMs, their state, and the available images with their OS versions |
-| `vm_create` | Create a VM from an image and wait until its desktop is ready |
-| `vm_start` / `vm_stop` | Boot a stopped VM / shut one down cleanly |
-| `vm_reset` | Discard all changes: back to a fresh copy of the image |
-| `vm_delete` | Delete a VM and its disk |
-| `vm_screenshot` | PNG screenshot from the hypervisor |
-| `vm_exec` | Run a command: PowerShell on Windows, bash on Ubuntu |
-| `vm_upload` / `vm_download` | Copy files or folders between your Mac and a VM |
-| `vm_forward` | Reach a server running in a VM from your Mac |
-| `desktop_tools` | List the desktop-control tools inside a VM |
-| `desktop` | Call one of them: click, type, launch apps, read the UI tree, … |
+| `list_vms` | VMs, their state, and the available images with their OS versions |
+| `create_vm` | Create a VM from an image and wait until its desktop is ready |
+| `start_vm` / `stop_vm` | Boot a stopped VM / shut one down cleanly |
+| `reset_vm` | Discard all changes: back to a fresh copy of the image |
+| `delete_vm` | Delete a VM and its disk |
+| `take_screenshot` | PNG screenshot from the hypervisor |
+| `run_command` | Run a command: PowerShell on Windows, bash on Ubuntu |
+| `upload_file` / `download_file` | Copy files or folders between your Mac and a VM |
+| `forward_port` | Reach a server running in a VM from your Mac |
+| `list_desktop_tools` | List the desktop-control tools inside a VM |
+| `use_desktop_tool` | Call one of them: click, type, launch apps, read the UI tree, … |
 
 | Guest | Desktop | Desktop-control server |
 | --- | --- | --- |
@@ -268,7 +272,7 @@ The guest login is `agent` / `agent`.
   resume from that saved state instead of booting (~1 s / ~4 s instead of ~14 s / ~25 s). A
   `start` after `stop` is a normal boot; `reset` resumes a fresh copy again.
 - **Snapshots stay local.** A memory snapshot depends on the Mac's chip and QEMU version, so
-  only the disk is published; the snapshot is recaptured after each pull (~35 s).
+  only the disk is published; the snapshot is recaptured after each pull (about a minute).
 - **Image distribution.** Ubuntu images are OCI artifacts on GitHub Container Registry: a
   compressed qcow2 split into 512 MB parts, downloaded in parallel and checksum-verified.
 - **Windows build.** [dockur/windows-arm](https://github.com/dockur/windows-arm) prepares a setup
@@ -299,6 +303,8 @@ The guest login is `agent` / `agent`.
 - The desktop-control servers inside the VMs are unauthenticated; any process on your Mac can
   reach them.
 - Guests use the fixed login `agent` / `agent`.
+- To keep agents unblocked, Windows VMs have UAC prompts, SmartScreen and Windows Update turned
+  off. Don't use them for anything that needs those protections.
 - Treat VMs as disposable sandboxes, not as a place for secrets.
 
 ## Development
