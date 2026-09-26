@@ -190,10 +190,7 @@ pub fn doctor() -> Result<bool> {
         "",
     );
 
-    println!("windows image build only:");
-    // After a first build, dockur's setup.img is cached and colima no longer needed for that ISO.
-    let setup_img =
-        std::fs::read_dir(home().join("cache/windows-setup")).is_ok_and(|mut d| d.next().is_some());
+    println!("windows image build:");
     // Not required: image build downloads Microsoft's ISO when none is found.
     match find_windows_iso(Os::Windows.default_version(), None).filter(|p| p.is_file()) {
         Some(p) => println!("  ok   Windows ISO: {}", p.display()),
@@ -201,21 +198,6 @@ pub fn doctor() -> Result<bool> {
             "  ok   Windows ISO: none yet; image build downloads it from Microsoft (7.3 GB)"
         ),
     }
-    check(
-        "colima + docker (brew install colima docker)",
-        setup_img || (which("colima").is_some() && which("docker").is_some()),
-        "",
-    );
-    let cpu = Command::new("sysctl")
-        .args(["-n", "machdep.cpu.brand_string"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    check(
-        "M3 or newer (nested virt for dockur)",
-        setup_img || !(cpu.contains("M1") || cpu.contains("M2")),
-        "",
-    );
 
     println!("images:");
     let images = Image::all();

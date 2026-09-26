@@ -11,7 +11,7 @@ The plugin bundles:
 
 ## Requirements
 
-- An Apple Silicon Mac (M1 or later) running macOS 14 or later.
+- An Apple Silicon Mac (M1 or later) running a recent macOS (one QEMU supports).
 - The `agentpc` binary on your `PATH`:
 
   ```sh

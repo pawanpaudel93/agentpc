@@ -107,7 +107,7 @@ case ":$PATH:" in
     ;;
 esac
 
-# --- QEMU ------------------------------------------------------------------
+# --- QEMU (Homebrew) -------------------------------------------------------
 if ! has brew; then
   for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
     [ -x "$b" ] && eval "$("$b" shellenv)" && break
@@ -118,7 +118,7 @@ if has qemu-system-aarch64; then
   say "QEMU found: $(command -v qemu-system-aarch64)"
 else
   if ! has brew; then
-    say "QEMU is needed and comes from Homebrew, which is not installed."
+    say "QEMU comes from Homebrew, which is not installed."
     say "Installing Homebrew with its official installer; it asks for your macOS password once."
     if [ -r /dev/tty ]; then
       /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/tty

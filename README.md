@@ -52,11 +52,10 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 | Requirement | Details |
 | --- | --- |
 | Hardware | Apple Silicon Mac (M1 or later; tested on M4) |
-| OS | macOS 14 or later (tested on macOS 15) |
-| Runtime | [QEMU](https://www.qemu.org) from Homebrew (the installer handles it) |
+| OS | A macOS version QEMU supports: the current one and, for up to two years, the previous one (tested on macOS 15) |
+| Runtime | [QEMU](https://www.qemu.org) from Homebrew (the installer handles it, installing Homebrew too if needed) |
 | Memory | 4 GB per running Ubuntu VM, 8 GB per running Windows VM |
 | Disk | ~10 GB per Ubuntu image, ~30 GB per Windows image (each including its snapshot) |
-| Windows only | `colima` and `docker` for the first image build (the ISO is downloaded from Microsoft) |
 
 ## Installation
 
@@ -96,7 +95,6 @@ builds its own once. agentpc downloads the official Windows 11 ARM64 ISO from Mi
 (7.3 GB, checksum-verified) unless you already have one:
 
 ```sh
-brew install colima docker     # needed for the first build only
 agentpc image build windows    # once: download + ~12 min install; or pass --iso <path>
 agentpc create windows         # ~4 s per VM
 ```
@@ -292,7 +290,7 @@ The guest login is `agent` / `agent`.
 ## How it works
 
 - **Hypervisor.** VMs run in QEMU with Apple's Hypervisor.framework (HVF), natively on Apple
-  Silicon. No Docker or Linux VM sits in between.
+  Silicon, with nothing else in between.
 - **Instant start.** After building or downloading an image, agentpc boots it once, waits
   until the desktop and its control server are running, and saves the VM's memory. New VMs
   resume from that saved state instead of booting (~1 s / ~4 s instead of ~14 s / ~25 s). A
@@ -301,16 +299,15 @@ The guest login is `agent` / `agent`.
   only the disk is published; the snapshot is recaptured after each pull (about a minute).
 - **Image distribution.** Ubuntu images are OCI artifacts on GitHub Container Registry: a
   compressed qcow2 split into 512 MB parts, downloaded in parallel and checksum-verified.
-- **Windows build.** [dockur/windows-arm](https://github.com/dockur/windows-arm) prepares a setup
-  disk once (unattended-install answer file and ARM virtio drivers); a first-logon script
-  installs OpenSSH and Windows-MCP.
+- **Windows build.** agentpc writes a small setup disk next to the ISO: an unattended-install
+  answer file (adapted from [dockur/windows-arm](https://github.com/dockur/windows-arm)), Red
+  Hat's ARM64 virtio drivers, and a first-logon script that installs OpenSSH and Windows-MCP.
+  Windows Setup then runs in QEMU with no clicks.
 - **Ubuntu build.** The official cloud image is provisioned with cloud-init: XFCE on X11,
   auto-login, and cua-driver. cloud-init is then disabled so clones don't re-provision.
 - **Agent-ready guests.** Each time a snapshot is captured, a prepare script turns off what
   interrupts unattended work (Windows SmartScreen, updates, first-run and tip pop-ups; Ubuntu's
   background apt jobs) and installs Google Chrome on Ubuntu for cua-driver's browser tools.
-- **Why not Docker?** dockur can't run Windows on a Mac: Apple's virtualization gives nested
-  VMs no performance-monitoring unit, and Windows ARM hangs at boot without one.
 
 ## Troubleshooting
 
@@ -322,8 +319,6 @@ The guest login is `agent` / `agent`.
 - **A VM is in a bad state:** `agentpc reset <name>`.
 - **`image build`/`pull`/`rm` refuses:** VMs still depend on that image; `agentpc rm` them
   first.
-- **Windows build can't read the ISO:** dockur runs in colima, which only shares your home
-  folder; keep `--iso` files (and `AGENTPC_HOME`) under it.
 
 ## Security
 

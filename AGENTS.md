@@ -56,8 +56,9 @@ Rules:
   `viewer` (browser viewer), `image` (build/snapshot), `registry` (pull/push), `setup` (`doctor`, `mcp-install`), `mcp` (the server).
 - Ports derive from the instance slot n: SSH 2200+n, Windows-MCP 8000+n, VNC 5910+n,
   VNC websocket 5700+n; the shared browser viewer is on 8100.
-- Guest assets in `guests/` are embedded in the binary. `guests/windows/oem/setup.ps1` runs
-  at first logon of a Windows image build; `guests/ubuntu/user-data` is the Ubuntu cloud-init.
+- Guest assets in `guests/` are embedded in the binary. A Windows build writes them to a
+  FAT `setup.img`: `Autounattend.xml` drives Setup, `SetupComplete.cmd` runs after it, and
+  `oem/setup.ps1` runs at first logon; `guests/ubuntu/user-data` is the Ubuntu cloud-init.
   `guests/<os>/prepare.*` runs in the guest every time a snapshot is captured (agent defaults:
   no pop-ups or updates, Chrome on Ubuntu), so it also upgrades existing and pulled images.
   Changes take effect on the next `agentpc image build`, which refuses while VMs of that image exist.
@@ -68,4 +69,4 @@ Rules:
   "Using the VMs" section above; check with `claude plugin validate plugin --strict`.
 - Verify with `cargo clippy -- -D warnings` plus a real instance (`agentpc create ubuntu`, then
   the MCP tools). Unit tests can't cover the VM paths.
-- Never commit `target/` or `.state/`.
+- Never commit `target/`.

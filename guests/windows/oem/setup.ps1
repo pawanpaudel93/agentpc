@@ -1,4 +1,4 @@
-# Runs once, at the end of dockur's unattended install (first logon).
+# Runs once, at the end of the unattended install (first logon).
 $ErrorActionPreference = 'Continue'
 Start-Transcript -Path C:\OEM\setup.log -Append
 

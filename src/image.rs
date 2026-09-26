@@ -29,8 +29,8 @@ pub(crate) struct WinIso {
 /// The Windows versions `image build` can download (en-us; others need --iso). Microsoft
 /// only serves its current ARM64 ISOs, so older releases come from archive mirrors. Left out:
 /// Microsoft's evaluation ISOs (they install already expired and shut down every hour),
-/// Windows 10 (its ARM64 build hangs at boot on Apple Silicon) and LTSC (dockur's answer
-/// file doesn't install it).
+/// Windows 10 (its ARM64 build hangs at boot on Apple Silicon) and LTSC (the answer file's
+/// generic Pro key doesn't install it).
 pub(crate) const WINDOWS_ISOS: [WinIso; 3] = [
     WinIso {
         version: "11",
@@ -61,8 +61,8 @@ pub(crate) const WINDOWS_ISOS: [WinIso; 3] = [
 
 const UBUNTU_PREPARE: &str = include_str!("../guests/ubuntu/prepare.sh");
 const WIN_PREPARE: &str = include_str!("../guests/windows/prepare.ps1");
-const WIN_COMPOSE: &str = include_str!("../guests/windows/compose.yaml");
-const WIN_COMPOSE_ISO: &str = include_str!("../guests/windows/compose.iso.yaml");
+const WIN_AUTOUNATTEND: &str = include_str!("../guests/windows/Autounattend.xml");
+const WIN_SETUP_COMPLETE: &[u8] = include_bytes!("../guests/windows/SetupComplete.cmd");
 const WIN_OEM: [(&str, &[u8]); 2] = [
     (
         "install.bat",
@@ -73,9 +73,6 @@ const WIN_OEM: [(&str, &[u8]); 2] = [
         include_bytes!("../guests/windows/oem/setup.ps1"),
     ),
 ];
-
-const COLIMA_PROFILE: &str = "agentpc";
-const DOCKER_CTX: &str = "colima-agentpc";
 
 pub fn build(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     let os = image.os;
@@ -641,20 +638,10 @@ fn download_windows_iso(w: &WinIso) -> Result<PathBuf> {
     Ok(dest)
 }
 
-/// dockur's answer file picks the edition from the ISO, so setup.img is cached per ISO.
-pub(crate) fn windows_setup_img_path(iso: &Path) -> PathBuf {
-    let name = iso.file_stem().unwrap_or_default().to_string_lossy();
-    cache_dir()
-        .join("windows-setup")
-        .join(format!("{name}.img"))
-}
-
 fn build_windows(inst: &Instance, iso: &Path) -> Result<()> {
     let iso = std::fs::canonicalize(iso)?;
-    windows_setup_img(&iso)?;
     let setup = inst.dir.join("setup.img");
-    std::fs::copy(windows_setup_img_path(&iso), &setup)?;
-    windows_refresh_oem(&setup)?;
+    windows_setup_img(&setup)?;
     run(
         "qemu-img",
         &[
@@ -681,157 +668,99 @@ fn build_windows(inst: &Instance, iso: &Path) -> Result<()> {
         "usb-storage,drive=boot,bootindex=9,removable=on".into(),
     ];
     qemu::start_windows_installer(inst, &extra)?;
-    // Answer "Press any key to boot from CD". Keep it short: once setup's UI is up,
-    // Enter lands on its focused Cancel button.
-    for _ in 0..15 {
-        let _ = qemu::Qmp::connect(inst).and_then(|mut q| q.send_key("ret"));
-        std::thread::sleep(Duration::from_secs(1));
-    }
+    answer_cd_prompt(inst);
     log!("installing Windows (~12 min)");
     let took = wait_ready(inst, Duration::from_secs(5400))?;
     log!("{} ready in {}s", inst.name, took.as_secs());
     Ok(())
 }
 
-/// dockur builds Autounattend.xml + ARM virtio drivers into setup.img; only needed once.
-fn windows_setup_img(iso: &Path) -> Result<()> {
-    let out = windows_setup_img_path(iso);
-    if out.is_file() {
-        return Ok(());
-    }
-    // colima shares only the home folder with its VM, so dockur can't see an ISO elsewhere.
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    if !iso.starts_with(&home) {
-        bail!(
-            "the ISO must be inside your home folder for dockur to read it: {}",
-            iso.display()
-        );
-    }
-    std::fs::create_dir_all(out.parent().unwrap())?;
-    let status = Command::new("colima")
-        .args(["status", "-p", COLIMA_PROFILE])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    if !status.is_ok_and(|s| s.success()) {
-        // `colima start` switches the default docker context; put the user's back.
-        let prev = Command::new("docker")
-            .args(["context", "show"])
-            .output()
-            .context("run docker")?;
-        let prev = String::from_utf8_lossy(&prev.stdout).trim().to_string();
-        run(
-            "colima",
-            &[
-                "start",
-                COLIMA_PROFILE,
-                "--vm-type",
-                "vz",
-                "--nested-virtualization",
-                "--cpus",
-                "2",
-                "--memory",
-                "4",
-                "--disk",
-                "60",
-            ],
-        )?;
-        if !prev.is_empty() {
-            let _ = Command::new("docker")
-                .args(["context", "use", &prev])
-                .stdout(Stdio::null())
-                .status();
-        }
-    }
-
-    // Compose resolves ./oem relative to the compose file, so lay the assets out together.
-    let dir = cache_dir().join("guests/windows");
-    std::fs::create_dir_all(dir.join("oem"))?;
-    std::fs::write(dir.join("compose.yaml"), WIN_COMPOSE)?;
-    std::fs::write(dir.join("compose.iso.yaml"), WIN_COMPOSE_ISO)?;
-    for (name, body) in WIN_OEM {
-        std::fs::write(dir.join("oem").join(name), body)?;
-    }
-    let compose = |args: &[&str]| {
-        let mut c = Command::new("docker");
-        c.args(["--context", DOCKER_CTX, "compose", "-f"])
-            .arg(dir.join("compose.yaml"))
-            .arg("-f")
-            .arg(dir.join("compose.iso.yaml"))
-            .args(args)
-            .env("WIN_ISO", iso);
-        c
+/// Answer the ISO's "Press any key to boot from CD" prompt. Keys go only in the few seconds
+/// after the firmware starts the ISO: once Setup's window is up, Enter lands on its Cancel
+/// button, and a cached ISO gets there in about 10 s.
+fn answer_cd_prompt(inst: &Instance) {
+    let serial = inst.dir.join("serial.log");
+    let started = || {
+        std::fs::read(&serial).is_ok_and(|b| {
+            String::from_utf8_lossy(&b)
+                .lines()
+                .any(|l| l.contains("BdsDxe: starting") && l.contains("USB"))
+        })
     };
-    let _ = compose(&["down", "-v"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    if !compose(&["up", "-d"])
-        .status()
-        .context("run docker compose")?
-        .success()
-    {
-        bail!("docker compose up failed");
-    }
-    log!("waiting for dockur to write setup.img");
-    loop {
-        let st = Command::new("docker")
-            .args([
-                "--context",
-                DOCKER_CTX,
-                "exec",
-                "agentpc-windows",
-                "test",
-                "-f",
-                "/run/shm/qemu.pid",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if st.is_ok_and(|s| s.success()) {
+    for _ in 0..120 {
+        if started() {
             break;
         }
-        let running = Command::new("docker")
-            .args([
-                "--context",
-                DOCKER_CTX,
-                "inspect",
-                "-f",
-                "{{.State.Running}}",
-                "agentpc-windows",
-            ])
-            .output()
-            .is_ok_and(|o| o.stdout.starts_with(b"true"));
-        if !running {
-            bail!(
-                "dockur stopped before writing setup.img; see: docker --context {DOCKER_CTX} \
-                 logs agentpc-windows"
-            );
-        }
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(250));
     }
-    let part = out.with_extension("img.part");
-    run(
-        "docker",
-        &[
-            "--context",
-            DOCKER_CTX,
-            "cp",
-            "agentpc-windows:/storage/setup.img",
-            &part.to_string_lossy(),
-        ],
-    )?;
-    std::fs::rename(&part, &out)?;
-    let _ = compose(&["down", "-v"]).stdout(Stdio::null()).status();
-    run("colima", &["stop", COLIMA_PROFILE])
+    for _ in 0..6 {
+        let _ = qemu::Qmp::connect(inst).and_then(|mut q| q.send_key("ret"));
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
-/// Put the embedded OEM payload (+ SSH public key) into setup.img's `C:\OEM`.
-fn windows_refresh_oem(img: &Path) -> Result<()> {
+/// Red Hat's virtio-win drivers for ARM64, as packaged (and tested) by dockur/windows-arm.
+const VIRTIO_VERSION: &str = "0.1.285";
+const VIRTIO_URL: &str =
+    "https://github.com/qemus/virtiso-arm/releases/download/v0.1.285-1/virtio-win-0.1.285.tar.xz";
+const VIRTIO_SHA256: &str = "c6712f8d5730c09c1212be9fc3baa18b78534f3c8c136cf02b2cca46515ca310";
+const VIRTIO_DRIVERS: [&str; 9] = [
+    "Balloon",
+    "NetKVM",
+    "viogpudo",
+    "vioinput",
+    "viomem",
+    "viorng",
+    "vioscsi",
+    "vioserial",
+    "viostor",
+];
+
+/// The virtio drivers, downloaded and unpacked once into the cache.
+fn virtio_drivers() -> Result<PathBuf> {
+    let dir = cache_dir().join(format!("virtio-win-{VIRTIO_VERSION}"));
+    if dir.is_dir() {
+        return Ok(dir);
+    }
+    std::fs::create_dir_all(cache_dir())?;
+    let archive = dir.with_extension("tar.xz");
+    log!("downloading the virtio drivers for Windows");
+    run(
+        "curl",
+        &["-fsSL", "-o", &archive.to_string_lossy(), VIRTIO_URL],
+    )?;
+    if sha256_file(&archive)? != VIRTIO_SHA256 {
+        let _ = std::fs::remove_file(&archive);
+        bail!("virtio driver checksum mismatch");
+    }
+    let tmp = dir.with_extension("tmp");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)?;
+    run(
+        "tar",
+        &[
+            "-xJf",
+            &archive.to_string_lossy(),
+            "-C",
+            &tmp.to_string_lossy(),
+        ],
+    )?;
+    // The archive's folders are read-only, which would stop `rm -rf ~/.agentpc`.
+    run("chmod", &["-R", "u+w", &tmp.to_string_lossy()])?;
+    std::fs::rename(&tmp, &dir)?;
+    std::fs::remove_file(&archive)?;
+    Ok(dir)
+}
+
+/// Write setup.img, the FAT disk Windows Setup reads next to the ISO: the answer file,
+/// the drivers it needs to see the virtio disk and network, and the first-logon payload.
+fn windows_setup_img(img: &Path) -> Result<()> {
+    let drivers = virtio_drivers()?;
+    std::fs::File::create(img)?.set_len(64 << 20)?;
     let out = Command::new("hdiutil")
         .args([
             "attach",
-            "-nobrowse",
+            "-nomount",
             "-imagekey",
             "diskimage-class=CRawDiskImage",
         ])
@@ -845,39 +774,76 @@ fn windows_refresh_oem(img: &Path) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let dev = text
+    let dev = String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .next()
         .context("hdiutil attach: no device")?
         .to_string();
-    let mnt = text
-        .lines()
-        .filter(|l| l.contains("/Volumes"))
-        .filter_map(|l| l.split('\t').next_back())
-        .map(|m| PathBuf::from(m.trim()))
-        .next();
-    let copied = (|| -> Result<()> {
-        let mnt = mnt.context("hdiutil attach: no mounted volume")?;
-        let oem = mnt.join("$OEM$/$1/OEM");
-        if !oem.is_dir() {
-            bail!("{} missing in setup.img", oem.display());
+    let mnt = img.with_extension("mnt");
+    let filled = (|| -> Result<()> {
+        let quiet = |cmd: &str, args: &[&str]| -> Result<()> {
+            let o = Command::new(cmd)
+                .args(args)
+                .output()
+                .with_context(|| format!("run {cmd}"))?;
+            if !o.status.success() {
+                bail!(
+                    "{cmd} failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+            }
+            Ok(())
+        };
+        // One sector per cluster keeps a 64 MB volume above FAT32's minimum cluster count.
+        quiet("newfs_msdos", &["-F", "32", "-c", "1", "-v", "SETUP", &dev])?;
+        std::fs::create_dir_all(&mnt)?;
+        quiet(
+            "diskutil",
+            &["mount", "-mountPoint", &mnt.to_string_lossy(), &dev],
+        )?;
+        std::fs::write(mnt.join("Autounattend.xml"), WIN_AUTOUNATTEND)?;
+        for name in VIRTIO_DRIVERS {
+            let src = drivers.join(name).join("w11/ARM64");
+            copy_files(&src, &mnt.join("$OEM$/$$/Drivers").join(name))?;
+            // The display driver waits for SetupComplete.cmd: installed during setup, it
+            // can disrupt the steps that follow.
+            if name != "viogpudo" {
+                copy_files(&src, &mnt.join("$WinPEDriver$").join(name))?;
+            }
         }
+        let scripts = mnt.join("$OEM$/$$/Setup/Scripts");
+        std::fs::create_dir_all(&scripts)?;
+        std::fs::write(scripts.join("SetupComplete.cmd"), WIN_SETUP_COMPLETE)?;
+        let oem = mnt.join("$OEM$/$1/OEM");
+        std::fs::create_dir_all(&oem)?;
         for (name, body) in WIN_OEM {
             std::fs::write(oem.join(name), body)?;
         }
         std::fs::copy(public_key(), oem.join("authorized_keys")).context("copy SSH public key")?;
-        // FAT can't hold macOS xattrs, so they land as ._* files that would ship to C:\OEM.
-        let _ = Command::new("dot_clean").arg("-m").arg(&oem).status();
+        // FAT can't hold macOS xattrs, so they'd land as ._* files and ship to the guest.
+        let _ = Command::new("dot_clean").arg("-m").arg(&mnt).status();
         Ok(())
     })();
     let detached = Command::new("hdiutil")
         .args(["detach", &dev])
         .stdout(Stdio::null())
         .status();
-    copied?;
+    let _ = std::fs::remove_dir(&mnt);
+    filled?;
     if !detached.is_ok_and(|s| s.success()) {
         bail!("hdiutil detach {dev} failed");
+    }
+    Ok(())
+}
+
+/// Copy the files (not subdirectories) of `src` into `dst`.
+fn copy_files(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for e in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let e = e?;
+        if e.file_type()?.is_file() {
+            std::fs::copy(e.path(), dst.join(e.file_name()))?;
+        }
     }
     Ok(())
 }
@@ -1022,12 +988,12 @@ mod tests {
         );
     }
 
-    /// Needs hdiutil and a dockur setup.img: set AGENTPC_TEST_SETUP_IMG to a scratch COPY
-    /// and AGENTPC_HOME to a dir holding id_ed25519.pub.
+    /// Downloads the virtio drivers and writes setup.img with hdiutil; run with AGENTPC_HOME
+    /// set to a scratch dir holding id_ed25519.pub.
     #[test]
     #[ignore]
-    fn refresh_oem_on_setup_img_copy() {
-        let img = std::path::PathBuf::from(std::env::var("AGENTPC_TEST_SETUP_IMG").unwrap());
-        super::windows_refresh_oem(&img).unwrap();
+    fn writes_setup_img() {
+        let home = std::path::PathBuf::from(std::env::var("AGENTPC_HOME").unwrap());
+        super::windows_setup_img(&home.join("setup.img")).unwrap();
     }
 }
