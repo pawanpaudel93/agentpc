@@ -56,7 +56,7 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 | Runtime | [QEMU](https://www.qemu.org) from Homebrew (the installer handles it) |
 | Memory | 4 GB per running Ubuntu VM, 8 GB per running Windows VM |
 | Disk | ~10 GB for the Ubuntu image, ~30 GB for the Windows image (each including its snapshot) |
-| Windows only | A Windows 11 ARM64 ISO from Microsoft; `colima` and `docker` for the first image build |
+| Windows only | `colima` and `docker` for the first image build (the ISO is downloaded from Microsoft) |
 
 ## Installation
 
@@ -91,13 +91,14 @@ To build from source instead, see [Development](#development).
 agentpc create ubuntu        # first run: downloads (~1.2 GB) and prepares the image; then ~1 s per VM
 ```
 
-**Windows:** Microsoft's license doesn't allow redistributing Windows images, so you build
-yours once from a Windows 11 ARM64 ISO:
+**Windows:** Microsoft's license doesn't allow redistributing Windows images, so each Mac
+builds its own once. agentpc downloads the official Windows 11 ARM64 ISO from Microsoft
+(7.3 GB, checksum-verified) unless you already have one:
 
 ```sh
-brew install colima docker                                  # needed for the first build only
-agentpc image build windows --iso ~/Downloads/<file>.iso   # once, ~12 min
-agentpc create windows                                      # ~4 s per VM
+brew install colima docker     # needed for the first build only
+agentpc image build windows    # once: download + ~12 min install; or pass --iso <path>
+agentpc create windows         # ~4 s per VM
 ```
 
 Then ask your agent something like:
@@ -194,7 +195,7 @@ pick the server up automatically.
 | Command | Description |
 | --- | --- |
 | `agentpc image pull ubuntu [--tag 24.04]` | Download the published Ubuntu image |
-| `agentpc image build <os> [--iso <path>]` | Build an image locally (Ubuntu ~3 min, Windows ~12 min) |
+| `agentpc image build <os> [--iso <path>]` | Build an image locally (Ubuntu ~3 min, Windows ~12 min + ISO download) |
 | `agentpc image ls` | List local images with their OS versions |
 | `agentpc image info <os>` | Version, source, build date and desktop server of an image |
 | `agentpc image rm <os>` | Delete a local image |
@@ -217,7 +218,7 @@ copy-on-write clone of an image, so a VM starts from a clean install and costs o
 | OS | How to get it | Source |
 | --- | --- | --- |
 | Ubuntu | `agentpc image pull ubuntu` (automatic on first `create`) or `agentpc image build ubuntu` | Official Ubuntu 24.04 cloud image |
-| Windows | `agentpc image build windows --iso <path>` | Your Windows 11 ARM64 ISO |
+| Windows | `agentpc image build windows` | Official Windows 11 ARM64 ISO, downloaded from Microsoft (or `--iso <path>`) |
 
 Each image records what it is (`agentpc image info <os>`):
 
@@ -250,7 +251,7 @@ Only Ubuntu is published (Windows images can't be redistributed):
 | --- | --- | --- |
 | `AGENTPC_HOME` | `~/.agentpc` | Where images, VMs, keys and caches live |
 | `AGENTPC_IMAGE_REPO` | `ghcr.io/pawanpaudel93/agentpc` | Package for `image pull`/`push` (tags `<os>`, `<os>-<version>`, …) |
-| `WIN_ISO` | `~/Downloads/*A64FRE*.iso` | Windows ISO used by `image build windows` without `--iso` |
+| `WIN_ISO` | `~/Downloads/*A64FRE*.iso`, else a download | Windows ISO used by `image build windows` without `--iso` |
 
 Each VM gets its own ports on `127.0.0.1`, derived from its slot number `n`:
 

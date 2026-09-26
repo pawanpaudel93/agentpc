@@ -31,8 +31,8 @@ Then ask Claude something like *"Create an Ubuntu VM and check that my install s
 a clean machine."*
 
 The first Ubuntu VM downloads the Ubuntu image (~1.2 GB). Windows images can't be
-redistributed, so build yours once from a Windows 11 ARM64 ISO:
-`agentpc image build windows --iso <path>`.
+redistributed, so build yours once with `agentpc image build windows`, which downloads the
+official ISO from Microsoft.
 
 ## More
 

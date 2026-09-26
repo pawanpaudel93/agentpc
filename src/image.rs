@@ -17,6 +17,12 @@ const UBUNTU_IMG_URL: &str =
 
 // Guest assets ship inside the binary: an installed agentpc has no repo next to it.
 const UBUNTU_USER_DATA: &str = include_str!("../guests/ubuntu/user-data");
+/// The official Windows 11 ARM64 ISO on Microsoft's download servers, with the checksum and
+/// size dockur/windows-arm records for it. Used when no ISO is given.
+const WIN_ISO_URL: &str = "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_a64fre_en-us.iso";
+const WIN_ISO_SHA256: &str = "32cde0071ed8086b29bb6c8c3bf17ba9e3cdf43200537434a811a9b6cc2711a1";
+const WIN_ISO_SIZE: u64 = 7_299_147_776;
+
 const UBUNTU_PREPARE: &str = include_str!("../guests/ubuntu/prepare.sh");
 const WIN_PREPARE: &str = include_str!("../guests/windows/prepare.ps1");
 const WIN_COMPOSE: &str = include_str!("../guests/windows/compose.yaml");
@@ -51,11 +57,14 @@ pub fn build(os: Os, iso: Option<PathBuf>) -> Result<()> {
         }
         std::fs::remove_dir_all(instances_dir().join(&name))?;
     }
+    let iso_path = match os {
+        Os::Windows => Some(windows_iso(iso)?),
+        Os::Ubuntu => None,
+    };
     let inst = Instance::create(&name, os, 0)?;
-    let iso_path = find_windows_iso(iso.clone());
-    match os {
-        Os::Windows => build_windows(&inst, iso)?,
-        Os::Ubuntu => build_ubuntu(&inst)?,
+    match &iso_path {
+        Some(iso) => build_windows(&inst, iso)?,
+        None => build_ubuntu(&inst)?,
     }
     // Bake the defaults into the image too, so the prepare step at snapshot time (after a
     // pull, say) finds them in place instead of redoing slow work like installing Chrome.
@@ -353,16 +362,22 @@ fn describe_iso(name: &str) -> String {
         _ => "",
     };
     let major = if build_no >= 22000 { "11" } else { "10" };
-    let arch = if stem.contains("A64FRE") {
+    let upper = stem.to_ascii_uppercase();
+    let arch = if upper.contains("A64FRE") {
         "ARM64"
-    } else if stem.contains("X64FRE") {
+    } else if upper.contains("X64FRE") {
         "x64"
     } else {
         "unknown arch"
     };
+    // "CLIENTCONSUMER" in older names, "CLIENT_CONSUMER" in newer ones.
     let editions = parts
         .iter()
-        .find_map(|p| p.strip_prefix("CLIENT"))
+        .position(|p| p.to_ascii_uppercase().starts_with("CLIENT"))
+        .and_then(|i| match &parts[i][6..] {
+            "" => parts.get(i + 1).copied(),
+            rest => Some(rest),
+        })
         .map(|e| format!(", {} editions", e.to_lowercase()))
         .unwrap_or_default();
     let lang = parts
@@ -471,34 +486,84 @@ fn create_vars(inst: &Instance) -> Result<()> {
 }
 
 /// `--iso`, else `$WIN_ISO`, else the first `~/Downloads/*A64FRE*.iso`.
+/// A Windows ISO already on this Mac: `--iso`, `$WIN_ISO`, `~/Downloads/*A64FRE*.iso`, or an
+/// earlier download. An explicitly named path is returned even if it doesn't exist.
 pub(crate) fn find_windows_iso(iso: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(p) = iso.or_else(|| std::env::var_os("WIN_ISO").map(PathBuf::from)) {
         return Some(p);
     }
     let downloads = PathBuf::from(std::env::var_os("HOME")?).join("Downloads");
     let mut isos: Vec<PathBuf> = std::fs::read_dir(downloads)
-        .ok()?
+        .into_iter()
+        .flatten()
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("A64FRE") && n.ends_with(".iso"))
+                .is_some_and(|n| n.to_ascii_lowercase().contains("a64fre") && n.ends_with(".iso"))
         })
         .collect();
     isos.sort();
-    isos.into_iter().next()
+    isos.into_iter()
+        .next()
+        .or_else(|| Some(downloaded_iso_path()).filter(|p| p.is_file()))
+}
+
+fn downloaded_iso_path() -> PathBuf {
+    cache_dir().join(
+        WIN_ISO_URL
+            .rsplit('/')
+            .next()
+            .unwrap_or("windows11-arm64.iso"),
+    )
+}
+
+/// The ISO to install from, downloading Microsoft's official one if none is on this Mac.
+fn windows_iso(iso: Option<PathBuf>) -> Result<PathBuf> {
+    match find_windows_iso(iso) {
+        Some(p) if p.is_file() => Ok(p),
+        Some(p) => bail!("Windows ISO {} not found", p.display()),
+        None => download_windows_iso(),
+    }
+}
+
+fn download_windows_iso() -> Result<PathBuf> {
+    let dest = downloaded_iso_path();
+    let part = dest.with_extension("iso.part");
+    std::fs::create_dir_all(cache_dir())?;
+    log!(
+        "downloading Windows 11 ARM64 from Microsoft ({:.1} GB, resumable)",
+        WIN_ISO_SIZE as f64 / 1e9
+    );
+    let st = Command::new("curl")
+        .args(["-fL", "--retry", "3", "-C", "-", "-#", "-o"])
+        .arg(&part)
+        .arg(WIN_ISO_URL)
+        .status()
+        .context("run curl")?;
+    if !st.success() {
+        bail!("downloading the Windows ISO failed; pass --iso <Windows 11 ARM64 ISO> instead");
+    }
+    let size = std::fs::metadata(&part)?.len();
+    if size != WIN_ISO_SIZE {
+        bail!("Windows ISO download is {size} bytes, expected {WIN_ISO_SIZE}; rerun to resume");
+    }
+    log!("verifying the Windows ISO checksum");
+    if sha256_file(&part)? != WIN_ISO_SHA256 {
+        let _ = std::fs::remove_file(&part);
+        bail!("Windows ISO checksum mismatch; the partial file was removed, rerun to retry");
+    }
+    std::fs::rename(&part, &dest)?;
+    Ok(dest)
 }
 
 pub(crate) fn windows_setup_img_path() -> PathBuf {
     cache_dir().join("windows-setup.img")
 }
 
-fn build_windows(inst: &Instance, iso: Option<PathBuf>) -> Result<()> {
-    let iso = find_windows_iso(iso).filter(|p| p.is_file()).context(
-        "no Windows 11 ARM64 ISO: pass --iso, set WIN_ISO, or put *A64FRE*.iso in ~/Downloads",
-    )?;
-    let iso = std::fs::canonicalize(&iso)?;
+fn build_windows(inst: &Instance, iso: &Path) -> Result<()> {
+    let iso = std::fs::canonicalize(iso)?;
     windows_setup_img(&iso)?;
     let setup = inst.dir.join("setup.img");
     std::fs::copy(windows_setup_img_path(), &setup)?;
@@ -806,6 +871,18 @@ fn promote_image(inst: &Instance) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Downloads the 7.3 GB Windows ISO from Microsoft; run with AGENTPC_HOME set to a scratch dir.
+    #[test]
+    #[ignore]
+    fn downloads_windows_iso() {
+        assert!(
+            std::env::var_os("AGENTPC_HOME").is_some(),
+            "set AGENTPC_HOME to a scratch dir"
+        );
+        let iso = super::download_windows_iso().unwrap();
+        assert_eq!(std::fs::metadata(iso).unwrap().len(), super::WIN_ISO_SIZE);
+    }
+
     #[test]
     fn describes_microsoft_iso_names() {
         assert_eq!(
@@ -813,6 +890,12 @@ mod tests {
                 "26100.4349.250607-1500.ge_release_svc_refresh_CLIENTCONSUMER_RET_A64FRE_en-us.iso"
             ),
             "Windows 11 24H2 ISO, ARM64, consumer editions, build 26100.4349, en-us"
+        );
+        assert_eq!(
+            super::describe_iso(
+                "26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_a64fre_en-us.iso"
+            ),
+            "Windows 11 25H2 ISO, ARM64, consumer editions, build 26200.6584, en-us"
         );
         assert_eq!(
             super::describe_iso("my-windows.iso"),

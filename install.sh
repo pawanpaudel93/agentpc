@@ -155,8 +155,8 @@ Next steps:
   agentpc create ubuntu        # first run downloads the Ubuntu image; then ~1 s per VM
   Then ask your agent, e.g. "open a terminal on ubuntu-1 and run uname -a".
 
-  Windows: download a Windows 11 ARM64 ISO from Microsoft, then
-  agentpc image build windows --iso ~/Downloads/<file>.iso   # once, ~12 min
+  Windows (downloads the official ISO from Microsoft):
+  agentpc image build windows   # once, ~12 min + 7.3 GB download
 
 Docs: https://github.com/$REPO
 EOF

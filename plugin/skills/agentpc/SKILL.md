@@ -73,6 +73,6 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 - The first `create_vm ubuntu` downloads the Ubuntu image (~1.2 GB).
 - Windows images can't be downloaded. If `list_vms` shows no Windows image, ask the user to
   build one once (~12 min) and don't start it yourself:
-  `agentpc image build windows --iso <Windows 11 ARM64 ISO>`.
+  `agentpc image build windows` (downloads the official ISO from Microsoft, 7.3 GB).
 - Don't put real credentials or secrets into a VM. The guest login is `agent` / `agent`, and
   the VMs are reachable from anything on the Mac.

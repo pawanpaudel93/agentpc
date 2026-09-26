@@ -39,7 +39,7 @@ Rules:
 - Don't create instances you won't use, and `delete_vm` scratch instances when done.
   Each running VM takes 4 GB (ubuntu) or 8 GB (windows) of RAM.
 - `create_vm ubuntu` downloads the Ubuntu image on first use (~1.2 GB). A Windows image must
-  be built by the user once: `agentpc image build windows --iso <Win11 ARM64 ISO>` (~12 min).
+  be built by the user once: `agentpc image build windows` (downloads the ISO; ~12 min).
   If `list_vms` shows no windows image, ask the user to run that. Don't start a build
   yourself unless asked.
 - The login for both guests is `agent` / `agent`. Everything binds to 127.0.0.1.

@@ -192,11 +192,13 @@ pub fn doctor() -> Result<bool> {
 
     println!("windows image build only:");
     let setup_img = windows_setup_img_path().is_file();
-    check(
-        "Windows 11 ARM64 ISO (--iso, WIN_ISO or ~/Downloads/*A64FRE*.iso)",
-        find_windows_iso(None).is_some_and(|p| p.is_file()),
-        &format!("or an existing {}", windows_setup_img_path().display()),
-    );
+    // Not required: image build downloads Microsoft's ISO when none is found.
+    match find_windows_iso(None).filter(|p| p.is_file()) {
+        Some(p) => println!("  ok   Windows ISO: {}", p.display()),
+        None => println!(
+            "  ok   Windows ISO: none yet; image build downloads it from Microsoft (7.3 GB)"
+        ),
+    }
     check(
         "colima + docker (brew install colima docker)",
         setup_img || (which("colima").is_some() && which("docker").is_some()),
