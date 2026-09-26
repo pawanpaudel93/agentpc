@@ -11,7 +11,7 @@ use crate::{log, qemu, viewer};
 
 /// Session env for cua-driver: the Ubuntu autologin X session and its AT-SPI bus.
 pub const UBUNTU_SESSION_ENV: &str = "DISPLAY=:0 XAUTHORITY=/home/agent/.Xauthority \
-     DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus";
+     XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus";
 
 pub const SSH_OPTS: [&str; 10] = [
     "-o",
@@ -38,6 +38,83 @@ pub fn ssh_args(inst: &Instance, remote: &str) -> Vec<String> {
     a.push("agent@127.0.0.1".into());
     a.push(remote.into());
     a
+}
+
+/// Copy a file or directory into the VM. A relative `guest` path is under the agent's home.
+pub fn upload(inst: &Instance, host: &Path, guest: &str) -> Result<String> {
+    if !host.exists() {
+        bail!("{} does not exist", host.display());
+    }
+    scp(
+        inst,
+        &host.to_string_lossy(),
+        &format!("agent@127.0.0.1:{guest}"),
+    )?;
+    Ok(format!(
+        "copied {} to {}:{guest}",
+        host.display(),
+        inst.name
+    ))
+}
+
+/// Copy a file or directory out of the VM.
+pub fn download(inst: &Instance, guest: &str, host: &Path) -> Result<String> {
+    scp(
+        inst,
+        &format!("agent@127.0.0.1:{guest}"),
+        &host.to_string_lossy(),
+    )?;
+    Ok(format!(
+        "copied {}:{guest} to {}",
+        inst.name,
+        host.display()
+    ))
+}
+
+fn scp(inst: &Instance, from: &str, to: &str) -> Result<()> {
+    let key = ssh_key().display().to_string();
+    let port = inst.ssh_port().to_string();
+    let out = Command::new("scp")
+        .args(["-r", "-i", &key, "-P", &port])
+        .args(SSH_OPTS)
+        .args([from, to])
+        .output()
+        .context("run scp")?;
+    if !out.status.success() {
+        bail!(
+            "copy failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Forward a host port on 127.0.0.1 to a guest port until the VM stops. With no
+/// `host_port`, a free one is picked.
+pub fn forward(inst: &Instance, guest_port: u16, host_port: Option<u16>) -> Result<String> {
+    if !inst.running() {
+        bail!("{} is not running", inst.name);
+    }
+    let host_port = match host_port {
+        Some(p) => p,
+        None => std::net::TcpListener::bind(("127.0.0.1", 0))?
+            .local_addr()?
+            .port(),
+    };
+    let reply = qemu::Qmp::connect(inst)?.execute(
+        "human-monitor-command",
+        Some(serde_json::json!({
+            "command-line": format!("hostfwd_add net0 tcp:127.0.0.1:{host_port}-:{guest_port}")
+        })),
+    )?;
+    let msg = reply.as_str().unwrap_or_default().trim();
+    if !msg.is_empty() {
+        bail!("forwarding failed: {msg}");
+    }
+    Ok(format!(
+        "127.0.0.1:{host_port} -> {}:{guest_port} (until the VM stops)",
+        inst.name
+    ))
 }
 
 pub fn ssh(inst: &Instance, remote: &str) -> Result<Output> {

@@ -17,6 +17,8 @@ const UBUNTU_IMG_URL: &str =
 
 // Guest assets ship inside the binary: an installed agentpc has no repo next to it.
 const UBUNTU_USER_DATA: &str = include_str!("../guests/ubuntu/user-data");
+const UBUNTU_PREPARE: &str = include_str!("../guests/ubuntu/prepare.sh");
+const WIN_PREPARE: &str = include_str!("../guests/windows/prepare.ps1");
 const WIN_COMPOSE: &str = include_str!("../guests/windows/compose.yaml");
 const WIN_COMPOSE_ISO: &str = include_str!("../guests/windows/compose.iso.yaml");
 const WIN_OEM: [(&str, &[u8]); 2] = [
@@ -106,6 +108,7 @@ pub fn snapshot(os: Os) -> Result<()> {
     log!("booting {os} to capture its snapshot");
     qemu::start(&inst, &[])?;
     let took = wait_ready(&inst, Duration::from_secs(os.boot_timeout()))?;
+    prepare_guest(&inst)?;
     // Let post-logon startup finish so clones don't all redo it after resuming.
     let settle = match os {
         Os::Windows => 45,
@@ -163,6 +166,37 @@ pub fn snapshot(os: Os) -> Result<()> {
         gb(&disk),
         gb(&state)
     );
+    Ok(())
+}
+
+/// Apply the agent-friendly defaults in `guests/<os>/prepare.*` to a running guest.
+/// It runs at every snapshot, so existing and pulled images get it too.
+fn prepare_guest(inst: &Instance) -> Result<()> {
+    log!("applying agent defaults to {}", inst.os);
+    let (script, name, run) = match inst.os {
+        Os::Ubuntu => (
+            UBUNTU_PREPARE,
+            "/tmp/agentpc-prepare.sh",
+            "sudo sh /tmp/agentpc-prepare.sh && rm -f /tmp/agentpc-prepare.sh",
+        ),
+        Os::Windows => (
+            WIN_PREPARE,
+            "agentpc-prepare.ps1",
+            "powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:USERPROFILE\\agentpc-prepare.ps1\"; \
+             Remove-Item \"$env:USERPROFILE\\agentpc-prepare.ps1\"",
+        ),
+    };
+    let local = inst.dir.join("prepare-script");
+    std::fs::write(&local, script)?;
+    crate::ops::upload(inst, &local, name)?;
+    let out = ssh(inst, run)?;
+    if !out.status.success() {
+        bail!(
+            "preparing {} failed: {}",
+            inst.os,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
     Ok(())
 }
 
@@ -491,7 +525,7 @@ fn build_windows(inst: &Instance, iso: Option<PathBuf>) -> Result<()> {
         "-device".into(),
         "usb-storage,drive=boot,bootindex=9,removable=on".into(),
     ];
-    qemu::start(inst, &extra)?;
+    qemu::start_windows_installer(inst, &extra)?;
     // Answer "Press any key to boot from CD". Keep it short: once setup's UI is up,
     // Enter lands on its focused Cancel button.
     for _ in 0..15 {

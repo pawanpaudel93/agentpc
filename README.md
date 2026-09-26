@@ -155,13 +155,15 @@ pick the server up automatically.
 | `vm_delete` | Delete a VM and its disk |
 | `vm_screenshot` | PNG screenshot from the hypervisor |
 | `vm_exec` | Run a command: PowerShell on Windows, bash on Ubuntu |
+| `vm_upload` / `vm_download` | Copy files or folders between your Mac and a VM |
+| `vm_forward` | Reach a server running in a VM from your Mac |
 | `desktop_tools` | List the desktop-control tools inside a VM |
 | `desktop` | Call one of them: click, type, launch apps, read the UI tree, … |
 
 | Guest | Desktop | Desktop-control server |
 | --- | --- | --- |
-| Windows | Windows 11 Pro ARM | [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) |
-| Ubuntu | Ubuntu 24.04, XFCE on X11 | [cua-driver](https://github.com/trycua/cua) (over SSH) |
+| Windows | Windows 11 Pro ARM, 1280x800, Edge | [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) |
+| Ubuntu | Ubuntu 24.04, XFCE on X11, 1280x800, Google Chrome | [cua-driver](https://github.com/trycua/cua) (over SSH) |
 
 [AGENTS.md](AGENTS.md) has usage tips for agents.
 
@@ -180,6 +182,8 @@ pick the server up automatically.
 | `agentpc rm <name>` | Delete a VM and its disk |
 | `agentpc ssh <name> [command]` | Run a command, or open a shell with no command |
 | `agentpc screenshot <name> [file]` | Save a PNG screenshot |
+| `agentpc cp <src> <dst>` | Copy files; the VM side is `<name>:<path>`, e.g. `agentpc cp app.msi windows-1:Downloads/` |
+| `agentpc forward <name> <guest-port> [host-port]` | Forward `127.0.0.1:<host-port>` to a port in a running VM |
 
 ### Image commands
 
@@ -272,6 +276,9 @@ The guest login is `agent` / `agent`.
   installs OpenSSH and Windows-MCP.
 - **Ubuntu build.** The official cloud image is provisioned with cloud-init: XFCE on X11,
   auto-login, and cua-driver. cloud-init is then disabled so clones don't re-provision.
+- **Agent-ready guests.** Each time a snapshot is captured, a prepare script turns off what
+  interrupts unattended work (Windows SmartScreen, updates, first-run and tip pop-ups; Ubuntu's
+  background apt jobs) and installs Google Chrome on Ubuntu for cua-driver's browser tools.
 - **Why not Docker?** dockur can't run Windows on a Mac: Apple's virtualization gives nested
   VMs no performance-monitoring unit, and Windows ARM hangs at boot without one.
 

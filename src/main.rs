@@ -57,6 +57,14 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Copy files between this Mac and a VM: `agentpc cp ./app.msi windows-1:Downloads/`
+    Cp { src: String, dst: String },
+    /// Forward 127.0.0.1:<host_port> to a port inside a running VM (free port if omitted)
+    Forward {
+        name: String,
+        guest_port: u16,
+        host_port: Option<u16>,
+    },
     /// Save a PNG screenshot
     Screenshot { name: String, out: Option<PathBuf> },
     /// Manage images (the installed OS every VM is cloned from)
@@ -131,6 +139,12 @@ fn run(cli: Cli) -> Result<()> {
             use std::os::unix::process::CommandExt;
             Err(std::process::Command::new("ssh").args(args).exec().into())
         }
+        Cmd::Cp { src, dst } => out(copy(&src, &dst)),
+        Cmd::Forward {
+            name,
+            guest_port,
+            host_port,
+        } => out(ops::forward(&Instance::load(&name)?, guest_port, host_port)),
         Cmd::Screenshot { name, out: path } => {
             let inst = Instance::load(&name)?;
             let path = path.unwrap_or_else(|| inst.dir.join("screen.png"));
@@ -179,6 +193,21 @@ fn ensure_path() {
     }
     // SAFETY: runs first thing in main, before any other thread exists.
     unsafe { std::env::set_var("PATH", dirs.join(":")) };
+}
+
+/// `agentpc cp` endpoints: `<vm>:<path>` inside a VM, anything else on this Mac.
+fn copy(src: &str, dst: &str) -> Result<String> {
+    let guest = |arg: &str| {
+        arg.split_once(':')
+            .and_then(|(vm, path)| Instance::load(vm).ok().map(|i| (i, path.to_string())))
+    };
+    match (guest(src), guest(dst)) {
+        (None, Some((inst, path))) => ops::upload(&inst, &std::path::absolute(src)?, &path),
+        (Some((inst, path)), None) => ops::download(&inst, &path, &std::path::absolute(dst)?),
+        _ => anyhow::bail!(
+            "exactly one side must be <vm>:<path>, e.g. agentpc cp ./file ubuntu-1:/tmp/"
+        ),
+    }
 }
 
 fn out(r: Result<String>) -> Result<()> {

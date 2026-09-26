@@ -29,6 +29,8 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 | `vm_delete(name)` | Delete a VM |
 | `vm_screenshot(name)` | PNG screenshot; works even while booting or hung |
 | `vm_exec(name, command)` | Shell command: PowerShell on Windows, bash on Ubuntu |
+| `vm_upload` / `vm_download` | Copy files or folders between this Mac and a VM |
+| `vm_forward(name, guest_port)` | Reach a server running in the VM at `127.0.0.1:<port>` on the Mac |
 | `desktop_tools(name, tool?)` | List the GUI tools inside a VM, or one tool's full schema |
 | `desktop(name, tool, arguments)` | Call a GUI tool: click, type, launch apps, read the UI tree |
 
@@ -36,6 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 
 1. `vm_list`; reuse a running VM of the right OS, or `vm_create` one.
 2. Prefer `vm_exec` for anything a shell can do. It's faster and more reliable than the GUI.
+   Use `vm_upload` to bring in what you need to test (an installer, a script, a build).
 3. For GUI work, loop: look (`vm_screenshot` or a UI-snapshot tool), act (`desktop`), then
    look again to verify.
 4. Call `desktop_tools` once per VM to learn the exact tool names and arguments.
@@ -46,7 +49,10 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 - Call `Snapshot` first to get element labels and coordinates.
 - `Click` takes `loc: [x, y]`; `Type` needs `loc` or `label`.
 - `App` with `mode: "launch"` opens programs by name; `Shortcut` sends key combinations.
-- `vm_exec` runs PowerShell as the `agent` administrator.
+- `vm_exec` runs PowerShell as the `agent` administrator. The screen is 1280x800.
+- Processes started over `vm_exec` end when the command returns; start long-running servers
+  with a scheduled task, and open the Windows firewall for ports you `vm_forward`.
+- SmartScreen, Windows Update and first-run pop-ups are turned off. Edge is the browser.
 
 ## Ubuntu (desktop tools from cua-driver, XFCE on X11)
 
@@ -54,7 +60,11 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
   tools need.
 - Keyboard and mouse tools need `"delivery_mode": "foreground"`.
 - `launch_app` takes a command name such as `xfce4-terminal`.
-- `vm_exec` runs bash as `agent`, with passwordless `sudo`.
+- `vm_exec` runs bash as `agent`, with passwordless `sudo`. The screen is 1280x800.
+- Google Chrome is installed. Browser tools: `browser_prepare` with `allow_launch: true` and
+  `profile: {"mode": "isolated_new"}`, then `list_windows` for Chrome's `pid`/`window_id`,
+  `get_browser_state` with those to get `target_id`/`tab_id`, then `browser_navigate`,
+  `browser_click`, `browser_type`. Pass the same `session` label on every call.
 
 ## Rules
 

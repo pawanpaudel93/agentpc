@@ -44,12 +44,17 @@ pub fn which(cmd: &str) -> Option<PathBuf> {
 
 /// Boot an instance in the background. `extra` adds install media for image builds.
 pub fn start(inst: &Instance, extra: &[String]) -> Result<()> {
-    launch(inst, extra, None)
+    launch(inst, extra, None, false)
+}
+
+/// Boot the Windows installer. WinPE has no virtio-gpu driver, so it gets ramfb.
+pub fn start_windows_installer(inst: &Instance, extra: &[String]) -> Result<()> {
+    launch(inst, extra, None, true)
 }
 
 /// Resume a clone from a saved RAM snapshot instead of booting it.
 pub fn start_resumed(inst: &Instance, state: &Path) -> Result<()> {
-    launch(inst, &[], Some(state))?;
+    launch(inst, &[], Some(state), false)?;
     let mut q = Qmp::connect(inst)?;
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -101,7 +106,12 @@ pub fn save_state(inst: &Instance, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn launch(inst: &Instance, extra: &[String], incoming: Option<&Path>) -> Result<()> {
+fn launch(
+    inst: &Instance,
+    extra: &[String],
+    incoming: Option<&Path>,
+    installer: bool,
+) -> Result<()> {
     let d = &inst.dir;
     let _ = std::fs::remove_file(inst.qmp_socket());
     let mut fwd = format!("hostfwd=tcp:127.0.0.1:{}-:22", inst.ssh_port());
@@ -116,7 +126,13 @@ fn launch(inst: &Instance, extra: &[String], incoming: Option<&Path>) -> Result<
                     "-m",
                     "8G",
                     "-device",
-                    "ramfb",
+                    // ramfb's firmware driver tops out at 1024x768; Windows ships a
+                    // virtio-gpu driver (viogpudo) from the setup disk.
+                    if installer {
+                        "ramfb"
+                    } else {
+                        "virtio-gpu-pci,xres=1280,yres=800"
+                    },
                     "-rtc",
                     "base=localtime",
                     "-device",

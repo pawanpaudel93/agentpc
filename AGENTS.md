@@ -16,6 +16,8 @@ can run `agentpc mcp-install` (or install first: see README.md).
 | `vm_start` / `vm_stop` / `vm_reset` / `vm_delete` | Lifecycle. `vm_reset` = back to a clean install. |
 | `vm_screenshot(name)` | Hypervisor screenshot; works even while booting or hung. |
 | `vm_exec(name, command)` | Shell over SSH: PowerShell on windows, bash on ubuntu. |
+| `vm_upload` / `vm_download` | Copy files or folders between the Mac and a VM. |
+| `vm_forward(name, guest_port)` | Reach a server in the VM at `127.0.0.1:<port>` on the Mac. |
 | `desktop_tools(name, tool?)` | Desktop-control tools in that VM, or one tool's full schema. |
 | `desktop(name, tool, arguments)` | Call one of those tools (click, type, launch, snapshot…). |
 
@@ -29,7 +31,8 @@ coordinates. `Click` takes `loc: [x, y]`; `Type` needs `loc` or `label`; `App` w
 **Ubuntu** (desktop tools from cua-driver, XFCE on X11): `get_desktop_state` returns a
 screenshot plus window pid/window_id values to pass to other tools. Keyboard and mouse
 tools need `"delivery_mode": "foreground"`. `launch_app` takes a command name such as
-`xfce4-terminal`.
+`xfce4-terminal`. Google Chrome is installed for the `browser_*` tools (see the plugin skill
+for the call sequence).
 
 Rules:
 - Instances are disposable; `vm_reset` instead of repairing a broken one.
@@ -52,6 +55,8 @@ Rules:
   VNC websocket 5700+n; the shared browser viewer is on 8100.
 - Guest assets in `guests/` are embedded in the binary. `guests/windows/oem/setup.ps1` runs
   at first logon of a Windows image build; `guests/ubuntu/user-data` is the Ubuntu cloud-init.
+  `guests/<os>/prepare.*` runs in the guest every time a snapshot is captured (agent defaults:
+  no pop-ups or updates, Chrome on Ubuntu), so it also upgrades existing and pulled images.
   Changes take effect on the next `agentpc image build`, which refuses while VMs of that OS exist.
 - State (images, keys, instances) lives in `~/.agentpc` (`AGENTPC_HOME` overrides).
 - `plugin/` is the Claude plugin (MCP server + `skills/agentpc/SKILL.md`), listed by

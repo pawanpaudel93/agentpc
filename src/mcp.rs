@@ -101,6 +101,34 @@ fn default_timeout() -> u64 {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct UploadArgs {
+    name: String,
+    /// File or directory on this Mac (absolute, or relative to the server's working directory).
+    host_path: String,
+    /// Destination in the VM; relative paths are under the agent user's home
+    /// (e.g. "Downloads/" on Windows, "/tmp/" on Ubuntu).
+    guest_path: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DownloadArgs {
+    name: String,
+    /// File or directory in the VM; relative paths are under the agent user's home.
+    guest_path: String,
+    /// Destination on this Mac (absolute, or relative to the server's working directory).
+    host_path: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ForwardArgs {
+    name: String,
+    /// Port a server listens on inside the VM.
+    guest_port: u16,
+    /// Port on 127.0.0.1 of this Mac; a free one is picked if omitted.
+    host_port: Option<u16>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct ToolsArgs {
     name: String,
     tool: Option<String>,
@@ -205,6 +233,44 @@ impl Gateway {
         text(exec(&a.name, &a.command, a.timeout).await)
     }
 
+    #[tool(description = "Copy a file or directory from this Mac into a VM (scp).")]
+    async fn vm_upload(&self, Parameters(a): Parameters<UploadArgs>) -> CallToolResult {
+        text(
+            async {
+                let inst = load(&a.name)?;
+                let host = std::path::absolute(&a.host_path)?;
+                blocking(move || ops::upload(&inst, &host, &a.guest_path)).await
+            }
+            .await,
+        )
+    }
+
+    #[tool(description = "Copy a file or directory from a VM to this Mac (scp).")]
+    async fn vm_download(&self, Parameters(a): Parameters<DownloadArgs>) -> CallToolResult {
+        text(
+            async {
+                let inst = load(&a.name)?;
+                let host = std::path::absolute(&a.host_path)?;
+                blocking(move || ops::download(&inst, &a.guest_path, &host)).await
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Make a server running inside a VM reachable from this Mac: forwards a port on\n\
+                          127.0.0.1 to the guest port until the VM stops. Returns the host address."
+    )]
+    async fn vm_forward(&self, Parameters(a): Parameters<ForwardArgs>) -> CallToolResult {
+        text(
+            async {
+                let inst = load(&a.name)?;
+                blocking(move || ops::forward(&inst, a.guest_port, a.host_port)).await
+            }
+            .await,
+        )
+    }
+
     #[tool(
         description = "List the desktop-control tools available in an instance (name + summary), or the full\n\
                           input schema of one tool when `tool` is given. Call them with `desktop`."
@@ -271,7 +337,23 @@ impl Gateway {
                     msg
                 })])
             }
-            Ok(res) => CallToolResult::success(res.content),
+            Ok(res) => {
+                // Inner servers (cua-driver's browser tools) put ids like tab_id only in
+                // structured content, and many clients show only text, so mirror it as text.
+                let mut content = res.content;
+                if let Some(sc) = &res.structured_content {
+                    let json = serde_json::to_string_pretty(sc).unwrap_or_default();
+                    if !content
+                        .iter()
+                        .any(|c| c.as_text().is_some_and(|t| t.text.contains(&json)))
+                    {
+                        content.push(ContentBlock::text(json));
+                    }
+                }
+                let mut out = CallToolResult::success(content);
+                out.structured_content = res.structured_content;
+                out
+            }
             Err(e) => text(Err(e)),
         }
     }
