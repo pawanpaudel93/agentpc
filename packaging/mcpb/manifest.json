@@ -1,0 +1,35 @@
+{
+  "manifest_version": "0.3",
+  "name": "agentpc",
+  "display_name": "agentpc",
+  "version": "0.0.0",
+  "description": "Disposable Windows 11 and Ubuntu desktop VMs on Apple Silicon Macs for AI agents.",
+  "long_description": "Create, screenshot, drive and reset local Windows 11 ARM and Ubuntu desktop VMs over MCP. Requires QEMU from Homebrew (brew install qemu) and a one-time `agentpc bake ubuntu` / `agentpc bake windows`.",
+  "author": { "name": "Pawan Paudel", "url": "https://github.com/pawanpaudel93" },
+  "license": "MIT",
+  "homepage": "https://github.com/pawanpaudel93/agentpc",
+  "repository": { "type": "git", "url": "https://github.com/pawanpaudel93/agentpc.git" },
+  "server": {
+    "type": "binary",
+    "entry_point": "server/agentpc",
+    "mcp_config": {
+      "command": "${__dirname}/server/agentpc",
+      "args": ["mcp"],
+      "env": { "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" }
+    }
+  },
+  "tools": [
+    { "name": "vm_list", "description": "Instances, their state, and which golden images exist" },
+    { "name": "vm_create", "description": "Clone a golden image into a new instance and boot it" },
+    { "name": "vm_start", "description": "Start an instance" },
+    { "name": "vm_stop", "description": "Stop an instance" },
+    { "name": "vm_reset", "description": "Discard all changes: back to the golden image" },
+    { "name": "vm_delete", "description": "Stop and delete an instance" },
+    { "name": "vm_screenshot", "description": "Hypervisor screenshot of an instance" },
+    { "name": "vm_exec", "description": "Run a shell command (PowerShell on Windows, bash on Ubuntu)" },
+    { "name": "desktop_tools", "description": "List the desktop-control tools inside an instance" },
+    { "name": "desktop", "description": "Call a desktop-control tool inside an instance" }
+  ],
+  "keywords": ["vm", "qemu", "windows", "ubuntu", "computer-use"],
+  "compatibility": { "platforms": ["darwin"] }
+}

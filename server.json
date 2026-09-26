@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.pawanpaudel93/agentpc",
+  "title": "agentpc",
+  "description": "Disposable Windows 11 and Ubuntu desktop VMs on Apple Silicon Macs for AI agents.",
+  "repository": {
+    "url": "https://github.com/pawanpaudel93/agentpc",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/pawanpaudel93/agentpc/releases/download/v0.1.0/agentpc-0.1.0.mcpb",
+      "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

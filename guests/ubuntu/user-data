@@ -1,0 +1,56 @@
+#cloud-config
+# __SSH_KEY__ is substituted by ./ubuntu-agent when it builds the seed ISO.
+hostname: ubuntu-agent
+users:
+  - name: agent
+    groups: [sudo, adm]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    plain_text_passwd: agent
+    ssh_authorized_keys: [__SSH_KEY__]
+
+package_update: true
+packages:
+  - xfce4
+  - xfce4-terminal
+  - lightdm
+  - lightdm-gtk-greeter
+  - xserver-xorg
+  - dbus-x11
+  - at-spi2-core
+  - xdotool
+  - curl
+
+write_files:
+  # X11 session with autologin: Cua Driver fully supports X11 (Wayland only with limits).
+  - path: /etc/lightdm/lightdm.conf.d/50-agent.conf
+    content: |
+      [Seat:*]
+      autologin-user=agent
+      autologin-session=xfce
+      user-session=xfce
+  # A blanked or locked screen blocks screenshots and input.
+  - path: /etc/X11/xorg.conf.d/10-noblank.conf
+    content: |
+      Section "ServerFlags"
+        Option "BlankTime" "0"
+        Option "StandbyTime" "0"
+        Option "SuspendTime" "0"
+        Option "OffTime" "0"
+      EndSection
+
+runcmd:
+  - systemctl set-default graphical.target
+  # xfce4 pulls in light-locker, which would lock the agent out of the session.
+  - apt-get purge -y light-locker
+  - su - agent -c '/bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"'
+  - touch /var/lib/cloud/agent-ready
+  # Clones of the golden image boot without a seed; stop cloud-init treating them as
+  # new instances and re-running this whole file.
+  - touch /etc/cloud/cloud-init.disabled
+
+# Reboot so lightdm starts the autologin session on a fully provisioned system.
+power_state:
+  mode: reboot
+  condition: true

@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "agentpc": { "command": "agentpc", "args": ["mcp"], "timeout": 600000 }
+  }
+}

@@ -1,0 +1,5 @@
+# Used by `./agentpc bake windows` when WIN_ISO is set: install from a local ISO.
+services:
+  windows:
+    volumes:
+      - ${WIN_ISO}:/boot.iso:ro
