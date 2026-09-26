@@ -2,7 +2,7 @@
   "name": "agentpc",
   "displayName": "agentpc",
   "version": "0.1.0",
-  "description": "Disposable Windows 11 and Ubuntu desktops on your Mac that Claude can create in about a second, then click, type, screenshot, run commands in, and reset.",
+  "description": "Disposable Windows and Ubuntu desktops on your Mac that Claude can create in about a second, then click, type, screenshot, run commands in, and reset.",
   "author": {
     "name": "Pawan Paudel",
     "url": "https://github.com/pawanpaudel93"

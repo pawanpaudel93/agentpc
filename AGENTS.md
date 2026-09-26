@@ -1,6 +1,6 @@
 # agentpc — instructions for coding agents
 
-This repo runs disposable Windows 11 and Ubuntu desktop VMs on an Apple Silicon Mac and
+This repo runs disposable Windows and Ubuntu desktop VMs on an Apple Silicon Mac and
 exposes them to you through one MCP server, `agentpc` (`agentpc mcp`). It is
 preconfigured for Claude Code (`.mcp.json`), Codex (`.codex/config.toml`), Gemini CLI
 (`.gemini/settings.json`), Cursor (`.cursor/mcp.json`) and VS Code (`.vscode/mcp.json`),
@@ -10,9 +10,9 @@ can run `agentpc mcp-install` (or install first: see README.md).
 ## Using the VMs
 
 | Tool | Use |
-|------|-----|
+| --- | --- |
 | `list_vms` | VMs, their state, and the images (with OS version) they come from. Start here. |
-| `create_vm(os, name?)` | New clone: ubuntu ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready. |
+| `create_vm(os, version?, name?)` | New clone: ubuntu ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready. |
 | `start_vm` / `stop_vm` / `reset_vm` / `delete_vm` | Lifecycle. `reset_vm` = back to a clean install. |
 | `take_screenshot(name)` | Hypervisor screenshot; works even while booting or hung. |
 | `run_command(name, command)` | Shell over SSH: PowerShell on windows, bash on ubuntu. |
@@ -35,11 +35,14 @@ tools need `"delivery_mode": "foreground"`. `launch_app` takes a command name su
 for the call sequence).
 
 Rules:
+
 - Instances are disposable; `reset_vm` instead of repairing a broken one.
 - Don't create instances you won't use, and `delete_vm` scratch instances when done.
   Each running VM takes 4 GB (ubuntu) or 8 GB (windows) of RAM.
-- `create_vm ubuntu` downloads the Ubuntu image on first use (~1.2 GB). A Windows image must
-  be built by the user once: `agentpc image build windows` (downloads the ISO; ~12 min).
+- `create_vm ubuntu` downloads the Ubuntu image on first use (~1.2 GB); pass `version`
+  (e.g. "22.04") for another release. A Windows image must be built by the user once:
+  `agentpc image build windows` (downloads the ISO; ~12 min), or another version
+  (`windows-11-24h2`, `windows-11-23h2`; `agentpc image build --help` lists them).
   If `list_vms` shows no windows image, ask the user to run that. Don't start a build
   yourself unless asked.
 - The login for both guests is `agent` / `agent`. Everything binds to 127.0.0.1.
@@ -57,7 +60,8 @@ Rules:
   at first logon of a Windows image build; `guests/ubuntu/user-data` is the Ubuntu cloud-init.
   `guests/<os>/prepare.*` runs in the guest every time a snapshot is captured (agent defaults:
   no pop-ups or updates, Chrome on Ubuntu), so it also upgrades existing and pulled images.
-  Changes take effect on the next `agentpc image build`, which refuses while VMs of that OS exist.
+  Changes take effect on the next `agentpc image build`, which refuses while VMs of that image exist.
+- Images are `<os>-<version>` (`Image` in `instance.rs`); a bare OS means its default version.
 - State (images, keys, instances) lives in `~/.agentpc` (`AGENTPC_HOME` overrides).
 - `plugin/` is the Claude plugin (MCP server + `skills/agentpc/SKILL.md`), listed by
   `.claude-plugin/marketplace.json`. Keep the skill's tool guidance in sync with the

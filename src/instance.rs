@@ -41,34 +41,100 @@ pub enum Os {
 impl Os {
     pub const ALL: [Os; 2] = [Os::Windows, Os::Ubuntu];
 
-    pub fn image_disk(self) -> PathBuf {
-        images_dir().join(format!("{self}.qcow2"))
+    /// The version a bare `ubuntu` or `windows` means.
+    pub fn default_version(self) -> &'static str {
+        match self {
+            Os::Windows => "11",
+            Os::Ubuntu => "24.04",
+        }
     }
 
-    pub fn image_vars(self) -> PathBuf {
-        images_dir().join(format!("{self}.vars.fd"))
+    /// Seconds a cold boot may take before the desktop and its control server answer.
+    pub fn boot_timeout(self) -> u64 {
+        match self {
+            Os::Windows => 300,
+            Os::Ubuntu => 180,
+        }
+    }
+}
+
+/// An OS image VMs are cloned from, named `<os>-<version>` (`ubuntu-24.04`, `windows-11`).
+/// Several versions of an OS can be installed side by side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    pub os: Os,
+    pub version: String,
+}
+
+impl Image {
+    pub fn new(os: Os, version: Option<&str>) -> Result<Self> {
+        let version = version.unwrap_or(os.default_version()).to_ascii_lowercase();
+        // It becomes part of file names and registry tags.
+        if version.is_empty()
+            || !version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            bail!("invalid {os} version '{version}'");
+        }
+        Ok(Self { os, version })
+    }
+
+    /// Installed images, sorted by name.
+    pub fn all() -> Vec<Self> {
+        let mut out: Vec<Self> = std::fs::read_dir(images_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let stem = name.strip_suffix(".qcow2")?;
+                if stem.ends_with(".snapshot") {
+                    return None;
+                }
+                stem.parse().ok()
+            })
+            .collect();
+        out.sort_by_key(|i| i.to_string());
+        out
+    }
+
+    fn file(&self, suffix: &str) -> PathBuf {
+        images_dir().join(format!("{self}{suffix}"))
+    }
+
+    pub fn disk(&self) -> PathBuf {
+        self.file(".qcow2")
+    }
+
+    pub fn vars(&self) -> PathBuf {
+        self.file(".vars.fd")
     }
 
     /// What the image contains (OS version, source), see `image::ImageInfo`.
-    pub fn image_info(self) -> PathBuf {
-        images_dir().join(format!("{self}.json"))
+    pub fn info_file(&self) -> PathBuf {
+        self.file(".json")
     }
 
     /// The image as captured with the desktop already running, plus its saved RAM,
     /// so clones resume instead of booting.
-    pub fn snapshot_disk(self) -> PathBuf {
-        images_dir().join(format!("{self}.snapshot.qcow2"))
+    pub fn snapshot_disk(&self) -> PathBuf {
+        self.file(".snapshot.qcow2")
     }
 
-    pub fn snapshot_vars(self) -> PathBuf {
-        images_dir().join(format!("{self}.snapshot.vars.fd"))
+    pub fn snapshot_vars(&self) -> PathBuf {
+        self.file(".snapshot.vars.fd")
     }
 
-    pub fn snapshot_state(self) -> PathBuf {
-        images_dir().join(format!("{self}.snapshot.state"))
+    pub fn snapshot_state(&self) -> PathBuf {
+        self.file(".snapshot.state")
     }
 
-    pub fn has_snapshot(self) -> bool {
+    pub fn exists(&self) -> bool {
+        self.disk().is_file()
+    }
+
+    pub fn has_snapshot(&self) -> bool {
         [
             self.snapshot_disk(),
             self.snapshot_vars(),
@@ -78,11 +144,28 @@ impl Os {
         .all(|p| p.is_file())
     }
 
-    /// Seconds a cold boot may take before the desktop and its control server answer.
-    pub fn boot_timeout(self) -> u64 {
-        match self {
-            Os::Windows => 300,
-            Os::Ubuntu => 180,
+    /// VMs cloned from this image.
+    pub fn instances(&self) -> Result<Vec<Instance>> {
+        Ok(Instance::list()?
+            .into_iter()
+            .filter(|i| &i.image == self)
+            .collect())
+    }
+}
+
+impl fmt::Display for Image {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(&format!("{}-{}", self.os, self.version))
+    }
+}
+
+/// `ubuntu` (default version) or `ubuntu-22.04`.
+impl FromStr for Image {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.split_once('-') {
+            Some((os, version)) => Self::new(os.parse()?, Some(version)),
+            None => Self::new(s.parse()?, None),
         }
     }
 }
@@ -112,6 +195,7 @@ impl FromStr for Os {
 pub struct Instance {
     pub name: String,
     pub os: Os,
+    pub image: Image,
     pub slot: u16,
     pub dir: PathBuf,
 }
@@ -122,26 +206,32 @@ impl Instance {
         if name.is_empty() || !dir.is_dir() {
             bail!("no instance '{name}' (see: agentpc list)");
         }
-        let os = read_trimmed(&dir.join("os"))?.parse()?;
+        // VMs from before versioned images only recorded their OS.
+        let image: Image = match read_trimmed(&dir.join("image")) {
+            Ok(i) => i.parse()?,
+            Err(_) => Image::new(read_trimmed(&dir.join("os"))?.parse()?, None)?,
+        };
         let slot = read_trimmed(&dir.join("slot"))?
             .parse()
             .context("bad slot file")?;
         Ok(Self {
             name: name.to_string(),
-            os,
+            os: image.os,
+            image,
             slot,
             dir,
         })
     }
 
-    pub fn create(name: &str, os: Os, slot: u16) -> Result<Self> {
+    pub fn create(name: &str, image: &Image, slot: u16) -> Result<Self> {
         let dir = instances_dir().join(name);
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("os"), os.to_string())?;
+        std::fs::write(dir.join("image"), image.to_string())?;
         std::fs::write(dir.join("slot"), slot.to_string())?;
         Ok(Self {
             name: name.to_string(),
-            os,
+            os: image.os,
+            image: image.clone(),
             slot,
             dir,
         })
@@ -228,6 +318,72 @@ impl Instance {
     }
 }
 
+/// Rename images from before versions were tracked (`ubuntu.qcow2` → `ubuntu-24.04.qcow2`)
+/// and repoint their clones. Waits while such a clone is running: its disk is locked.
+pub fn migrate_legacy_images() -> Result<()> {
+    for os in Os::ALL {
+        let legacy = |suffix: &str| images_dir().join(format!("{os}{suffix}"));
+        if !legacy(".qcow2").is_file() {
+            continue;
+        }
+        let clones: Vec<Instance> = std::fs::read_dir(instances_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| !e.path().join("image").exists())
+            .filter_map(|e| Instance::load(&e.file_name().to_string_lossy()).ok())
+            .filter(|i| i.os == os)
+            .collect();
+        if clones.iter().any(|i| i.running()) {
+            continue;
+        }
+        // Builds before this recorded the Ubuntu release; Windows ones were all Windows 11.
+        let version = std::fs::read(legacy(".json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["version_id"].as_str().map(String::from))
+            .filter(|_| os == Os::Ubuntu);
+        let image = Image::new(os, version.as_deref())?;
+        if image.exists() {
+            continue;
+        }
+        for suffix in [
+            ".qcow2",
+            ".vars.fd",
+            ".json",
+            ".snapshot.qcow2",
+            ".snapshot.vars.fd",
+            ".snapshot.state",
+        ] {
+            if legacy(suffix).exists() {
+                std::fs::rename(legacy(suffix), image.file(suffix))?;
+            }
+        }
+        for inst in clones {
+            let base = if inst.on_snapshot_base() {
+                image.snapshot_disk()
+            } else {
+                image.disk()
+            };
+            let base = format!(
+                "../../images/{}",
+                base.file_name().unwrap().to_string_lossy()
+            );
+            let st = std::process::Command::new("qemu-img")
+                .args(["rebase", "-u", "-F", "qcow2", "-b", &base])
+                .arg(inst.disk())
+                .status()
+                .context("run qemu-img")?;
+            if !st.success() {
+                bail!("repointing {} at {image} failed", inst.name);
+            }
+            std::fs::write(inst.dir.join("image"), image.to_string())?;
+        }
+        crate::log!("renamed the {os} image to {image}");
+    }
+    Ok(())
+}
+
 unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
@@ -288,4 +444,23 @@ pub fn read_trimmed(p: &Path) -> Result<String> {
         .with_context(|| format!("read {}", p.display()))?
         .trim()
         .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Image, Os};
+
+    #[test]
+    fn parses_image_names() {
+        let i: Image = "ubuntu".parse().unwrap();
+        assert_eq!((i.os, i.to_string()), (Os::Ubuntu, "ubuntu-24.04".into()));
+        let i: Image = "windows-11-23h2".parse().unwrap();
+        assert_eq!((i.os, i.version.as_str()), (Os::Windows, "11-23h2"));
+        assert_eq!(
+            "Ubuntu-22.04".parse::<Image>().err().map(|e| e.to_string()),
+            Some("unknown os 'Ubuntu' (windows|ubuntu)".into())
+        );
+        assert!("ubuntu-../x".parse::<Image>().is_err());
+        assert!("macos".parse::<Image>().is_err());
+    }
 }

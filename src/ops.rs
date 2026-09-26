@@ -6,14 +6,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::instance::{Instance, Os, ssh_key};
+use crate::instance::{Image, Instance, Os, ssh_key};
 use crate::{log, qemu, viewer};
 
 /// Session env for cua-driver: the Ubuntu autologin X session and its AT-SPI bus.
 pub const UBUNTU_SESSION_ENV: &str = "DISPLAY=:0 XAUTHORITY=/home/agent/.Xauthority \
      XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus";
 
-pub const SSH_OPTS: [&str; 10] = [
+pub const SSH_OPTS: [&str; 12] = [
     "-o",
     "StrictHostKeyChecking=no",
     "-o",
@@ -24,6 +24,10 @@ pub const SSH_OPTS: [&str; 10] = [
     "ConnectTimeout=5",
     "-o",
     "BatchMode=yes",
+    // Otherwise keys in the user's ssh-agent are offered first and can exhaust the server's
+    // MaxAuthTries before ours is tried.
+    "-o",
+    "IdentitiesOnly=yes",
 ];
 
 /// `ssh` argv (without the program) that runs `remote` in the instance.
@@ -181,11 +185,12 @@ pub fn wait_ready(inst: &Instance, timeout: Duration) -> Result<Duration> {
 /// boot resumes in about a second. The backing path is relative so `$AGENTPC_HOME`
 /// can move.
 pub fn clone_disk(inst: &Instance) -> Result<()> {
-    let live = inst.os.has_snapshot();
+    let image = &inst.image;
+    let live = image.has_snapshot();
     let (base, vars) = if live {
-        (inst.os.snapshot_disk(), inst.os.snapshot_vars())
+        (image.snapshot_disk(), image.snapshot_vars())
     } else {
-        (inst.os.image_disk(), inst.os.image_vars())
+        (image.disk(), image.vars())
     };
     let base_name = base.file_name().unwrap().to_string_lossy();
     let _ = std::fs::remove_file(inst.disk());
@@ -248,9 +253,10 @@ pub fn info(inst: &Instance) -> String {
     )
 }
 
-pub fn create(os: Os, name: Option<&str>) -> Result<String> {
-    if !os.image_disk().is_file() {
-        provision_image(os)?;
+pub fn create(image: &Image, name: Option<&str>) -> Result<String> {
+    let os = image.os;
+    if !image.exists() {
+        provision_image(image)?;
     }
     let slot = Instance::free_slot()?;
     let name = match name {
@@ -266,25 +272,25 @@ pub fn create(os: Os, name: Option<&str>) -> Result<String> {
     if crate::instance::instances_dir().join(&name).exists() {
         bail!("instance '{name}' exists");
     }
-    let inst = Instance::create(&name, os, slot)?;
+    let inst = Instance::create(&name, image, slot)?;
     clone_disk(&inst)?;
     boot(&inst)
 }
 
-/// First `create` of an OS: fetch its image (Ubuntu), or say how to build it (Windows).
-fn provision_image(os: Os) -> Result<()> {
-    match os {
+/// First `create` from an image: fetch it (Ubuntu), or say how to build it (Windows).
+fn provision_image(image: &Image) -> Result<()> {
+    match image.os {
         Os::Ubuntu => {
-            log!("no ubuntu image yet; downloading it");
-            if let Err(e) = crate::registry::pull(os, "latest") {
+            log!("no {image} image yet; downloading it");
+            if let Err(e) = crate::registry::pull(image) {
                 log!("download failed ({e:#}); building it locally instead (~3 min)");
-                crate::image::build(os, None)?;
+                crate::image::build(image, None)?;
             }
             Ok(())
         }
         Os::Windows => bail!(
-            "no windows image yet; build it once (~12 min) from a Windows 11 ARM64 ISO: \
-             agentpc image build windows --iso <path>"
+            "no {image} image yet; build it once (~12 min, downloads the ISO from Microsoft): \
+             agentpc image build {image}"
         ),
     }
 }
@@ -295,9 +301,9 @@ pub fn boot(inst: &Instance) -> Result<String> {
     if !inst.running() {
         // Only a clone's first boot can resume: afterwards its disk has moved on
         // from the saved RAM, so later starts are cold boots.
-        if inst.resume_marker().exists() && inst.os.has_snapshot() {
+        if inst.resume_marker().exists() && inst.image.has_snapshot() {
             let _ = std::fs::remove_file(inst.resume_marker());
-            match qemu::start_resumed(inst, &inst.os.snapshot_state()) {
+            match qemu::start_resumed(inst, &inst.image.snapshot_state()) {
                 Ok(()) => resumed = true,
                 Err(e) => {
                     log!("{}: resume failed ({e:#}); booting instead", inst.name);
@@ -360,15 +366,15 @@ pub fn delete(inst: &Instance) -> Result<String> {
 
 pub fn list_table() -> Result<String> {
     let mut s = format!(
-        "{:<14} {:<8} {:<5} {:<8} {}\n",
-        "NAME", "OS", "SLOT", "STATE", "VIEWER"
+        "{:<14} {:<22} {:<5} {:<8} {}\n",
+        "NAME", "IMAGE", "SLOT", "STATE", "VIEWER"
     );
     for i in Instance::list()? {
         let state = if i.running() { "running" } else { "stopped" };
         s += &format!(
-            "{:<14} {:<8} {:<5} {:<8} {}\n",
+            "{:<14} {:<22} {:<5} {:<8} {}\n",
             i.name,
-            i.os,
+            i.image,
             i.slot,
             state,
             viewer::url(&i)

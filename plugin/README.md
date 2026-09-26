@@ -1,6 +1,6 @@
 # agentpc plugin for Claude
 
-Gives Claude disposable Windows 11 and Ubuntu desktops on your Mac. Claude can create a VM
+Gives Claude disposable Windows and Ubuntu desktops on your Mac. Claude can create a VM
 in about a second, click, type, take screenshots and run commands in it, then reset it to a
 clean install.
 
@@ -32,7 +32,8 @@ a clean machine."*
 
 The first Ubuntu VM downloads the Ubuntu image (~1.2 GB). Windows images can't be
 redistributed, so build yours once with `agentpc image build windows`, which downloads the
-official ISO from Microsoft.
+official ISO from Microsoft. Other versions work side by side, e.g. `ubuntu-22.04` or
+`windows-11-23h2`.
 
 ## More
 

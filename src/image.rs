@@ -8,20 +8,56 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::instance::{Instance, Os, cache_dir, home, images_dir, instances_dir, ssh_key};
+use crate::instance::{Image, Instance, Os, cache_dir, home, images_dir, instances_dir, ssh_key};
 use crate::ops::{run, ssh, wait_ready};
 use crate::{log, qemu};
 
-const UBUNTU_IMG_URL: &str =
-    "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img";
-
 // Guest assets ship inside the binary: an installed agentpc has no repo next to it.
 const UBUNTU_USER_DATA: &str = include_str!("../guests/ubuntu/user-data");
-/// The official Windows 11 ARM64 ISO on Microsoft's download servers, with the checksum and
-/// size dockur/windows-arm records for it. Used when no ISO is given.
-const WIN_ISO_URL: &str = "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_a64fre_en-us.iso";
-const WIN_ISO_SHA256: &str = "32cde0071ed8086b29bb6c8c3bf17ba9e3cdf43200537434a811a9b6cc2711a1";
-const WIN_ISO_SIZE: u64 = 7_299_147_776;
+
+/// A Windows ARM64 ISO with the checksum and size dockur/windows-arm records for it. The
+/// checksum is what makes a third-party mirror safe to use: a tampered file is rejected.
+pub(crate) struct WinIso {
+    pub version: &'static str,
+    pub what: &'static str,
+    /// Tried in order; the same file on each.
+    urls: &'static [&'static str],
+    sha256: &'static str,
+    pub size: u64,
+}
+
+/// The Windows versions `image build` can download (en-us; others need --iso). Microsoft
+/// only serves its current ARM64 ISOs, so older releases come from archive mirrors. Left out:
+/// Microsoft's evaluation ISOs (they install already expired and shut down every hour),
+/// Windows 10 (its ARM64 build hangs at boot on Apple Silicon) and LTSC (dockur's answer
+/// file doesn't install it).
+pub(crate) const WINDOWS_ISOS: [WinIso; 3] = [
+    WinIso {
+        version: "11",
+        what: "Windows 11 25H2 (Home/Pro)",
+        urls: &[
+            "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_a64fre_en-us.iso",
+        ],
+        sha256: "32cde0071ed8086b29bb6c8c3bf17ba9e3cdf43200537434a811a9b6cc2711a1",
+        size: 7_299_147_776,
+    },
+    WinIso {
+        version: "11-24h2",
+        what: "Windows 11 24H2 (Home/Pro)",
+        urls: &[
+            "https://archive.org/download/Windows11_24H2_Arm64_ISO/Win11_24H2_English_Arm64.iso",
+        ],
+        sha256: "57d1dfb2c6690a99fe99226540333c6c97d3fd2b557a50dfe3d68c3f675ef2b0",
+        size: 5_460_387_840,
+    },
+    WinIso {
+        version: "11-23h2",
+        what: "Windows 11 23H2 (Home/Pro)",
+        urls: &["https://dl.bobpony.com/windows/11/en-us_windows_11_23h2_arm64.iso"],
+        sha256: "bde2bcefe470bd19eb6cb810f38478dbd6809f04bac20c26ff27d4c9b864f662",
+        size: 6_755_211_264,
+    },
+];
 
 const UBUNTU_PREPARE: &str = include_str!("../guests/ubuntu/prepare.sh");
 const WIN_PREPARE: &str = include_str!("../guests/windows/prepare.ps1");
@@ -41,16 +77,17 @@ const WIN_OEM: [(&str, &[u8]); 2] = [
 const COLIMA_PROFILE: &str = "agentpc";
 const DOCKER_CTX: &str = "colima-agentpc";
 
-pub fn build(os: Os, iso: Option<PathBuf>) -> Result<()> {
-    if Instance::list()?.iter().any(|i| i.os == os) {
-        bail!("instances of {os} depend on its image; rm them first");
+pub fn build(image: &Image, iso: Option<PathBuf>) -> Result<()> {
+    let os = image.os;
+    if !image.instances()?.is_empty() {
+        bail!("VMs of {image} depend on it; rm them first");
     }
     for d in [home(), cache_dir(), images_dir(), instances_dir()] {
         std::fs::create_dir_all(&d).with_context(|| format!("create {}", d.display()))?;
     }
     ensure_ssh_key()?;
 
-    let name = format!("_build-{os}");
+    let name = format!("_build-{image}");
     if instances_dir().join(&name).is_dir() {
         if let Ok(old) = Instance::load(&name) {
             qemu::stop(&old)?;
@@ -58,10 +95,10 @@ pub fn build(os: Os, iso: Option<PathBuf>) -> Result<()> {
         std::fs::remove_dir_all(instances_dir().join(&name))?;
     }
     let iso_path = match os {
-        Os::Windows => Some(windows_iso(iso)?),
+        Os::Windows => Some(windows_iso(&image.version, iso)?),
         Os::Ubuntu => None,
     };
-    let inst = Instance::create(&name, os, 0)?;
+    let inst = Instance::create(&name, image, 0)?;
     match &iso_path {
         Some(iso) => build_windows(&inst, iso)?,
         None => build_ubuntu(&inst)?,
@@ -75,31 +112,29 @@ pub fn build(os: Os, iso: Option<PathBuf>) -> Result<()> {
     }
     info.built = crate::instance::local_date();
     promote_image(&inst)?;
-    write_info(os, &info)?;
-    snapshot(os)
+    write_info(image, &info)?;
+    snapshot(image)
 }
 
 /// Capture the image's snapshot: boot the image once, let the desktop
 /// settle, then save RAM and flatten the disk as it was at that instant. Clones of it
 /// resume in about a second instead of booting.
-pub fn snapshot(os: Os) -> Result<()> {
-    if !os.image_disk().is_file() {
-        bail!("no {os} image; run: agentpc image build {os}");
+pub fn snapshot(image: &Image) -> Result<()> {
+    let os = image.os;
+    if !image.exists() {
+        bail!("no {image} image; run: agentpc image build {image}");
     }
-    if Instance::list()?
-        .iter()
-        .any(|i| i.os == os && i.on_snapshot_base())
-    {
-        bail!("instances of {os} depend on its snapshot; rm them first");
+    if image.instances()?.iter().any(|i| i.on_snapshot_base()) {
+        bail!("VMs of {image} depend on its snapshot; rm them first");
     }
-    let name = format!("_snap-{os}");
+    let name = format!("_snap-{image}");
     if instances_dir().join(&name).is_dir() {
         if let Ok(old) = Instance::load(&name) {
             qemu::quit(&old);
         }
         std::fs::remove_dir_all(instances_dir().join(&name))?;
     }
-    let inst = Instance::create(&name, os, 0)?;
+    let inst = Instance::create(&name, image, 0)?;
     run(
         "qemu-img",
         &[
@@ -108,16 +143,16 @@ pub fn snapshot(os: Os) -> Result<()> {
             "-f",
             "qcow2",
             "-b",
-            &format!("../../images/{os}.qcow2"),
+            &format!("../../images/{image}.qcow2"),
             "-F",
             "qcow2",
             &inst.disk().to_string_lossy(),
         ],
     )?;
-    std::fs::copy(os.image_vars(), inst.vars())?;
+    std::fs::copy(image.vars(), inst.vars())?;
     crate::ops::set_writable(&inst.vars())?;
 
-    log!("booting {os} to capture its snapshot");
+    log!("booting {image} to capture its snapshot");
     qemu::start(&inst, &[])?;
     let took = wait_ready(&inst, Duration::from_secs(os.boot_timeout()))?;
     prepare_guest(&inst)?;
@@ -129,7 +164,7 @@ pub fn snapshot(os: Os) -> Result<()> {
     log!("{os} ready in {}s; settling {settle}s", took.as_secs());
     // Guest-reported fields refresh; build-time ones (base, built, ISO checksum) are kept.
     let fresh = guest_info(&inst)?;
-    let mut info = read_info(os).unwrap_or_default();
+    let mut info = read_info(image).unwrap_or_default();
     if info.base.is_empty() {
         info.base = fresh.base;
     }
@@ -139,10 +174,14 @@ pub fn snapshot(os: Os) -> Result<()> {
     info.arch = fresh.arch;
     info.agentpc = fresh.agentpc;
     info.desktop_server = fresh.desktop_server;
-    write_info(os, &info)?;
+    write_info(image, &info)?;
     std::thread::sleep(Duration::from_secs(settle));
 
-    let (disk, vars, state) = (os.snapshot_disk(), os.snapshot_vars(), os.snapshot_state());
+    let (disk, vars, state) = (
+        image.snapshot_disk(),
+        image.snapshot_vars(),
+        image.snapshot_state(),
+    );
     for p in [&disk, &vars, &state] {
         let _ = std::fs::remove_file(p);
     }
@@ -174,7 +213,7 @@ pub fn snapshot(os: Os) -> Result<()> {
             .unwrap_or(0.0)
     };
     log!(
-        "snapshot for {os} ready (disk {:.1} GB, memory {:.1} GB)",
+        "snapshot for {image} ready (disk {:.1} GB, memory {:.1} GB)",
         gb(&disk),
         gb(&state)
     );
@@ -241,12 +280,12 @@ pub struct ImageInfo {
     pub pulled_from: Option<String>,
 }
 
-pub fn read_info(os: Os) -> Option<ImageInfo> {
-    serde_json::from_slice(&std::fs::read(os.image_info()).ok()?).ok()
+pub fn read_info(image: &Image) -> Option<ImageInfo> {
+    serde_json::from_slice(&std::fs::read(image.info_file()).ok()?).ok()
 }
 
-pub fn write_info(os: Os, info: &ImageInfo) -> Result<()> {
-    std::fs::write(os.image_info(), serde_json::to_vec_pretty(info)?)?;
+pub fn write_info(image: &Image, info: &ImageInfo) -> Result<()> {
+    std::fs::write(image.info_file(), serde_json::to_vec_pretty(info)?)?;
     Ok(())
 }
 
@@ -335,8 +374,12 @@ pub fn record_iso(info: &mut ImageInfo, iso: &Path) -> Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     log!("checksumming {name}");
-    info.iso_sha256 = Some(sha256_file(iso)?);
-    info.base = describe_iso(&name);
+    let sha = sha256_file(iso)?;
+    info.base = match WINDOWS_ISOS.iter().find(|w| w.sha256 == sha) {
+        Some(w) => format!("{} ISO, ARM64, en-us", w.what),
+        None => describe_iso(&name),
+    };
+    info.iso_sha256 = Some(sha);
     Ok(())
 }
 
@@ -404,19 +447,15 @@ fn sha256_file(p: &Path) -> Result<String> {
 /// One line per local image: version, size and whether VMs can resume from its snapshot.
 pub fn list() -> Result<String> {
     let mut s = String::new();
-    for os in Os::ALL {
-        if let Ok(m) = std::fs::metadata(os.image_disk()) {
-            let snap = if os.has_snapshot() {
-                "snapshot: yes"
-            } else {
-                "snapshot: no"
-            };
-            let version = read_info(os).map_or("version unknown".into(), |i| i.version);
-            s += &format!(
-                "{os:<8} {version:<42} {:>5.1} GB  {snap}\n",
-                m.len() as f64 / 1e9
-            );
-        }
+    for image in Image::all() {
+        let size = std::fs::metadata(image.disk())?.len() as f64 / 1e9;
+        let snap = if image.has_snapshot() {
+            "snapshot: yes"
+        } else {
+            "snapshot: no"
+        };
+        let version = read_info(&image).map_or("version unknown".into(), |i| i.version);
+        s += &format!("{image:<22} {version:<42} {size:>5.1} GB  {snap}\n");
     }
     if s.is_empty() {
         s = "no images (agentpc image pull ubuntu, or agentpc image build <os>)".into();
@@ -424,35 +463,35 @@ pub fn list() -> Result<String> {
     Ok(s)
 }
 
-pub fn describe(os: Os) -> Result<String> {
-    if !os.image_disk().is_file() {
-        bail!("no {os} image");
+pub fn describe(image: &Image) -> Result<String> {
+    if !image.exists() {
+        bail!("no {image} image");
     }
-    let info = read_info(os).with_context(|| {
-        format!("no version info for the {os} image; run: agentpc image snapshot {os}")
+    let info = read_info(image).with_context(|| {
+        format!("no version info for {image}; run: agentpc image snapshot {image}")
     })?;
     Ok(serde_json::to_string_pretty(&info)?)
 }
 
-pub fn remove(os: Os) -> Result<String> {
-    if Instance::list()?.iter().any(|i| i.os == os) {
-        bail!("VMs of {os} depend on its image; rm them first");
+pub fn remove(image: &Image) -> Result<String> {
+    if !image.instances()?.is_empty() {
+        bail!("VMs of {image} depend on it; rm them first");
     }
     let files = [
-        os.image_info(),
-        os.image_disk(),
-        os.image_vars(),
-        os.snapshot_disk(),
-        os.snapshot_vars(),
-        os.snapshot_state(),
+        image.info_file(),
+        image.disk(),
+        image.vars(),
+        image.snapshot_disk(),
+        image.snapshot_vars(),
+        image.snapshot_state(),
     ];
     if !files.iter().any(|p| p.exists()) {
-        bail!("no {os} image");
+        bail!("no {image} image");
     }
     for p in files {
         let _ = std::fs::remove_file(p);
     }
-    Ok(format!("removed the {os} image"))
+    Ok(format!("removed {image}"))
 }
 
 fn ensure_ssh_key() -> Result<()> {
@@ -485,12 +524,23 @@ fn create_vars(inst: &Instance) -> Result<()> {
     Ok(())
 }
 
-/// `--iso`, else `$WIN_ISO`, else the first `~/Downloads/*A64FRE*.iso`.
-/// A Windows ISO already on this Mac: `--iso`, `$WIN_ISO`, `~/Downloads/*A64FRE*.iso`, or an
-/// earlier download. An explicitly named path is returned even if it doesn't exist.
-pub(crate) fn find_windows_iso(iso: Option<PathBuf>) -> Option<PathBuf> {
+/// A Windows ISO already on this Mac for `version`: `--iso`, `$WIN_ISO`, an earlier download,
+/// or (for the default version) `~/Downloads/*A64FRE*.iso`. An explicitly named path is
+/// returned even if it doesn't exist.
+pub(crate) fn find_windows_iso(version: &str, iso: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(p) = iso.or_else(|| std::env::var_os("WIN_ISO").map(PathBuf::from)) {
         return Some(p);
+    }
+    if let Some(p) = windows_iso_entry(version)
+        .map(downloaded_iso_path)
+        .filter(|p| p.is_file())
+    {
+        return Some(p);
+    }
+    // A consumer ISO the user downloaded themselves can't be told apart from other
+    // editions by name alone, so only the default version picks one up.
+    if version != Os::Windows.default_version() {
+        return None;
     }
     let downloads = PathBuf::from(std::env::var_os("HOME")?).join("Downloads");
     let mut isos: Vec<PathBuf> = std::fs::read_dir(downloads)
@@ -505,52 +555,85 @@ pub(crate) fn find_windows_iso(iso: Option<PathBuf>) -> Option<PathBuf> {
         })
         .collect();
     isos.sort();
-    isos.into_iter()
-        .next()
-        .or_else(|| Some(downloaded_iso_path()).filter(|p| p.is_file()))
+    isos.into_iter().next()
 }
 
-fn downloaded_iso_path() -> PathBuf {
-    cache_dir().join(
-        WIN_ISO_URL
-            .rsplit('/')
-            .next()
-            .unwrap_or("windows11-arm64.iso"),
-    )
+pub(crate) fn windows_iso_entry(version: &str) -> Option<&'static WinIso> {
+    WINDOWS_ISOS.iter().find(|w| w.version == version)
+}
+
+fn downloaded_iso_path(w: &WinIso) -> PathBuf {
+    cache_dir().join(w.urls[0].rsplit('/').next().unwrap_or(w.version))
 }
 
 /// The ISO to install from, downloading Microsoft's official one if none is on this Mac.
-fn windows_iso(iso: Option<PathBuf>) -> Result<PathBuf> {
-    match find_windows_iso(iso) {
+fn windows_iso(version: &str, iso: Option<PathBuf>) -> Result<PathBuf> {
+    match find_windows_iso(version, iso) {
         Some(p) if p.is_file() => Ok(p),
         Some(p) => bail!("Windows ISO {} not found", p.display()),
-        None => download_windows_iso(),
+        None => match windows_iso_entry(version) {
+            Some(w) => download_windows_iso(w),
+            None => bail!(
+                "no download for windows-{version}; pass --iso <ARM64 ISO>, or use one of: {}",
+                WINDOWS_ISOS
+                    .iter()
+                    .map(|w| format!("windows-{}", w.version))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
     }
 }
 
-fn download_windows_iso() -> Result<PathBuf> {
-    let dest = downloaded_iso_path();
+fn download_windows_iso(w: &WinIso) -> Result<PathBuf> {
+    let dest = downloaded_iso_path(w);
     let part = dest.with_extension("iso.part");
     std::fs::create_dir_all(cache_dir())?;
-    log!(
-        "downloading Windows 11 ARM64 from Microsoft ({:.1} GB, resumable)",
-        WIN_ISO_SIZE as f64 / 1e9
-    );
-    let st = Command::new("curl")
-        .args(["-fL", "--retry", "3", "-C", "-", "-#", "-o"])
-        .arg(&part)
-        .arg(WIN_ISO_URL)
-        .status()
-        .context("run curl")?;
-    if !st.success() {
-        bail!("downloading the Windows ISO failed; pass --iso <Windows 11 ARM64 ISO> instead");
+    // A partial file larger than the ISO can't be resumed; start over.
+    if std::fs::metadata(&part).is_ok_and(|m| m.len() > w.size) {
+        std::fs::remove_file(&part)?;
+    }
+    let curl = |url: &str| {
+        Command::new("curl")
+            .args(["-fL", "--retry", "3", "-C", "-", "-#", "-o"])
+            .arg(&part)
+            .arg(url)
+            .status()
+            .map(|s| s.code())
+            .context("run curl")
+    };
+    let mut done = false;
+    for url in w.urls {
+        let host = url.split('/').nth(2).unwrap_or(url);
+        log!(
+            "downloading {} from {host} ({:.1} GB, resumable)",
+            w.what,
+            w.size as f64 / 1e9
+        );
+        let mut code = curl(url)?;
+        // 33: the mirror ignores range requests, so the partial file can't be resumed.
+        if code == Some(33) {
+            let _ = std::fs::remove_file(&part);
+            code = curl(url)?;
+        }
+        if code == Some(0) {
+            done = true;
+            break;
+        }
+        log!("download from {host} failed");
+    }
+    if !done {
+        bail!("downloading the Windows ISO failed; pass --iso <Windows ARM64 ISO> instead");
     }
     let size = std::fs::metadata(&part)?.len();
-    if size != WIN_ISO_SIZE {
-        bail!("Windows ISO download is {size} bytes, expected {WIN_ISO_SIZE}; rerun to resume");
+    if size != w.size {
+        bail!(
+            "Windows ISO download is {size} bytes, expected {}; rerun to resume",
+            w.size
+        );
     }
     log!("verifying the Windows ISO checksum");
-    if sha256_file(&part)? != WIN_ISO_SHA256 {
+    if sha256_file(&part)? != w.sha256 {
         let _ = std::fs::remove_file(&part);
         bail!("Windows ISO checksum mismatch; the partial file was removed, rerun to retry");
     }
@@ -558,15 +641,19 @@ fn download_windows_iso() -> Result<PathBuf> {
     Ok(dest)
 }
 
-pub(crate) fn windows_setup_img_path() -> PathBuf {
-    cache_dir().join("windows-setup.img")
+/// dockur's answer file picks the edition from the ISO, so setup.img is cached per ISO.
+pub(crate) fn windows_setup_img_path(iso: &Path) -> PathBuf {
+    let name = iso.file_stem().unwrap_or_default().to_string_lossy();
+    cache_dir()
+        .join("windows-setup")
+        .join(format!("{name}.img"))
 }
 
 fn build_windows(inst: &Instance, iso: &Path) -> Result<()> {
     let iso = std::fs::canonicalize(iso)?;
     windows_setup_img(&iso)?;
     let setup = inst.dir.join("setup.img");
-    std::fs::copy(windows_setup_img_path(), &setup)?;
+    std::fs::copy(windows_setup_img_path(&iso), &setup)?;
     windows_refresh_oem(&setup)?;
     run(
         "qemu-img",
@@ -608,10 +695,19 @@ fn build_windows(inst: &Instance, iso: &Path) -> Result<()> {
 
 /// dockur builds Autounattend.xml + ARM virtio drivers into setup.img; only needed once.
 fn windows_setup_img(iso: &Path) -> Result<()> {
-    let out = windows_setup_img_path();
+    let out = windows_setup_img_path(iso);
     if out.is_file() {
         return Ok(());
     }
+    // colima shares only the home folder with its VM, so dockur can't see an ISO elsewhere.
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    if !iso.starts_with(&home) {
+        bail!(
+            "the ISO must be inside your home folder for dockur to read it: {}",
+            iso.display()
+        );
+    }
+    std::fs::create_dir_all(out.parent().unwrap())?;
     let status = Command::new("colima")
         .args(["status", "-p", COLIMA_PROFILE])
         .stdout(Stdio::null())
@@ -695,6 +791,23 @@ fn windows_setup_img(iso: &Path) -> Result<()> {
         if st.is_ok_and(|s| s.success()) {
             break;
         }
+        let running = Command::new("docker")
+            .args([
+                "--context",
+                DOCKER_CTX,
+                "inspect",
+                "-f",
+                "{{.State.Running}}",
+                "agentpc-windows",
+            ])
+            .output()
+            .is_ok_and(|o| o.stdout.starts_with(b"true"));
+        if !running {
+            bail!(
+                "dockur stopped before writing setup.img; see: docker --context {DOCKER_CTX} \
+                 logs agentpc-windows"
+            );
+        }
         std::thread::sleep(Duration::from_secs(5));
     }
     let part = out.with_extension("img.part");
@@ -770,14 +883,19 @@ fn windows_refresh_oem(img: &Path) -> Result<()> {
 }
 
 fn build_ubuntu(inst: &Instance) -> Result<()> {
-    let base = cache_dir().join("ubuntu-base.img");
+    let version = &inst.image.version;
+    let file = format!("ubuntu-{version}-server-cloudimg-arm64.img");
+    let base = cache_dir().join(&file);
     if !base.is_file() {
-        log!("downloading Ubuntu cloud image");
-        let part = cache_dir().join("ubuntu-base.img.part");
-        run(
-            "curl",
-            &["-fsSL", "-o", &part.to_string_lossy(), UBUNTU_IMG_URL],
-        )?;
+        log!("downloading the Ubuntu {version} cloud image");
+        let url = format!("https://cloud-images.ubuntu.com/releases/{version}/release/{file}");
+        let part = base.with_extension("img.part");
+        if run("curl", &["-fsSL", "-o", &part.to_string_lossy(), &url]).is_err() {
+            bail!(
+                "no Ubuntu {version} cloud image for arm64; releases are listed at \
+                 https://cloud-images.ubuntu.com/releases/"
+            );
+        }
         std::fs::rename(&part, &base)?;
     }
     // Relative backing path so $AGENTPC_HOME can move; promote flattens it anyway.
@@ -789,7 +907,7 @@ fn build_ubuntu(inst: &Instance) -> Result<()> {
             "-f",
             "qcow2",
             "-b",
-            "../../cache/ubuntu-base.img",
+            &format!("../../cache/{file}"),
             "-F",
             "qcow2",
             &inst.disk().to_string_lossy(),
@@ -839,10 +957,10 @@ fn build_ubuntu(inst: &Instance) -> Result<()> {
 
 /// Freeze the cleanly shut-down build disk as the image (flattened, read-only).
 fn promote_image(inst: &Instance) -> Result<()> {
-    let os = inst.os;
+    let image = &inst.image;
     qemu::stop(inst)?;
-    log!("writing the {os} image");
-    let (disk, vars) = (os.image_disk(), os.image_vars());
+    log!("writing the {image} image");
+    let (disk, vars) = (image.disk(), image.vars());
     let _ = std::fs::remove_file(&disk);
     let _ = std::fs::remove_file(&vars);
     let tmp = disk.with_extension("qcow2.tmp");
@@ -865,7 +983,7 @@ fn promote_image(inst: &Instance) -> Result<()> {
     }
     std::fs::remove_dir_all(&inst.dir)?;
     let size = std::fs::metadata(&disk)?.len() as f64 / 1e9;
-    log!("{os} image ready ({size:.1} GB)");
+    log!("{image} image ready ({size:.1} GB)");
     Ok(())
 }
 
@@ -879,8 +997,9 @@ mod tests {
             std::env::var_os("AGENTPC_HOME").is_some(),
             "set AGENTPC_HOME to a scratch dir"
         );
-        let iso = super::download_windows_iso().unwrap();
-        assert_eq!(std::fs::metadata(iso).unwrap().len(), super::WIN_ISO_SIZE);
+        let w = &super::WINDOWS_ISOS[0];
+        let iso = super::download_windows_iso(w).unwrap();
+        assert_eq!(std::fs::metadata(iso).unwrap().len(), w.size);
     }
 
     #[test]

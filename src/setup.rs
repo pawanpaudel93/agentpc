@@ -6,8 +6,8 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::image::{find_windows_iso, windows_setup_img_path};
-use crate::instance::{Os, home};
+use crate::image::find_windows_iso;
+use crate::instance::{Image, Os, home};
 use crate::log;
 use crate::qemu::{edk2, which};
 
@@ -191,9 +191,11 @@ pub fn doctor() -> Result<bool> {
     );
 
     println!("windows image build only:");
-    let setup_img = windows_setup_img_path().is_file();
+    // After a first build, dockur's setup.img is cached and colima no longer needed for that ISO.
+    let setup_img =
+        std::fs::read_dir(home().join("cache/windows-setup")).is_ok_and(|mut d| d.next().is_some());
     // Not required: image build downloads Microsoft's ISO when none is found.
-    match find_windows_iso(None).filter(|p| p.is_file()) {
+    match find_windows_iso(Os::Windows.default_version(), None).filter(|p| p.is_file()) {
         Some(p) => println!("  ok   Windows ISO: {}", p.display()),
         None => println!(
             "  ok   Windows ISO: none yet; image build downloads it from Microsoft (7.3 GB)"
@@ -216,10 +218,11 @@ pub fn doctor() -> Result<bool> {
     );
 
     println!("images:");
+    let images = Image::all();
     for os in Os::ALL {
         check(
             &os.to_string(),
-            os.image_disk().is_file(),
+            images.iter().any(|i| i.os == os),
             &format!("run: agentpc image build {os} (or image pull ubuntu)"),
         );
     }

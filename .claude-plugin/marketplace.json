@@ -1,6 +1,6 @@
 {
   "name": "agentpc",
-  "description": "Disposable Windows 11 and Ubuntu desktops for AI agents on Apple Silicon Macs",
+  "description": "Disposable Windows and Ubuntu desktops for AI agents on Apple Silicon Macs",
   "owner": {
     "name": "Pawan Paudel",
     "url": "https://github.com/pawanpaudel93"
@@ -9,7 +9,7 @@
     {
       "name": "agentpc",
       "source": "./plugin",
-      "description": "Create, drive, screenshot and reset local Windows 11 and Ubuntu desktop VMs from Claude",
+      "description": "Create, drive, screenshot and reset local Windows and Ubuntu desktop VMs from Claude",
       "version": "0.1.0"
     }
   ]

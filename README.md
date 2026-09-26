@@ -4,7 +4,7 @@
 ![Platform: macOS on Apple Silicon](https://img.shields.io/badge/platform-macOS%20%7C%20Apple%20Silicon-lightgrey)
 ![MCP server](https://img.shields.io/badge/MCP-server-8A2BE2)
 
-**Disposable Windows 11 and Linux (Ubuntu 24.04) desktops for AI agents, on your Mac.**
+**Disposable Windows 11 and Linux (Ubuntu) desktops for AI agents, on your Mac.**
 
 agentpc gives AI agents (Claude Code, Claude Desktop, Codex, Cursor, Gemini CLI, VS Code, or
 any MCP client) real desktop computers to work in: create a VM in about a second, let the agent click,
@@ -31,7 +31,7 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 
 - **Instant VMs.** New VMs resume from a saved snapshot of a running desktop: ready in
   ~1 s (Ubuntu) or ~4 s (Windows). `reset` returns a VM to a clean state just as fast.
-- **Real desktops.** Windows 11 Pro ARM and Ubuntu 24.04 (XFCE), each with a
+- **Real desktops.** Windows 11 (ARM) and Ubuntu 24.04 or another release (XFCE), each with a
   desktop-control server agents can drive: [Windows-MCP](https://github.com/CursorTouch/Windows-MCP)
   and [cua-driver](https://github.com/trycua/cua).
 - **One MCP server for everything.** Agents create, drive, screenshot and delete VMs
@@ -43,8 +43,8 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 - **Agent-ready guests.** 1280x800 desktops with a browser (Edge on Windows, Chrome on Ubuntu)
   and the pop-ups, update restarts and background jobs that interrupt unattended work turned off.
 - **Watch along.** Every VM has a browser viewer, so you can see what the agent is doing.
-- **Versioned images.** Each image records its OS version, source and build date; the
-  Ubuntu image can be downloaded instead of built.
+- **Any version, side by side.** Run Ubuntu 22.04, 24.04 and 26.04, or several Windows 11
+  releases, at the same time. Each image records its OS version, source and build date.
 - **Local and private.** Everything runs on your Mac and listens on `127.0.0.1` only.
 
 ## Requirements
@@ -55,7 +55,7 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 | OS | macOS 14 or later (tested on macOS 15) |
 | Runtime | [QEMU](https://www.qemu.org) from Homebrew (the installer handles it) |
 | Memory | 4 GB per running Ubuntu VM, 8 GB per running Windows VM |
-| Disk | ~10 GB for the Ubuntu image, ~30 GB for the Windows image (each including its snapshot) |
+| Disk | ~10 GB per Ubuntu image, ~30 GB per Windows image (each including its snapshot) |
 | Windows only | `colima` and `docker` for the first image build (the ISO is downloaded from Microsoft) |
 
 ## Installation
@@ -154,7 +154,7 @@ pick the server up automatically.
 | Tool | Description |
 | --- | --- |
 | `list_vms` | VMs, their state, and the available images with their OS versions |
-| `create_vm` | Create a VM from an image and wait until its desktop is ready |
+| `create_vm` | Create a VM (optionally of a given version) and wait until its desktop is ready |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down cleanly |
 | `reset_vm` | Discard all changes: back to a fresh copy of the image |
 | `delete_vm` | Delete a VM and its disk |
@@ -167,8 +167,8 @@ pick the server up automatically.
 
 | Guest | Desktop | Desktop-control server |
 | --- | --- | --- |
-| Windows | Windows 11 Pro ARM, 1280x800, Edge | [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) |
-| Ubuntu | Ubuntu 24.04, XFCE on X11, 1280x800, Google Chrome | [cua-driver](https://github.com/trycua/cua) (over SSH) |
+| Windows | Windows 11 (ARM64), 1280x800, Edge | [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) |
+| Ubuntu | Ubuntu 24.04 or another release, XFCE on X11, 1280x800, Google Chrome | [cua-driver](https://github.com/trycua/cua) (over SSH) |
 
 [AGENTS.md](AGENTS.md) has usage tips for agents.
 
@@ -178,7 +178,7 @@ pick the server up automatically.
 
 | Command | Description |
 | --- | --- |
-| `agentpc create <os> [name]` | Create a VM (`ubuntu` or `windows`); fetches the Ubuntu image if missing |
+| `agentpc create <image> [name]` | Create a VM from `ubuntu`, `windows` or a version such as `ubuntu-22.04`; fetches Ubuntu images if missing |
 | `agentpc list` | VMs and images |
 | `agentpc info <name>` | Viewer URL, SSH and VNC details |
 | `agentpc start <name>` | Boot a stopped VM |
@@ -194,13 +194,13 @@ pick the server up automatically.
 
 | Command | Description |
 | --- | --- |
-| `agentpc image pull ubuntu [--tag 24.04]` | Download the published Ubuntu image |
-| `agentpc image build <os> [--iso <path>]` | Build an image locally (Ubuntu ~3 min, Windows ~12 min + ISO download) |
+| `agentpc image pull <image>` | Download a published Ubuntu image, e.g. `ubuntu` or `ubuntu-22.04` |
+| `agentpc image build <image> [--iso <path>]` | Build an image locally (Ubuntu ~3 min, Windows ~12 min + ISO download) |
 | `agentpc image ls` | List local images with their OS versions |
-| `agentpc image info <os>` | Version, source, build date and desktop server of an image |
-| `agentpc image rm <os>` | Delete a local image |
-| `agentpc image snapshot <os>` | Recapture the snapshot VMs resume from (build and pull do this) |
-| `agentpc image push ubuntu` | Maintainers: publish the image to ghcr.io |
+| `agentpc image info <image>` | Version, source, build date and desktop server of an image |
+| `agentpc image rm <image>` | Delete a local image |
+| `agentpc image snapshot <image>` | Recapture the snapshot VMs resume from (build and pull do this) |
+| `agentpc image push <image>` | Maintainers: publish an Ubuntu image to ghcr.io |
 
 ### Setup
 
@@ -215,12 +215,36 @@ pick the server up automatically.
 An **image** is a read-only disk with the OS, desktop and agent tools installed. Every VM is a
 copy-on-write clone of an image, so a VM starts from a clean install and costs only a few MB.
 
-| OS | How to get it | Source |
-| --- | --- | --- |
-| Ubuntu | `agentpc image pull ubuntu` (automatic on first `create`) or `agentpc image build ubuntu` | Official Ubuntu 24.04 cloud image |
-| Windows | `agentpc image build windows` | Official Windows 11 ARM64 ISO, downloaded from Microsoft (or `--iso <path>`) |
+Images are named `<os>-<version>`; a bare `ubuntu` or `windows` means the default version.
+Several versions can be installed side by side, and each VM remembers which one it came from.
 
-Each image records what it is (`agentpc image info <os>`):
+| Image | Source | How to get it |
+| --- | --- | --- |
+| `ubuntu` = `ubuntu-24.04` | Official Ubuntu 24.04 cloud image | `image pull` (automatic on first `create`) or `image build` |
+| `ubuntu-<release>` | Any release in [cloud-images.ubuntu.com/releases](https://cloud-images.ubuntu.com/releases/), e.g. `22.04`, `26.04` | `image build ubuntu-22.04`, or `image pull` if published |
+| `windows` = `windows-11` | Windows 11 25H2 (Home/Pro), 7.3 GB ISO from Microsoft | `image build windows` |
+| `windows-11-24h2`, `windows-11-23h2` | Earlier Windows 11 releases (Home/Pro) | `image build windows-11-23h2` |
+| `windows-<anything>` | Your own Windows 11 ARM64 Home/Pro ISO | `image build windows-<anything> --iso <path>` |
+
+Only ARM64 Windows runs at native speed on Apple Silicon, so x64-only releases aren't offered,
+and Windows 10's ARM64 build hangs at boot on Apple Silicon, so Windows 11 is the minimum.
+The unattended install handles the Home/Pro ISO; Enterprise and LTSC ISOs don't finish
+installing.
+Windows runs unactivated (a watermark, nothing else); activate it with your own key if you
+need to. Microsoft's evaluation ISOs aren't offered: they install already expired and shut
+down every hour.
+
+Microsoft serves only its current ARM64 ISOs; the older ones download from archive mirrors
+(archive.org, bobpony.com). Every ISO is checked against a pinned SHA-256, so a mirror can't
+substitute a modified file, and kept in `~/.agentpc/cache`. All are en-us; for another
+language, download it yourself and pass `--iso`.
+
+```sh
+agentpc image build ubuntu-22.04     # ~3 min
+agentpc create ubuntu-22.04          # VMs from different versions run side by side
+```
+
+Each image records what it is (`agentpc image info <image>`):
 
 ```json
 {
@@ -236,22 +260,22 @@ Each image records what it is (`agentpc image info <os>`):
 }
 ```
 
-Published images live in one package, `ghcr.io/pawanpaudel93/agentpc`, with the OS in the tag.
-Only Ubuntu is published (Windows images can't be redistributed):
+Published images live in one package, `ghcr.io/pawanpaudel93/agentpc`, tagged by image
+name. Only Ubuntu is published (Windows images can't be redistributed):
 
 | Tag | Meaning | Pull with |
 | --- | --- | --- |
-| `ubuntu` | Newest Ubuntu image | `agentpc image pull ubuntu` |
-| `ubuntu-24.04` | Newest build of Ubuntu 24.04 | `agentpc image pull ubuntu --tag 24.04` |
-| `ubuntu-24.04-YYYYMMDD` | One specific build (pinned) | `agentpc image pull ubuntu --tag 24.04-YYYYMMDD` |
+| `ubuntu-24.04` | Newest build of Ubuntu 24.04 (also tagged `ubuntu`) | `agentpc image pull ubuntu` |
+| `ubuntu-<release>` | Newest build of another release | `agentpc image pull ubuntu-22.04` |
+| `ubuntu-24.04-YYYYMMDD` | One specific build (pinned) | `agentpc image pull ubuntu-24.04-YYYYMMDD` |
 
 ## Configuration
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `AGENTPC_HOME` | `~/.agentpc` | Where images, VMs, keys and caches live |
-| `AGENTPC_IMAGE_REPO` | `ghcr.io/pawanpaudel93/agentpc` | Package for `image pull`/`push` (tags `<os>`, `<os>-<version>`, …) |
-| `WIN_ISO` | `~/Downloads/*A64FRE*.iso`, else a download | Windows ISO used by `image build windows` without `--iso` |
+| `AGENTPC_IMAGE_REPO` | `ghcr.io/pawanpaudel93/agentpc` | Package for `image pull`/`push` (tagged by image name) |
+| `WIN_ISO` | an earlier download, `~/Downloads/*A64FRE*.iso` (`windows-11` only), else a download | Windows ISO used by `image build windows-…` without `--iso` |
 
 Each VM gets its own ports on `127.0.0.1`, derived from its slot number `n`:
 
@@ -298,6 +322,8 @@ The guest login is `agent` / `agent`.
 - **A VM is in a bad state:** `agentpc reset <name>`.
 - **`image build`/`pull`/`rm` refuses:** VMs still depend on that image; `agentpc rm` them
   first.
+- **Windows build can't read the ISO:** dockur runs in colima, which only shares your home
+  folder; keep `--iso` files (and `AGENTPC_HOME`) under it.
 
 ## Security
 

@@ -23,17 +23,19 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::instance::{Instance, Os};
+use crate::instance::{Image, Instance, Os};
 use crate::{ops, qemu, viewer};
 
 const INSTRUCTIONS: &str = "\
-Controls disposable Windows 11 and Ubuntu desktop VMs on this Mac.
+Controls disposable Windows and Ubuntu desktop VMs on this Mac.
 
 Typical flow: list_vms -> create_vm (or start_vm) -> take_screenshot -> list_desktop_tools ->
 use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance to a clean state.
 Windows desktop tools come from Windows-MCP (call Snapshot first; Click/Type need a loc
 [x, y] or label). Ubuntu desktop tools come from cua-driver (keyboard/mouse input needs
 \"delivery_mode\": \"foreground\"). run_command runs PowerShell on Windows and bash on Ubuntu.
+create_vm takes an optional version (Ubuntu release like \"22.04\"; Windows \"11\",
+\"11-23h2\", ...; see agentpc image build --help); list_vms shows which images exist.
 ";
 
 pub async fn serve() -> Result<()> {
@@ -85,6 +87,9 @@ enum OsArg {
 #[derive(Deserialize, JsonSchema)]
 struct CreateArgs {
     os: OsArg,
+    /// Default: ubuntu 24.04, windows 11. Ubuntu: any release, e.g. "22.04", "26.04".
+    /// Windows: "11", "11-24h2" or "11-23h2".
+    version: Option<String>,
     name: Option<String>,
 }
 
@@ -143,29 +148,31 @@ struct DesktopArgs {
 
 #[tool_router]
 impl Gateway {
-    #[tool(description = "List VM instances (name, os, state, viewer URL) and which images exist.")]
+    #[tool(
+        description = "List VM instances (name, image, state, viewer URL) and which images exist."
+    )]
     async fn list_vms(&self) -> CallToolResult {
         text(blocking(|| {
             let instances: Vec<_> = Instance::list()?
                 .iter()
                 .map(|i| {
                     json!({
-                        "name": i.name, "os": i.os, "state": if i.running() { "running" } else { "stopped" },
+                        "name": i.name, "os": i.os, "image": i.image.to_string(), "state": if i.running() { "running" } else { "stopped" },
                         "slot": i.slot, "viewer": viewer::url(i), "ssh_port": i.ssh_port(),
                     })
                 })
                 .collect();
-            let images: Vec<Value> = Os::ALL
+            let images: Vec<Value> = Image::all()
                 .into_iter()
-                .filter(|os| os.image_disk().is_file())
-                .map(|os| {
-                    let info = crate::image::read_info(os);
+                .map(|image| {
+                    let info = crate::image::read_info(&image);
                     json!({
-                        "os": os,
+                        "image": image.to_string(),
+                        "os": image.os,
                         "version": info.as_ref().map(|i| i.version.clone()),
                         "based_on": info.as_ref().map(|i| i.base.clone()),
                         "desktop_server": info.as_ref().map(|i| i.desktop_server.clone()),
-                        "fast_start": os.has_snapshot(),
+                        "fast_start": image.has_snapshot(),
                     })
                 })
                 .collect();
@@ -183,7 +190,12 @@ impl Gateway {
             OsArg::Windows => Os::Windows,
             OsArg::Ubuntu => Os::Ubuntu,
         };
-        text(blocking(move || ops::create(os, a.name.as_deref())).await)
+        text(
+            blocking(move || {
+                ops::create(&Image::new(os, a.version.as_deref())?, a.name.as_deref())
+            })
+            .await,
+        )
     }
 
     #[tool(description = "Boot a stopped instance and wait until its desktop is ready.")]

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use instance::{Instance, Os};
+use instance::{Image, Instance};
 
 /// Timestamped progress line on stderr (stdout stays clean for results and MCP).
 #[macro_export]
@@ -38,7 +38,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Create a VM from an image and boot it (default name: <os>-<n>); gets the image if missing
-    Create { os: String, name: Option<String> },
+    Create {
+        /// ubuntu, windows, or a version: ubuntu-22.04, windows-11-23h2 (see image build --help)
+        image: String,
+        name: Option<String>,
+    },
     /// List VMs and images
     List,
     /// Viewer URL, SSH and VNC details
@@ -83,36 +87,39 @@ enum Cmd {
 #[derive(Subcommand)]
 enum ImageCmd {
     /// Build an image locally by installing the OS (Ubuntu ~3 min, Windows ~12 min)
+    #[command(after_help = "\
+Images are <os>-<version>; a bare os means the default version.
+  ubuntu-<release>            any release at cloud-images.ubuntu.com/releases (default 24.04)
+  windows-11                  Windows 11 25H2 Home/Pro (default)
+  windows-11-24h2             Windows 11 24H2 Home/Pro (archive mirror)
+  windows-11-23h2             Windows 11 23H2 Home/Pro (archive mirror)
+ISOs are checksum-verified; --iso installs from your own under any name.")]
     Build {
-        os: String,
-        /// Windows 11 ARM64 ISO (default: $WIN_ISO or ~/Downloads/*A64FRE*.iso)
+        image: String,
+        /// Windows ARM64 ISO to install from (default: $WIN_ISO, an earlier download,
+        /// ~/Downloads/*A64FRE*.iso for windows-11, else download it)
         #[arg(long)]
         iso: Option<PathBuf>,
     },
-    /// Download a published image (Ubuntu only; Windows can't be redistributed)
-    Pull {
-        os: String,
-        #[arg(long, default_value = "latest")]
-        tag: String,
-    },
-    /// Publish the local image to the registry (maintainers; needs `oras login`)
-    Push {
-        os: String,
-        #[arg(long, default_value = "latest")]
-        tag: String,
-    },
+    /// Download a published image, e.g. ubuntu-22.04 (Ubuntu only; Windows can't be redistributed)
+    Pull { image: String },
+    /// Publish a local image to the registry (maintainers; needs `oras login`)
+    Push { image: String },
     /// List local images
     Ls,
     /// Everything recorded about an image: OS version, edition, build, source, tool versions
-    Info { os: String },
+    Info { image: String },
     /// Delete a local image
-    Rm { os: String },
+    Rm { image: String },
     /// Recapture the RAM snapshot new VMs resume from (build and pull do this)
-    Snapshot { os: String },
+    Snapshot { image: String },
 }
 
 fn main() {
     ensure_path();
+    if let Err(e) = instance::migrate_legacy_images() {
+        log!("upgrading the image layout failed: {e:#}");
+    }
     if let Err(e) = run(Cli::parse()) {
         log!("FAIL: {e:#}");
         std::process::exit(1);
@@ -121,7 +128,7 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::Create { os, name } => out(ops::create(os.parse::<Os>()?, name.as_deref())),
+        Cmd::Create { image, name } => out(ops::create(&image.parse()?, name.as_deref())),
         Cmd::List => out(ops::list_table()),
         Cmd::Info { name } => out(Ok(ops::info(&Instance::load(&name)?))),
         Cmd::Start { name } => out(ops::boot(&Instance::load(&name)?)),
@@ -154,13 +161,13 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Image(cmd) => match cmd {
-            ImageCmd::Build { os, iso } => image::build(os.parse()?, iso),
-            ImageCmd::Pull { os, tag } => registry::pull(os.parse()?, &tag),
-            ImageCmd::Push { os, tag } => registry::push(os.parse()?, &tag),
+            ImageCmd::Build { image: i, iso } => image::build(&i.parse()?, iso),
+            ImageCmd::Pull { image: i } => registry::pull(&i.parse()?),
+            ImageCmd::Push { image: i } => registry::push(&i.parse()?),
             ImageCmd::Ls => out(image::list()),
-            ImageCmd::Info { os } => out(image::describe(os.parse()?)),
-            ImageCmd::Rm { os } => out(image::remove(os.parse()?)),
-            ImageCmd::Snapshot { os } => image::snapshot(os.parse()?),
+            ImageCmd::Info { image: i } => out(image::describe(&i.parse()?)),
+            ImageCmd::Rm { image: i } => out(image::remove(&i.parse()?)),
+            ImageCmd::Snapshot { image: i } => image::snapshot(&i.parse::<Image>()?),
         },
         Cmd::Mcp => tokio::runtime::Runtime::new()?.block_on(mcp::serve()),
         Cmd::McpInstall { clients } => setup::mcp_install(&clients),

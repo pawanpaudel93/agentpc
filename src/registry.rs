@@ -15,7 +15,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use crate::instance::{Instance, Os, cache_dir, images_dir};
+use crate::instance::{Image, Os, cache_dir, images_dir};
 use crate::ops::run;
 use crate::{image, log};
 
@@ -27,20 +27,11 @@ const VARS_TYPE: &str = "application/vnd.agentpc.efi-vars";
 const PART_SIZE: &str = "512m";
 const PARALLEL_DOWNLOADS: usize = 6;
 
-/// One package for all OSes, with the OS in the tag: `<repo>:<os>` for the newest image,
-/// `<repo>:<os>-<tag>` otherwise. `AGENTPC_IMAGE_REPO` overrides the repo (e.g. a local test
-/// registry).
-pub fn reference(os: Os, tag: &str) -> String {
+/// One package for all images, tagged by image name (`<repo>:ubuntu-24.04`).
+/// `AGENTPC_IMAGE_REPO` overrides the repo (e.g. a local test registry).
+fn reference(tag: &str) -> String {
     let repo = std::env::var("AGENTPC_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_REPO.into());
-    format!("{repo}:{}", os_tag(os, tag))
-}
-
-fn os_tag(os: Os, tag: &str) -> String {
-    if tag == "latest" {
-        os.to_string()
-    } else {
-        format!("{os}-{tag}")
-    }
+    format!("{repo}:{tag}")
 }
 
 fn plain_http(host: &str) -> bool {
@@ -48,23 +39,24 @@ fn plain_http(host: &str) -> bool {
 }
 
 /// Publish the local image (maintainers). Uses `oras` and its stored login.
-pub fn push(os: Os, tag: &str) -> Result<()> {
+pub fn push(image: &Image) -> Result<()> {
+    let os = image.os;
     if os == Os::Windows {
         bail!("Windows images can't be redistributed (Microsoft license); users build their own");
     }
     let oras =
         crate::qemu::which("oras").context("oras not found; install it with: brew install oras")?;
-    if !os.image_disk().is_file() {
-        bail!("no {os} image to push; run: agentpc image build {os}");
+    if !image.exists() {
+        bail!("no {image} image to push; run: agentpc image build {image}");
     }
-    let mut info = image::read_info(os).with_context(|| {
-        format!("the {os} image has no version info; run: agentpc image snapshot {os}")
+    let mut info = image::read_info(image).with_context(|| {
+        format!("{image} has no version info; run: agentpc image snapshot {image}")
     })?;
-    let work = cache_dir().join(format!("push-{os}"));
+    let work = cache_dir().join(format!("push-{image}"));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)?;
 
-    log!("compressing the {os} image");
+    log!("compressing the {image} image");
     let disk = work.join("disk.qcow2");
     run(
         "qemu-img",
@@ -73,7 +65,7 @@ pub fn push(os: Os, tag: &str) -> Result<()> {
             "-c",
             "-O",
             "qcow2",
-            &os.image_disk().to_string_lossy(),
+            &image.disk().to_string_lossy(),
             &disk.to_string_lossy(),
         ],
     )?;
@@ -86,11 +78,11 @@ pub fn push(os: Os, tag: &str) -> Result<()> {
         bail!("split failed");
     }
     std::fs::remove_file(&disk)?;
-    std::fs::copy(os.image_vars(), work.join("vars.fd"))?;
+    std::fs::copy(image.vars(), work.join("vars.fd"))?;
     // Older images have no build date; stamp one so the pinned tag and the info agree.
     if info.built.is_empty() {
         info.built = crate::instance::local_date();
-        image::write_info(os, &info)?;
+        image::write_info(image, &info)?;
     }
     std::fs::write(work.join("config.json"), serde_json::to_vec(&info)?)?;
 
@@ -100,11 +92,13 @@ pub fn push(os: Os, tag: &str) -> Result<()> {
         .filter(|n| n.starts_with("disk.qcow2.part-"))
         .collect();
     parts.sort();
-    // :<os> (newest), :<os>-<version> (newest build of that version), and
-    // :<os>-<version>-<build date> (pinned).
-    let versioned = os_tag(os, &info.version_id);
-    let pinned = os_tag(os, &format!("{}-{}", info.version_id, info.built));
-    let target = format!("{},{versioned},{pinned}", reference(os, tag));
+    // :<image> (newest build of that version), :<image>-<build date> (pinned), and bare
+    // :<os> for the default version.
+    let mut tags = vec![image.to_string(), format!("{image}-{}", info.built)];
+    if image.version == os.default_version() {
+        tags.push(os.to_string());
+    }
+    let target = reference(&tags.join(","));
     let host = target.split('/').next().unwrap_or_default().to_string();
     let mut cmd = Command::new(oras);
     cmd.current_dir(&work)
@@ -118,32 +112,28 @@ pub fn push(os: Os, tag: &str) -> Result<()> {
     if plain_http(&host) {
         cmd.arg("--plain-http");
     }
-    log!("pushing {} ({} parts)", reference(os, tag), parts.len());
+    log!("pushing {} ({} parts)", reference(&tags[0]), parts.len());
     let st = cmd.status().context("run oras")?;
     std::fs::remove_dir_all(&work)?;
     if !st.success() {
         bail!("oras push failed (log in first: oras login ghcr.io)");
     }
-    log!(
-        "pushed {} as :{}, :{versioned} and :{pinned}",
-        info.version,
-        os_tag(os, tag)
-    );
+    log!("pushed {} as :{}", info.version, tags.join(", :"));
     Ok(())
 }
 
 /// Download an image, then capture its RAM snapshot locally.
-pub fn pull(os: Os, tag: &str) -> Result<()> {
-    if os == Os::Windows {
+pub fn pull(image: &Image) -> Result<()> {
+    if image.os == Os::Windows {
         bail!(
-            "Windows images aren't published (Microsoft license); run: agentpc image build windows"
+            "Windows images aren't published (Microsoft license); run: agentpc image build {image}"
         );
     }
-    if Instance::list()?.iter().any(|i| i.os == os) {
-        bail!("VMs of {os} depend on its current image; rm them first");
+    if !image.instances()?.is_empty() {
+        bail!("VMs of {image} depend on its current copy; rm them first");
     }
-    tokio::runtime::Runtime::new()?.block_on(download(os, tag))?;
-    image::snapshot(os)
+    tokio::runtime::Runtime::new()?.block_on(download(image))?;
+    image::snapshot(image)
 }
 
 struct Ref {
@@ -164,8 +154,9 @@ fn parse(reference: &str) -> Result<Ref> {
     })
 }
 
-async fn download(os: Os, tag: &str) -> Result<()> {
-    let r = parse(&reference(os, tag))?;
+async fn download(image: &Image) -> Result<()> {
+    let at = reference(&image.to_string());
+    let r = parse(&at)?;
     let scheme = if plain_http(&r.host) { "http" } else { "https" };
     let base = format!("{scheme}://{}/v2/{}", r.host, r.repo);
     let http = reqwest::Client::builder()
@@ -177,17 +168,17 @@ async fn download(os: Os, tag: &str) -> Result<()> {
         None => req,
     };
 
-    log!("fetching {}", reference(os, tag));
+    log!("fetching {at}");
     let manifest: Value = auth(http.get(format!("{base}/manifests/{}", r.tag)))
         .header("Accept", "application/vnd.oci.image.manifest.v1+json")
         .send()
         .await?
         .error_for_status()
-        .with_context(|| format!("no image at {}", reference(os, tag)))?
+        .with_context(|| format!("no image at {at}"))?
         .json()
         .await?;
     if manifest["artifactType"] != ARTIFACT_TYPE {
-        bail!("{} is not an agentpc image", reference(os, tag));
+        bail!("{at} is not an agentpc image");
     }
     let config_digest = manifest["config"]["digest"]
         .as_str()
@@ -199,14 +190,14 @@ async fn download(os: Os, tag: &str) -> Result<()> {
         .json()
         .await
         .context("image config is not agentpc image info")?;
-    info.pulled_from = Some(reference(os, tag));
+    info.pulled_from = Some(at);
     log!("{} (built {} from {})", info.version, info.built, info.base);
     let layers = manifest["layers"]
         .as_array()
         .context("manifest has no layers")?;
     let total: u64 = layers.iter().filter_map(|l| l["size"].as_u64()).sum();
 
-    let work = cache_dir().join(format!("pull-{os}"));
+    let work = cache_dir().join(format!("pull-{image}"));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)?;
     let done = Arc::new(AtomicU64::new(0));
@@ -257,7 +248,7 @@ async fn download(os: Os, tag: &str) -> Result<()> {
         bail!("image is missing its disk or vars");
     }
     std::fs::create_dir_all(images_dir())?;
-    let disk_tmp = os.image_disk().with_extension("qcow2.tmp");
+    let disk_tmp = image.disk().with_extension("qcow2.tmp");
     let mut out = tokio::fs::File::create(&disk_tmp).await?;
     for p in &parts {
         let mut f = tokio::fs::File::open(p).await?;
@@ -266,14 +257,18 @@ async fn download(os: Os, tag: &str) -> Result<()> {
     out.flush().await?;
     drop(out);
 
-    replace_readonly(&disk_tmp, &os.image_disk())?;
-    replace_readonly(&work.join("vars.fd"), &os.image_vars())?;
-    image::write_info(os, &info)?;
-    for p in [os.snapshot_disk(), os.snapshot_vars(), os.snapshot_state()] {
+    replace_readonly(&disk_tmp, &image.disk())?;
+    replace_readonly(&work.join("vars.fd"), &image.vars())?;
+    image::write_info(image, &info)?;
+    for p in [
+        image.snapshot_disk(),
+        image.snapshot_vars(),
+        image.snapshot_state(),
+    ] {
         let _ = std::fs::remove_file(p);
     }
     std::fs::remove_dir_all(&work)?;
-    log!("{os} image downloaded");
+    log!("{image} downloaded");
     Ok(())
 }
 
