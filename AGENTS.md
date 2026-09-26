@@ -43,6 +43,8 @@ Rules:
 
 ## Working on this repo
 
+- Commits follow Conventional Commits: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`,
+  `ci:` or `chore:`, then a short imperative subject; add a brief bullet body only if needed.
 - Rust, single binary `agentpc` (CLI + MCP server). `src/main.rs` is the CLI; modules:
   `instance` (VMs, images, on-disk layout), `qemu`, `ops` (lifecycle),
   `viewer` (browser viewer), `image` (build/snapshot), `registry` (pull/push), `setup` (`doctor`, `mcp-install`), `mcp` (the server).
@@ -52,6 +54,9 @@ Rules:
   at first logon of a Windows image build; `guests/ubuntu/user-data` is the Ubuntu cloud-init.
   Changes take effect on the next `agentpc image build`, which refuses while VMs of that OS exist.
 - State (images, keys, instances) lives in `~/.agentpc` (`AGENTPC_HOME` overrides).
+- `plugin/` is the Claude plugin (MCP server + `skills/agentpc/SKILL.md`), listed by
+  `.claude-plugin/marketplace.json`. Keep the skill's tool guidance in sync with the
+  "Using the VMs" section above; check with `claude plugin validate plugin --strict`.
 - Verify with `cargo clippy -- -D warnings` plus a real instance (`agentpc create ubuntu`, then
   the MCP tools). Unit tests can't cover the VM paths.
 - Never commit `target/` or `.state/`.

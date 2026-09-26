@@ -108,6 +108,21 @@ To watch a VM yourself, open the viewer URL printed by `agentpc info <name>`.
 
 agentpc is an MCP server (`agentpc mcp`, stdio). One server handles every VM.
 
+### Claude plugin
+
+In Claude Code, install the agentpc plugin. It bundles the MCP server with a skill that
+teaches Claude when and how to use the VMs:
+
+```text
+/plugin marketplace add pawanpaudel93/agentpc
+/plugin install agentpc@agentpc
+```
+
+The plugin runs the installed `agentpc` binary, so install that first
+(see [Installation](#installation)).
+
+### Other agents
+
 **Register it** with every supported agent that's installed (the installer does this):
 
 ```sh
@@ -129,7 +144,7 @@ This repository also contains project-level configs (`.mcp.json`, `.codex/config
 `.cursor/mcp.json`, `.gemini/settings.json`, `.vscode/mcp.json`), so agents opened in a clone
 pick the server up automatically.
 
-**Tools:**
+### Tools
 
 | Tool | Description |
 | --- | --- |

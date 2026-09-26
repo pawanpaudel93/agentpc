@@ -1,0 +1,43 @@
+# agentpc plugin for Claude
+
+Gives Claude disposable Windows 11 and Ubuntu desktops on your Mac. Claude can create a VM
+in about a second, click, type, take screenshots and run commands in it, then reset it to a
+clean install.
+
+The plugin bundles:
+
+- the `agentpc` MCP server (VM lifecycle, screenshots, shell and GUI control), and
+- the `agentpc` skill, which teaches Claude when and how to use the VMs.
+
+## Requirements
+
+- An Apple Silicon Mac (M1 or later) running macOS 14 or later.
+- The `agentpc` binary on your `PATH`:
+
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.sh | sh
+  ```
+
+## Install
+
+In Claude Code:
+
+```text
+/plugin marketplace add pawanpaudel93/agentpc
+/plugin install agentpc@agentpc
+```
+
+Then ask Claude something like *"Create an Ubuntu VM and check that my install script works on
+a clean machine."*
+
+The first Ubuntu VM downloads the Ubuntu image (~1.2 GB). Windows images can't be
+redistributed, so build yours once from a Windows 11 ARM64 ISO:
+`agentpc image build windows --iso <path>`.
+
+## More
+
+See the [agentpc repository](https://github.com/pawanpaudel93/agentpc) for documentation.
+
+## License
+
+[MIT](LICENSE)
