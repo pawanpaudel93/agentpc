@@ -235,20 +235,21 @@ Each image records what it is (`agentpc image info <os>`):
 }
 ```
 
-Published Ubuntu images live at `ghcr.io/pawanpaudel93/agentpc-ubuntu` with these tags:
+Published images live in one package, `ghcr.io/pawanpaudel93/agentpc`, with the OS in the tag.
+Only Ubuntu is published (Windows images can't be redistributed):
 
-| Tag | Meaning |
-| --- | --- |
-| `latest` | Newest image |
-| `24.04` | Newest build of Ubuntu 24.04 |
-| `24.04-YYYYMMDD` | One specific build (pinned) |
+| Tag | Meaning | Pull with |
+| --- | --- | --- |
+| `ubuntu` | Newest Ubuntu image | `agentpc image pull ubuntu` |
+| `ubuntu-24.04` | Newest build of Ubuntu 24.04 | `agentpc image pull ubuntu --tag 24.04` |
+| `ubuntu-24.04-YYYYMMDD` | One specific build (pinned) | `agentpc image pull ubuntu --tag 24.04-YYYYMMDD` |
 
 ## Configuration
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `AGENTPC_HOME` | `~/.agentpc` | Where images, VMs, keys and caches live |
-| `AGENTPC_IMAGE_REPO` | `ghcr.io/pawanpaudel93/agentpc` | Registry prefix for `image pull`/`push` (`<repo>-<os>:<tag>`) |
+| `AGENTPC_IMAGE_REPO` | `ghcr.io/pawanpaudel93/agentpc` | Package for `image pull`/`push` (tags `<os>`, `<os>-<version>`, …) |
 | `WIN_ISO` | `~/Downloads/*A64FRE*.iso` | Windows ISO used by `image build windows` without `--iso` |
 
 Each VM gets its own ports on `127.0.0.1`, derived from its slot number `n`:

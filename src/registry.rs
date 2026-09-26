@@ -27,10 +27,20 @@ const VARS_TYPE: &str = "application/vnd.agentpc.efi-vars";
 const PART_SIZE: &str = "512m";
 const PARALLEL_DOWNLOADS: usize = 6;
 
-/// `<repo>-<os>:<tag>`; `AGENTPC_IMAGE_REPO` overrides the repo (e.g. a local test registry).
+/// One package for all OSes, with the OS in the tag: `<repo>:<os>` for the newest image,
+/// `<repo>:<os>-<tag>` otherwise. `AGENTPC_IMAGE_REPO` overrides the repo (e.g. a local test
+/// registry).
 pub fn reference(os: Os, tag: &str) -> String {
     let repo = std::env::var("AGENTPC_IMAGE_REPO").unwrap_or_else(|_| DEFAULT_REPO.into());
-    format!("{repo}-{os}:{tag}")
+    format!("{repo}:{}", os_tag(os, tag))
+}
+
+fn os_tag(os: Os, tag: &str) -> String {
+    if tag == "latest" {
+        os.to_string()
+    } else {
+        format!("{os}-{tag}")
+    }
 }
 
 fn plain_http(host: &str) -> bool {
@@ -90,10 +100,11 @@ pub fn push(os: Os, tag: &str) -> Result<()> {
         .filter(|n| n.starts_with("disk.qcow2.part-"))
         .collect();
     parts.sort();
-    // :<tag> (latest), :<os version> (moves to the newest build of that version), and
-    // :<os version>-<build date> (pinned).
-    let pinned = format!("{}-{}", info.version_id, info.built);
-    let target = format!("{},{},{pinned}", reference(os, tag), info.version_id);
+    // :<os> (newest), :<os>-<version> (newest build of that version), and
+    // :<os>-<version>-<build date> (pinned).
+    let versioned = os_tag(os, &info.version_id);
+    let pinned = os_tag(os, &format!("{}-{}", info.version_id, info.built));
+    let target = format!("{},{versioned},{pinned}", reference(os, tag));
     let host = target.split('/').next().unwrap_or_default().to_string();
     let mut cmd = Command::new(oras);
     cmd.current_dir(&work)
@@ -114,9 +125,9 @@ pub fn push(os: Os, tag: &str) -> Result<()> {
         bail!("oras push failed (log in first: oras login ghcr.io)");
     }
     log!(
-        "pushed {} as :{tag}, :{} and :{pinned}",
+        "pushed {} as :{}, :{versioned} and :{pinned}",
         info.version,
-        info.version_id
+        os_tag(os, tag)
     );
     Ok(())
 }
