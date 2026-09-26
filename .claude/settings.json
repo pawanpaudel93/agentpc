@@ -2,9 +2,9 @@
   "enabledMcpjsonServers": ["agentpc"],
   "permissions": {
     "allow": [
-      "mcp__agentpc__vm_list",
-      "mcp__agentpc__vm_screenshot",
-      "mcp__agentpc__desktop_tools"
+      "mcp__agentpc__list_vms",
+      "mcp__agentpc__take_screenshot",
+      "mcp__agentpc__list_desktop_tools"
     ]
   }
 }

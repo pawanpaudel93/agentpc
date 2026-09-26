@@ -1,4 +1,4 @@
-//! MCP gateway over stdio. Lifecycle tools wrap `ops`; `desktop` forwards to the
+//! MCP gateway over stdio. Lifecycle tools wrap `ops`; `use_desktop_tool` forwards to the
 //! instance's own desktop-control server (Windows-MCP over HTTP, cua-driver over SSH)
 //! through one session kept open per instance, so element references returned by one
 //! call stay valid in the next.
@@ -29,11 +29,11 @@ use crate::{ops, qemu, viewer};
 const INSTRUCTIONS: &str = "\
 Controls disposable Windows 11 and Ubuntu desktop VMs on this Mac.
 
-Typical flow: vm_list -> vm_create (or vm_start) -> vm_screenshot -> desktop_tools ->
-desktop(...) -> vm_screenshot to verify. vm_reset returns an instance to a clean state.
+Typical flow: list_vms -> create_vm (or start_vm) -> take_screenshot -> list_desktop_tools ->
+use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance to a clean state.
 Windows desktop tools come from Windows-MCP (call Snapshot first; Click/Type need a loc
 [x, y] or label). Ubuntu desktop tools come from cua-driver (keyboard/mouse input needs
-\"delivery_mode\": \"foreground\"). vm_exec runs PowerShell on Windows and bash on Ubuntu.
+\"delivery_mode\": \"foreground\"). run_command runs PowerShell on Windows and bash on Ubuntu.
 ";
 
 pub async fn serve() -> Result<()> {
@@ -144,7 +144,7 @@ struct DesktopArgs {
 #[tool_router]
 impl Gateway {
     #[tool(description = "List VM instances (name, os, state, viewer URL) and which images exist.")]
-    async fn vm_list(&self) -> CallToolResult {
+    async fn list_vms(&self) -> CallToolResult {
         text(blocking(|| {
             let instances: Vec<_> = Instance::list()?
                 .iter()
@@ -178,7 +178,7 @@ impl Gateway {
         description = "Create and boot a new instance cloned from its image (~1 s ubuntu, ~4 s windows).\n\
                           Returns once the desktop and its control server are ready."
     )]
-    async fn vm_create(&self, Parameters(a): Parameters<CreateArgs>) -> CallToolResult {
+    async fn create_vm(&self, Parameters(a): Parameters<CreateArgs>) -> CallToolResult {
         let os = match a.os {
             OsArg::Windows => Os::Windows,
             OsArg::Ubuntu => Os::Ubuntu,
@@ -187,24 +187,24 @@ impl Gateway {
     }
 
     #[tool(description = "Boot a stopped instance and wait until its desktop is ready.")]
-    async fn vm_start(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
+    async fn start_vm(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
         text(self.lifecycle(&a.name, ops::boot).await)
     }
 
     #[tool(description = "Shut an instance down cleanly (its disk is kept).")]
-    async fn vm_stop(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
+    async fn stop_vm(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
         text(self.lifecycle(&a.name, ops::stop).await)
     }
 
     #[tool(
         description = "Discard all changes: restore the instance to a fresh copy of its image and boot it."
     )]
-    async fn vm_reset(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
+    async fn reset_vm(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
         text(self.lifecycle(&a.name, ops::reset).await)
     }
 
     #[tool(description = "Stop an instance and delete it with its disk.")]
-    async fn vm_delete(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
+    async fn delete_vm(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
         text(self.lifecycle(&a.name, ops::delete).await)
     }
 
@@ -212,7 +212,7 @@ impl Gateway {
         description = "Screenshot the instance's display from the hypervisor. Works at any time, even while\n\
                           booting or when the desktop server is unresponsive."
     )]
-    async fn vm_screenshot(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
+    async fn take_screenshot(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
         let png = async {
             let inst = load(&a.name)?;
             blocking(move || qemu::screenshot(&inst, &inst.dir.join("screen.png"))).await
@@ -229,12 +229,12 @@ impl Gateway {
         description = "Run a shell command in the instance over SSH: PowerShell on windows, bash on ubuntu.\n\
                           Returns combined stdout and stderr."
     )]
-    async fn vm_exec(&self, Parameters(a): Parameters<ExecArgs>) -> CallToolResult {
+    async fn run_command(&self, Parameters(a): Parameters<ExecArgs>) -> CallToolResult {
         text(exec(&a.name, &a.command, a.timeout).await)
     }
 
     #[tool(description = "Copy a file or directory from this Mac into a VM (scp).")]
-    async fn vm_upload(&self, Parameters(a): Parameters<UploadArgs>) -> CallToolResult {
+    async fn upload_file(&self, Parameters(a): Parameters<UploadArgs>) -> CallToolResult {
         text(
             async {
                 let inst = load(&a.name)?;
@@ -246,7 +246,7 @@ impl Gateway {
     }
 
     #[tool(description = "Copy a file or directory from a VM to this Mac (scp).")]
-    async fn vm_download(&self, Parameters(a): Parameters<DownloadArgs>) -> CallToolResult {
+    async fn download_file(&self, Parameters(a): Parameters<DownloadArgs>) -> CallToolResult {
         text(
             async {
                 let inst = load(&a.name)?;
@@ -261,7 +261,7 @@ impl Gateway {
         description = "Make a server running inside a VM reachable from this Mac: forwards a port on\n\
                           127.0.0.1 to the guest port until the VM stops. Returns the host address."
     )]
-    async fn vm_forward(&self, Parameters(a): Parameters<ForwardArgs>) -> CallToolResult {
+    async fn forward_port(&self, Parameters(a): Parameters<ForwardArgs>) -> CallToolResult {
         text(
             async {
                 let inst = load(&a.name)?;
@@ -273,9 +273,9 @@ impl Gateway {
 
     #[tool(
         description = "List the desktop-control tools available in an instance (name + summary), or the full\n\
-                          input schema of one tool when `tool` is given. Call them with `desktop`."
+                          input schema of one tool when `tool` is given. Call them with `use_desktop_tool`."
     )]
-    async fn desktop_tools(&self, Parameters(a): Parameters<ToolsArgs>) -> CallToolResult {
+    async fn list_desktop_tools(&self, Parameters(a): Parameters<ToolsArgs>) -> CallToolResult {
         let r = async {
             let tools = self
                 .with_session(&a.name, "list_tools", |c: Client| async move {
@@ -311,10 +311,10 @@ impl Gateway {
     }
 
     #[tool(
-        description = "Call a desktop-control tool inside an instance (see desktop_tools for names and schemas).\n\
+        description = "Call a desktop-control tool inside an instance (see list_desktop_tools for names and schemas).\n\
                           Screenshots and other content are returned as-is."
     )]
-    async fn desktop(&self, Parameters(a): Parameters<DesktopArgs>) -> CallToolResult {
+    async fn use_desktop_tool(&self, Parameters(a): Parameters<DesktopArgs>) -> CallToolResult {
         let params = CallToolRequestParams::new(a.tool.clone())
             .with_arguments(a.arguments.unwrap_or_default());
         let r = self
@@ -422,7 +422,7 @@ impl Gateway {
 async fn connect(name: &str) -> Result<RunningService<RoleClient, ()>> {
     let inst = load(name)?;
     if !inst.running() {
-        bail!("{name} is stopped; call vm_start first");
+        bail!("{name} is stopped; call start_vm first");
     }
     let session = async {
         match inst.os {
@@ -482,9 +482,9 @@ async fn exec(name: &str, command: &str, timeout: u64) -> Result<String> {
 fn load(name: &str) -> Result<Instance> {
     // Names become paths under the instances dir; keep `..` and `_build-*` out of reach.
     if name.starts_with(['_', '.']) || name.contains('/') {
-        bail!("no instance '{name}'; see vm_list");
+        bail!("no instance '{name}'; see list_vms");
     }
-    Instance::load(name).map_err(|_| anyhow!("no instance '{name}'; see vm_list"))
+    Instance::load(name).map_err(|_| anyhow!("no instance '{name}'; see list_vms"))
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {

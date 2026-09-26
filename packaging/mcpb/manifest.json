@@ -19,16 +19,19 @@
     }
   },
   "tools": [
-    { "name": "vm_list", "description": "VMs, their state, and which images exist" },
-    { "name": "vm_create", "description": "Create a VM from an image; ready in ~1 s (Ubuntu) or ~4 s (Windows)" },
-    { "name": "vm_start", "description": "Start an instance" },
-    { "name": "vm_stop", "description": "Stop an instance" },
-    { "name": "vm_reset", "description": "Discard all changes: back to a fresh copy of the image" },
-    { "name": "vm_delete", "description": "Stop and delete an instance" },
-    { "name": "vm_screenshot", "description": "Hypervisor screenshot of an instance" },
-    { "name": "vm_exec", "description": "Run a shell command (PowerShell on Windows, bash on Ubuntu)" },
-    { "name": "desktop_tools", "description": "List the desktop-control tools inside an instance" },
-    { "name": "desktop", "description": "Call a desktop-control tool inside an instance" }
+    { "name": "list_vms", "description": "VMs, their state, and which images exist" },
+    { "name": "create_vm", "description": "Create a VM from an image; ready in ~1 s (Ubuntu) or ~4 s (Windows)" },
+    { "name": "start_vm", "description": "Start an instance" },
+    { "name": "stop_vm", "description": "Stop an instance" },
+    { "name": "reset_vm", "description": "Discard all changes: back to a fresh copy of the image" },
+    { "name": "delete_vm", "description": "Stop and delete an instance" },
+    { "name": "take_screenshot", "description": "Hypervisor screenshot of an instance" },
+    { "name": "run_command", "description": "Run a shell command (PowerShell on Windows, bash on Ubuntu)" },
+    { "name": "upload_file", "description": "Copy a file or folder from this Mac into a VM" },
+    { "name": "download_file", "description": "Copy a file or folder from a VM to this Mac" },
+    { "name": "forward_port", "description": "Reach a server running in a VM from this Mac" },
+    { "name": "list_desktop_tools", "description": "List the desktop-control tools inside an instance" },
+    { "name": "use_desktop_tool", "description": "Call a desktop-control tool inside an instance" }
   ],
   "keywords": ["vm", "qemu", "windows", "ubuntu", "computer-use"],
   "compatibility": { "platforms": ["darwin"] }

@@ -22,36 +22,36 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 
 | Tool | Use |
 | --- | --- |
-| `vm_list` | VMs, their state, and the available images with OS versions. Start here. |
-| `vm_create(os, name?)` | New VM (`ubuntu` or `windows`); returns when the desktop is ready |
-| `vm_start` / `vm_stop` | Boot a stopped VM / shut one down |
-| `vm_reset(name)` | Discard all changes: back to a clean install |
-| `vm_delete(name)` | Delete a VM |
-| `vm_screenshot(name)` | PNG screenshot; works even while booting or hung |
-| `vm_exec(name, command)` | Shell command: PowerShell on Windows, bash on Ubuntu |
-| `vm_upload` / `vm_download` | Copy files or folders between this Mac and a VM |
-| `vm_forward(name, guest_port)` | Reach a server running in the VM at `127.0.0.1:<port>` on the Mac |
-| `desktop_tools(name, tool?)` | List the GUI tools inside a VM, or one tool's full schema |
-| `desktop(name, tool, arguments)` | Call a GUI tool: click, type, launch apps, read the UI tree |
+| `list_vms` | VMs, their state, and the available images with OS versions. Start here. |
+| `create_vm(os, name?)` | New VM (`ubuntu` or `windows`); returns when the desktop is ready |
+| `start_vm` / `stop_vm` | Boot a stopped VM / shut one down |
+| `reset_vm(name)` | Discard all changes: back to a clean install |
+| `delete_vm(name)` | Delete a VM |
+| `take_screenshot(name)` | PNG screenshot; works even while booting or hung |
+| `run_command(name, command)` | Shell command: PowerShell on Windows, bash on Ubuntu |
+| `upload_file` / `download_file` | Copy files or folders between this Mac and a VM |
+| `forward_port(name, guest_port)` | Reach a server running in the VM at `127.0.0.1:<port>` on the Mac |
+| `list_desktop_tools(name, tool?)` | List the GUI tools inside a VM, or one tool's full schema |
+| `use_desktop_tool(name, tool, arguments)` | Call a GUI tool: click, type, launch apps, read the UI tree |
 
 ## How to work
 
-1. `vm_list`; reuse a running VM of the right OS, or `vm_create` one.
-2. Prefer `vm_exec` for anything a shell can do. It's faster and more reliable than the GUI.
-   Use `vm_upload` to bring in what you need to test (an installer, a script, a build).
-3. For GUI work, loop: look (`vm_screenshot` or a UI-snapshot tool), act (`desktop`), then
+1. `list_vms`; reuse a running VM of the right OS, or `create_vm` one.
+2. Prefer `run_command` for anything a shell can do. It's faster and more reliable than the GUI.
+   Use `upload_file` to bring in what you need to test (an installer, a script, a build).
+3. For GUI work, loop: look (`take_screenshot` or a UI-snapshot tool), act (`use_desktop_tool`), then
    look again to verify.
-4. Call `desktop_tools` once per VM to learn the exact tool names and arguments.
-5. When finished, `vm_delete` VMs you created, unless the user wants to keep them.
+4. Call `list_desktop_tools` once per VM to learn the exact tool names and arguments.
+5. When finished, `delete_vm` VMs you created, unless the user wants to keep them.
 
 ## Windows (desktop tools from Windows-MCP)
 
 - Call `Snapshot` first to get element labels and coordinates.
 - `Click` takes `loc: [x, y]`; `Type` needs `loc` or `label`.
 - `App` with `mode: "launch"` opens programs by name; `Shortcut` sends key combinations.
-- `vm_exec` runs PowerShell as the `agent` administrator. The screen is 1280x800.
-- Processes started over `vm_exec` end when the command returns; start long-running servers
-  with a scheduled task, and open the Windows firewall for ports you `vm_forward`.
+- `run_command` runs PowerShell as the `agent` administrator. The screen is 1280x800.
+- Processes started over `run_command` end when the command returns; start long-running servers
+  with a scheduled task, and open the Windows firewall for ports you `forward_port`.
 - SmartScreen, Windows Update and first-run pop-ups are turned off. Edge is the browser.
 
 ## Ubuntu (desktop tools from cua-driver, XFCE on X11)
@@ -60,7 +60,7 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
   tools need.
 - Keyboard and mouse tools need `"delivery_mode": "foreground"`.
 - `launch_app` takes a command name such as `xfce4-terminal`.
-- `vm_exec` runs bash as `agent`, with passwordless `sudo`. The screen is 1280x800.
+- `run_command` runs bash as `agent`, with passwordless `sudo`. The screen is 1280x800.
 - Google Chrome is installed. Browser tools: `browser_prepare` with `allow_launch: true` and
   `profile: {"mode": "isolated_new"}`, then `list_windows` for Chrome's `pid`/`window_id`,
   `get_browser_state` with those to get `target_id`/`tab_id`, then `browser_navigate`,
@@ -68,10 +68,10 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 
 ## Rules
 
-- VMs are disposable: `vm_reset` a broken one instead of repairing it.
+- VMs are disposable: `reset_vm` a broken one instead of repairing it.
 - Don't create VMs you won't use. Each running VM uses 4 GB (Ubuntu) or 8 GB (Windows) of RAM.
-- The first `vm_create ubuntu` downloads the Ubuntu image (~1.2 GB).
-- Windows images can't be downloaded. If `vm_list` shows no Windows image, ask the user to
+- The first `create_vm ubuntu` downloads the Ubuntu image (~1.2 GB).
+- Windows images can't be downloaded. If `list_vms` shows no Windows image, ask the user to
   build one once (~12 min) and don't start it yourself:
   `agentpc image build windows --iso <Windows 11 ARM64 ISO>`.
 - Don't put real credentials or secrets into a VM. The guest login is `agent` / `agent`, and

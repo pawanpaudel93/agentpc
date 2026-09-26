@@ -11,18 +11,18 @@ can run `agentpc mcp-install` (or install first: see README.md).
 
 | Tool | Use |
 |------|-----|
-| `vm_list` | VMs, their state, and the images (with OS version) they come from. Start here. |
-| `vm_create(os, name?)` | New clone: ubuntu ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready. |
-| `vm_start` / `vm_stop` / `vm_reset` / `vm_delete` | Lifecycle. `vm_reset` = back to a clean install. |
-| `vm_screenshot(name)` | Hypervisor screenshot; works even while booting or hung. |
-| `vm_exec(name, command)` | Shell over SSH: PowerShell on windows, bash on ubuntu. |
-| `vm_upload` / `vm_download` | Copy files or folders between the Mac and a VM. |
-| `vm_forward(name, guest_port)` | Reach a server in the VM at `127.0.0.1:<port>` on the Mac. |
-| `desktop_tools(name, tool?)` | Desktop-control tools in that VM, or one tool's full schema. |
-| `desktop(name, tool, arguments)` | Call one of those tools (click, type, launch, snapshot…). |
+| `list_vms` | VMs, their state, and the images (with OS version) they come from. Start here. |
+| `create_vm(os, name?)` | New clone: ubuntu ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready. |
+| `start_vm` / `stop_vm` / `reset_vm` / `delete_vm` | Lifecycle. `reset_vm` = back to a clean install. |
+| `take_screenshot(name)` | Hypervisor screenshot; works even while booting or hung. |
+| `run_command(name, command)` | Shell over SSH: PowerShell on windows, bash on ubuntu. |
+| `upload_file` / `download_file` | Copy files or folders between the Mac and a VM. |
+| `forward_port(name, guest_port)` | Reach a server in the VM at `127.0.0.1:<port>` on the Mac. |
+| `list_desktop_tools(name, tool?)` | Desktop-control tools in that VM, or one tool's full schema. |
+| `use_desktop_tool(name, tool, arguments)` | Call one of those tools (click, type, launch, snapshot…). |
 
-Work in a loop: look (`vm_screenshot` or a snapshot tool) → act (`desktop`) → look again to
-verify. Prefer `vm_exec` for anything a shell can do; use `desktop` for GUI-only work.
+Work in a loop: look (`take_screenshot` or a snapshot tool) → act (`use_desktop_tool`) → look again to
+verify. Prefer `run_command` for anything a shell can do; use `use_desktop_tool` for GUI-only work.
 
 **Windows** (desktop tools from Windows-MCP): call `Snapshot` first for element labels and
 coordinates. `Click` takes `loc: [x, y]`; `Type` needs `loc` or `label`; `App` with
@@ -35,12 +35,12 @@ tools need `"delivery_mode": "foreground"`. `launch_app` takes a command name su
 for the call sequence).
 
 Rules:
-- Instances are disposable; `vm_reset` instead of repairing a broken one.
-- Don't create instances you won't use, and `vm_delete` scratch instances when done.
+- Instances are disposable; `reset_vm` instead of repairing a broken one.
+- Don't create instances you won't use, and `delete_vm` scratch instances when done.
   Each running VM takes 4 GB (ubuntu) or 8 GB (windows) of RAM.
-- `vm_create ubuntu` downloads the Ubuntu image on first use (~1.2 GB). A Windows image must
+- `create_vm ubuntu` downloads the Ubuntu image on first use (~1.2 GB). A Windows image must
   be built by the user once: `agentpc image build windows --iso <Win11 ARM64 ISO>` (~12 min).
-  If `vm_list` shows no windows image, ask the user to run that. Don't start a build
+  If `list_vms` shows no windows image, ask the user to run that. Don't start a build
   yourself unless asked.
 - The login for both guests is `agent` / `agent`. Everything binds to 127.0.0.1.
 
