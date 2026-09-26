@@ -57,6 +57,9 @@ pub fn build(os: Os, iso: Option<PathBuf>) -> Result<()> {
         Os::Windows => build_windows(&inst, iso)?,
         Os::Ubuntu => build_ubuntu(&inst)?,
     }
+    // Bake the defaults into the image too, so the prepare step at snapshot time (after a
+    // pull, say) finds them in place instead of redoing slow work like installing Chrome.
+    prepare_guest(&inst)?;
     let mut info = guest_info(&inst)?;
     if let (Os::Windows, Some(p)) = (os, &iso_path) {
         record_iso(&mut info, p)?;
