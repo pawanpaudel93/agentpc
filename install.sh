@@ -152,12 +152,11 @@ cat <<EOF
 agentpc $VERSION is installed.
 
 Next steps:
-  agentpc bake ubuntu          # once, ~3 min: builds the Ubuntu golden image
-  agentpc new ubuntu           # a fresh desktop in ~12 s
+  agentpc create ubuntu        # first run downloads the Ubuntu image; then ~1 s per VM
   Then ask your agent, e.g. "open a terminal on ubuntu-1 and run uname -a".
 
   Windows: download a Windows 11 ARM64 ISO from Microsoft, then
-  agentpc bake windows --iso ~/Downloads/<file>.iso   # once, ~12 min
+  agentpc image build windows --iso ~/Downloads/<file>.iso   # once, ~12 min
 
 Docs: https://github.com/$REPO
 EOF

@@ -42,7 +42,7 @@ pub fn which(cmd: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Boot an instance in the background. `extra` adds install media for bakes.
+/// Boot an instance in the background. `extra` adds install media for image builds.
 pub fn start(inst: &Instance, extra: &[String]) -> Result<()> {
     launch(inst, extra, None)
 }

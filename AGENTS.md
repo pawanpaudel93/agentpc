@@ -11,7 +11,7 @@ can run `agentpc mcp-install` (or install first: see README.md).
 
 | Tool | Use |
 |------|-----|
-| `vm_list` | Instances, their state, and which golden images exist. Start here. |
+| `vm_list` | VMs, their state, and the images (with OS version) they come from. Start here. |
 | `vm_create(os, name?)` | New clone: ubuntu ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready. |
 | `vm_start` / `vm_stop` / `vm_reset` / `vm_delete` | Lifecycle. `vm_reset` = back to a clean install. |
 | `vm_screenshot(name)` | Hypervisor screenshot; works even while booting or hung. |
@@ -35,22 +35,23 @@ Rules:
 - Instances are disposable; `vm_reset` instead of repairing a broken one.
 - Don't create instances you won't use, and `vm_delete` scratch instances when done.
   Each running VM takes 4 GB (ubuntu) or 8 GB (windows) of RAM.
-- If `vm_list` shows no golden image for an OS, ask the user to run `agentpc bake <os>`
-  (Windows ~12 min and needs a Win11 ARM64 ISO; Ubuntu ~3 min). Don't start a bake
+- `vm_create ubuntu` downloads the Ubuntu image on first use (~1.2 GB). A Windows image must
+  be built by the user once: `agentpc image build windows --iso <Win11 ARM64 ISO>` (~12 min).
+  If `vm_list` shows no windows image, ask the user to run that. Don't start a build
   yourself unless asked.
 - The login for both guests is `agent` / `agent`. Everything binds to 127.0.0.1.
 
 ## Working on this repo
 
 - Rust, single binary `agentpc` (CLI + MCP server). `src/main.rs` is the CLI; modules:
-  `instance` (instances, golden images, on-disk layout), `qemu`, `ops` (lifecycle),
-  `viewer` (browser viewer), `bake`, `setup` (`doctor`, `mcp-install`), `mcp` (the server).
+  `instance` (VMs, images, on-disk layout), `qemu`, `ops` (lifecycle),
+  `viewer` (browser viewer), `image` (build/snapshot), `registry` (pull/push), `setup` (`doctor`, `mcp-install`), `mcp` (the server).
 - Ports derive from the instance slot n: SSH 2200+n, Windows-MCP 8000+n, VNC 5910+n,
   VNC websocket 5700+n; the shared browser viewer is on 8100.
 - Guest assets in `guests/` are embedded in the binary. `guests/windows/oem/setup.ps1` runs
-  at first logon of a Windows bake; `guests/ubuntu/user-data` is the Ubuntu cloud-init.
-  Changes take effect on the next `bake`, which refuses while clones of that OS exist.
+  at first logon of a Windows image build; `guests/ubuntu/user-data` is the Ubuntu cloud-init.
+  Changes take effect on the next `agentpc image build`, which refuses while VMs of that OS exist.
 - State (images, keys, instances) lives in `~/.agentpc` (`AGENTPC_HOME` overrides).
-- Verify with `cargo clippy -- -D warnings` plus a real instance (`agentpc new ubuntu`, then
+- Verify with `cargo clippy -- -D warnings` plus a real instance (`agentpc create ubuntu`, then
   the MCP tools). Unit tests can't cover the VM paths.
 - Never commit `target/` or `.state/`.

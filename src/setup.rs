@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::bake::{find_windows_iso, windows_setup_img_path};
+use crate::image::{find_windows_iso, windows_setup_img_path};
 use crate::instance::{Os, home};
 use crate::log;
 use crate::qemu::{edk2, which};
@@ -174,7 +174,7 @@ pub fn doctor() -> Result<bool> {
         "",
     );
 
-    println!("windows bake only:");
+    println!("windows image build only:");
     let setup_img = windows_setup_img_path().is_file();
     check(
         "Windows 11 ARM64 ISO (--iso, WIN_ISO or ~/Downloads/*A64FRE*.iso)",
@@ -197,12 +197,12 @@ pub fn doctor() -> Result<bool> {
         "",
     );
 
-    println!("golden images:");
+    println!("images:");
     for os in Os::ALL {
         check(
             &os.to_string(),
-            os.golden_disk().is_file(),
-            &format!("run: agentpc bake {os}"),
+            os.image_disk().is_file(),
+            &format!("run: agentpc image build {os} (or image pull ubuntu)"),
         );
     }
     Ok(all_ok)

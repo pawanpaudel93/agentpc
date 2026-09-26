@@ -1,14 +1,15 @@
-//! Baking golden images: install an OS once into a build VM (`_bake-<os>`, slot 0),
-//! then freeze its disk as a read-only golden image that `new` clones.
+//! Images: install an OS once into a build VM (`_build-<os>`, slot 0), freeze its disk
+//! as a read-only image that `create` clones, and capture its RAM snapshot.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
-use crate::instance::{Instance, Os, cache_dir, golden_dir, home, instances_dir, ssh_key};
-use crate::ops::{run, wait_ready};
+use crate::instance::{Instance, Os, cache_dir, home, images_dir, instances_dir, ssh_key};
+use crate::ops::{run, ssh, wait_ready};
 use crate::{log, qemu};
 
 const UBUNTU_IMG_URL: &str =
@@ -32,16 +33,16 @@ const WIN_OEM: [(&str, &[u8]); 2] = [
 const COLIMA_PROFILE: &str = "agentpc";
 const DOCKER_CTX: &str = "colima-agentpc";
 
-pub fn bake(os: Os, iso: Option<PathBuf>) -> Result<()> {
+pub fn build(os: Os, iso: Option<PathBuf>) -> Result<()> {
     if Instance::list()?.iter().any(|i| i.os == os) {
-        bail!("instances of {os} depend on its golden image; rm them first");
+        bail!("instances of {os} depend on its image; rm them first");
     }
-    for d in [home(), cache_dir(), golden_dir(), instances_dir()] {
+    for d in [home(), cache_dir(), images_dir(), instances_dir()] {
         std::fs::create_dir_all(&d).with_context(|| format!("create {}", d.display()))?;
     }
     ensure_ssh_key()?;
 
-    let name = format!("_bake-{os}");
+    let name = format!("_build-{os}");
     if instances_dir().join(&name).is_dir() {
         if let Ok(old) = Instance::load(&name) {
             qemu::stop(&old)?;
@@ -49,26 +50,33 @@ pub fn bake(os: Os, iso: Option<PathBuf>) -> Result<()> {
         std::fs::remove_dir_all(instances_dir().join(&name))?;
     }
     let inst = Instance::create(&name, os, 0)?;
+    let iso_path = find_windows_iso(iso.clone());
     match os {
-        Os::Windows => bake_windows(&inst, iso)?,
-        Os::Ubuntu => bake_ubuntu(&inst)?,
+        Os::Windows => build_windows(&inst, iso)?,
+        Os::Ubuntu => build_ubuntu(&inst)?,
     }
-    promote_golden(&inst)?;
+    let mut info = guest_info(&inst)?;
+    if let (Os::Windows, Some(p)) = (os, &iso_path) {
+        record_iso(&mut info, p)?;
+    }
+    info.built = crate::instance::local_date();
+    promote_image(&inst)?;
+    write_info(os, &info)?;
     snapshot(os)
 }
 
-/// Capture the live golden image: boot the cold golden image once, let the desktop
+/// Capture the image's snapshot: boot the image once, let the desktop
 /// settle, then save RAM and flatten the disk as it was at that instant. Clones of it
 /// resume in about a second instead of booting.
 pub fn snapshot(os: Os) -> Result<()> {
-    if !os.golden_disk().is_file() {
-        bail!("no golden image for {os}; run: agentpc bake {os}");
+    if !os.image_disk().is_file() {
+        bail!("no {os} image; run: agentpc image build {os}");
     }
     if Instance::list()?
         .iter()
-        .any(|i| i.os == os && i.on_live_base())
+        .any(|i| i.os == os && i.on_snapshot_base())
     {
-        bail!("instances of {os} depend on its live snapshot; rm them first");
+        bail!("instances of {os} depend on its snapshot; rm them first");
     }
     let name = format!("_snap-{os}");
     if instances_dir().join(&name).is_dir() {
@@ -86,16 +94,16 @@ pub fn snapshot(os: Os) -> Result<()> {
             "-f",
             "qcow2",
             "-b",
-            &format!("../../golden/{os}.qcow2"),
+            &format!("../../images/{os}.qcow2"),
             "-F",
             "qcow2",
             &inst.disk().to_string_lossy(),
         ],
     )?;
-    std::fs::copy(os.golden_vars(), inst.vars())?;
+    std::fs::copy(os.image_vars(), inst.vars())?;
     crate::ops::set_writable(&inst.vars())?;
 
-    log!("booting {os} to capture a live snapshot");
+    log!("booting {os} to capture its snapshot");
     qemu::start(&inst, &[])?;
     let took = wait_ready(&inst, Duration::from_secs(os.boot_timeout()))?;
     // Let post-logon startup finish so clones don't all redo it after resuming.
@@ -104,9 +112,22 @@ pub fn snapshot(os: Os) -> Result<()> {
         Os::Ubuntu => 10,
     };
     log!("{os} ready in {}s; settling {settle}s", took.as_secs());
+    // Guest-reported fields refresh; build-time ones (base, built, ISO checksum) are kept.
+    let fresh = guest_info(&inst)?;
+    let mut info = read_info(os).unwrap_or_default();
+    if info.base.is_empty() {
+        info.base = fresh.base;
+    }
+    info.os = fresh.os;
+    info.version = fresh.version;
+    info.version_id = fresh.version_id;
+    info.arch = fresh.arch;
+    info.agentpc = fresh.agentpc;
+    info.desktop_server = fresh.desktop_server;
+    write_info(os, &info)?;
     std::thread::sleep(Duration::from_secs(settle));
 
-    let (disk, vars, state) = (os.live_disk(), os.live_vars(), os.live_state());
+    let (disk, vars, state) = (os.snapshot_disk(), os.snapshot_vars(), os.snapshot_state());
     for p in [&disk, &vars, &state] {
         let _ = std::fs::remove_file(p);
     }
@@ -138,11 +159,248 @@ pub fn snapshot(os: Os) -> Result<()> {
             .unwrap_or(0.0)
     };
     log!(
-        "live snapshot for {os} ready (disk {:.1} GB, memory {:.1} GB)",
+        "snapshot for {os} ready (disk {:.1} GB, memory {:.1} GB)",
         gb(&disk),
         gb(&state)
     );
     Ok(())
+}
+
+/// What an image contains. Kept next to it as `<os>.json` and published as its OCI config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImageInfo {
+    pub os: String,
+    /// As the guest reports it, e.g. "Ubuntu 24.04.5 LTS".
+    pub version: String,
+    /// Short form used as a registry tag, e.g. "24.04" or "11-24H2".
+    pub version_id: String,
+    #[serde(default)]
+    pub arch: String,
+    /// What it was built from: the Ubuntu cloud-image serial or the Windows ISO.
+    #[serde(default)]
+    pub base: String,
+    /// Build date, YYYYMMDD.
+    #[serde(default)]
+    pub built: String,
+    #[serde(default)]
+    pub agentpc: String,
+    /// The desktop-control server agents drive, e.g. "Windows-MCP 0.8.5".
+    #[serde(default)]
+    pub desktop_server: String,
+    /// Checksum of the Windows ISO it was built from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iso_sha256: Option<String>,
+    /// Registry reference, when the image was pulled rather than built here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pulled_from: Option<String>,
+}
+
+pub fn read_info(os: Os) -> Option<ImageInfo> {
+    serde_json::from_slice(&std::fs::read(os.image_info()).ok()?).ok()
+}
+
+pub fn write_info(os: Os, info: &ImageInfo) -> Result<()> {
+    std::fs::write(os.image_info(), serde_json::to_vec_pretty(info)?)?;
+    Ok(())
+}
+
+/// Ask a running guest what it is, as `key=value` lines.
+fn guest_info(inst: &Instance) -> Result<ImageInfo> {
+    let script = match inst.os {
+        Os::Ubuntu => {
+            r#". /etc/os-release
+echo "version=$PRETTY_NAME"
+echo "version_id=$VERSION_ID"
+echo "arch=$(dpkg --print-architecture)"
+echo "serial=$(sed -n 's/^serial: *//p' /etc/cloud/build.info 2>/dev/null)"
+echo "server=$(~/.local/bin/cua-driver --version 2>/dev/null | awk '{print $NF}')""#
+        }
+        // ProductName still says "Windows 10" on Windows 11; the WMI caption doesn't.
+        Os::Windows => {
+            r#"$v = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+$mcp = & 'C:\uv\uv.exe' tool list 2>$null | Select-String '^windows-mcp v'
+"caption=$((Get-CimInstance Win32_OperatingSystem).Caption -replace '^Microsoft ', '')"
+"release=$($v.DisplayVersion)"
+"build=$($v.CurrentBuild).$($v.UBR)"
+"arch=$($env:PROCESSOR_ARCHITECTURE.ToLower())"
+"server=$(if ($mcp) { $mcp.Line -replace '^windows-mcp v', '' })""#
+        }
+    };
+    let out = ssh(inst, script)?;
+    if !out.status.success() {
+        bail!(
+            "reading the {} version failed: {}",
+            inst.os,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let kv: std::collections::HashMap<&str, &str> = text
+        .lines()
+        .filter_map(|l| l.trim().split_once('='))
+        .map(|(k, v)| (k, v.trim()))
+        .collect();
+    let get = |k: &str| kv.get(k).copied().unwrap_or_default().to_string();
+    let server = get("server");
+    let (version, version_id, base, desktop_server) = match inst.os {
+        Os::Ubuntu => (
+            get("version"),
+            get("version_id"),
+            format!(
+                "Ubuntu {} cloud image, serial {}",
+                get("version_id"),
+                get("serial")
+            ),
+            format!("cua-driver {server}"),
+        ),
+        Os::Windows => {
+            let caption = get("caption");
+            let major = if caption.contains("Windows 11") {
+                "11"
+            } else {
+                "10"
+            };
+            (
+                format!("{caption} {} (build {})", get("release"), get("build")),
+                format!("{major}-{}", get("release")),
+                String::new(), // described from the ISO by build
+                format!("Windows-MCP {server}"),
+            )
+        }
+    };
+    Ok(ImageInfo {
+        os: inst.os.to_string(),
+        version,
+        version_id,
+        arch: get("arch"),
+        base,
+        built: String::new(),
+        agentpc: env!("CARGO_PKG_VERSION").into(),
+        desktop_server,
+        iso_sha256: None,
+        pulled_from: None,
+    })
+}
+
+/// Note which ISO a Windows image was built from: a readable description plus its checksum.
+pub fn record_iso(info: &mut ImageInfo, iso: &Path) -> Result<()> {
+    let name = iso
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    log!("checksumming {name}");
+    info.iso_sha256 = Some(sha256_file(iso)?);
+    info.base = describe_iso(&name);
+    Ok(())
+}
+
+/// Turn Microsoft's ISO file name into words, e.g.
+/// `26100.4349.250607-1500.ge_release_svc_refresh_CLIENTCONSUMER_RET_A64FRE_en-us.iso` →
+/// "Windows 11 24H2 ISO, ARM64, consumer editions, build 26100.4349, en-us".
+fn describe_iso(name: &str) -> String {
+    let stem = name.trim_end_matches(".iso");
+    let parts: Vec<&str> = stem.split('_').collect();
+    let mut nums = parts.first().unwrap_or(&"").split('.');
+    let (Some(build), Some(ubr)) = (nums.next(), nums.next()) else {
+        return format!("Windows ISO {name}");
+    };
+    let Ok(build_no) = build.parse::<u32>() else {
+        return format!("Windows ISO {name}");
+    };
+    let release = match build_no {
+        26200.. => " 25H2",
+        26100.. => " 24H2",
+        22631.. => " 23H2",
+        22621.. => " 22H2",
+        22000.. => " 21H2",
+        _ => "",
+    };
+    let major = if build_no >= 22000 { "11" } else { "10" };
+    let arch = if stem.contains("A64FRE") {
+        "ARM64"
+    } else if stem.contains("X64FRE") {
+        "x64"
+    } else {
+        "unknown arch"
+    };
+    let editions = parts
+        .iter()
+        .find_map(|p| p.strip_prefix("CLIENT"))
+        .map(|e| format!(", {} editions", e.to_lowercase()))
+        .unwrap_or_default();
+    let lang = parts
+        .last()
+        .filter(|l| l.contains('-'))
+        .map(|l| format!(", {l}"))
+        .unwrap_or_default();
+    format!("Windows {major}{release} ISO, {arch}{editions}, build {build}.{ubr}{lang}")
+}
+
+/// SHA-256 of a file via `shasum`, for recording which ISO an image was built from.
+fn sha256_file(p: &Path) -> Result<String> {
+    let out = Command::new("shasum").args(["-a", "256"]).arg(p).output()?;
+    if !out.status.success() {
+        bail!("shasum failed for {}", p.display());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// One line per local image: version, size and whether VMs can resume from its snapshot.
+pub fn list() -> Result<String> {
+    let mut s = String::new();
+    for os in Os::ALL {
+        if let Ok(m) = std::fs::metadata(os.image_disk()) {
+            let snap = if os.has_snapshot() {
+                "snapshot: yes"
+            } else {
+                "snapshot: no"
+            };
+            let version = read_info(os).map_or("version unknown".into(), |i| i.version);
+            s += &format!(
+                "{os:<8} {version:<42} {:>5.1} GB  {snap}\n",
+                m.len() as f64 / 1e9
+            );
+        }
+    }
+    if s.is_empty() {
+        s = "no images (agentpc image pull ubuntu, or agentpc image build <os>)".into();
+    }
+    Ok(s)
+}
+
+pub fn describe(os: Os) -> Result<String> {
+    if !os.image_disk().is_file() {
+        bail!("no {os} image");
+    }
+    let info = read_info(os).with_context(|| {
+        format!("no version info for the {os} image; run: agentpc image snapshot {os}")
+    })?;
+    Ok(serde_json::to_string_pretty(&info)?)
+}
+
+pub fn remove(os: Os) -> Result<String> {
+    if Instance::list()?.iter().any(|i| i.os == os) {
+        bail!("VMs of {os} depend on its image; rm them first");
+    }
+    let files = [
+        os.image_info(),
+        os.image_disk(),
+        os.image_vars(),
+        os.snapshot_disk(),
+        os.snapshot_vars(),
+        os.snapshot_state(),
+    ];
+    if !files.iter().any(|p| p.exists()) {
+        bail!("no {os} image");
+    }
+    for p in files {
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(format!("removed the {os} image"))
 }
 
 fn ensure_ssh_key() -> Result<()> {
@@ -199,7 +457,7 @@ pub(crate) fn windows_setup_img_path() -> PathBuf {
     cache_dir().join("windows-setup.img")
 }
 
-fn bake_windows(inst: &Instance, iso: Option<PathBuf>) -> Result<()> {
+fn build_windows(inst: &Instance, iso: Option<PathBuf>) -> Result<()> {
     let iso = find_windows_iso(iso).filter(|p| p.is_file()).context(
         "no Windows 11 ARM64 ISO: pass --iso, set WIN_ISO, or put *A64FRE*.iso in ~/Downloads",
     )?;
@@ -409,7 +667,7 @@ fn windows_refresh_oem(img: &Path) -> Result<()> {
     Ok(())
 }
 
-fn bake_ubuntu(inst: &Instance) -> Result<()> {
+fn build_ubuntu(inst: &Instance) -> Result<()> {
     let base = cache_dir().join("ubuntu-base.img");
     if !base.is_file() {
         log!("downloading Ubuntu cloud image");
@@ -477,12 +735,12 @@ fn bake_ubuntu(inst: &Instance) -> Result<()> {
     Ok(())
 }
 
-/// Freeze the cleanly shut-down build disk as the golden image (flattened, read-only).
-fn promote_golden(inst: &Instance) -> Result<()> {
+/// Freeze the cleanly shut-down build disk as the image (flattened, read-only).
+fn promote_image(inst: &Instance) -> Result<()> {
     let os = inst.os;
     qemu::stop(inst)?;
-    log!("writing golden image for {os}");
-    let (disk, vars) = (os.golden_disk(), os.golden_vars());
+    log!("writing the {os} image");
+    let (disk, vars) = (os.image_disk(), os.image_vars());
     let _ = std::fs::remove_file(&disk);
     let _ = std::fs::remove_file(&vars);
     let tmp = disk.with_extension("qcow2.tmp");
@@ -505,12 +763,23 @@ fn promote_golden(inst: &Instance) -> Result<()> {
     }
     std::fs::remove_dir_all(&inst.dir)?;
     let size = std::fs::metadata(&disk)?.len() as f64 / 1e9;
-    log!("golden {os} ready ({size:.1} GB)");
+    log!("{os} image ready ({size:.1} GB)");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn describes_microsoft_iso_names() {
+        assert_eq!(
+            super::describe_iso(
+                "26100.4349.250607-1500.ge_release_svc_refresh_CLIENTCONSUMER_RET_A64FRE_en-us.iso"
+            ),
+            "Windows 11 24H2 ISO, ARM64, consumer editions, build 26100.4349, en-us"
+        );
+        assert_eq!(super::describe_iso("my-windows.iso"), "Windows ISO my-windows.iso");
+    }
+
     /// Needs hdiutil and a dockur setup.img: set AGENTPC_TEST_SETUP_IMG to a scratch COPY
     /// and AGENTPC_HOME to a dir holding id_ed25519.pub.
     #[test]

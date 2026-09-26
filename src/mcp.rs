@@ -21,9 +21,9 @@ use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioC
 use rmcp::{RoleClient, ServerHandler, ServiceError, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::instance::{Instance, Os, golden_dir};
+use crate::instance::{Instance, Os};
 use crate::{ops, qemu, viewer};
 
 const INSTRUCTIONS: &str = "\
@@ -115,9 +115,7 @@ struct DesktopArgs {
 
 #[tool_router]
 impl Gateway {
-    #[tool(
-        description = "List VM instances (name, os, state, viewer URL) and which golden images exist."
-    )]
+    #[tool(description = "List VM instances (name, os, state, viewer URL) and which images exist.")]
     async fn vm_list(&self) -> CallToolResult {
         text(blocking(|| {
             let instances: Vec<_> = Instance::list()?
@@ -129,20 +127,27 @@ impl Gateway {
                     })
                 })
                 .collect();
-            let mut golden: Vec<String> = std::fs::read_dir(golden_dir())
+            let images: Vec<Value> = Os::ALL
                 .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|e| e.file_name().to_str()?.strip_suffix(".qcow2").map(String::from))
+                .filter(|os| os.image_disk().is_file())
+                .map(|os| {
+                    let info = crate::image::read_info(os);
+                    json!({
+                        "os": os,
+                        "version": info.as_ref().map(|i| i.version.clone()),
+                        "based_on": info.as_ref().map(|i| i.base.clone()),
+                        "desktop_server": info.as_ref().map(|i| i.desktop_server.clone()),
+                        "fast_start": os.has_snapshot(),
+                    })
+                })
                 .collect();
-            golden.sort();
-            Ok(serde_json::to_string_pretty(&json!({"instances": instances, "golden_images": golden}))?)
+            Ok(serde_json::to_string_pretty(&json!({"instances": instances, "images": images}))?)
         })
         .await)
     }
 
     #[tool(
-        description = "Create and boot a new instance cloned from the golden image (~1 s ubuntu, ~4 s windows).\n\
+        description = "Create and boot a new instance cloned from its image (~1 s ubuntu, ~4 s windows).\n\
                           Returns once the desktop and its control server are ready."
     )]
     async fn vm_create(&self, Parameters(a): Parameters<CreateArgs>) -> CallToolResult {
@@ -164,7 +169,7 @@ impl Gateway {
     }
 
     #[tool(
-        description = "Discard all changes: restore the instance to its golden image and boot it."
+        description = "Discard all changes: restore the instance to a fresh copy of its image and boot it."
     )]
     async fn vm_reset(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
         text(self.lifecycle(&a.name, ops::reset).await)
@@ -393,7 +398,7 @@ async fn exec(name: &str, command: &str, timeout: u64) -> Result<String> {
 }
 
 fn load(name: &str) -> Result<Instance> {
-    // Names become paths under the instances dir; keep `..` and `_bake-*` out of reach.
+    // Names become paths under the instances dir; keep `..` and `_build-*` out of reach.
     if name.starts_with(['_', '.']) || name.contains('/') {
         bail!("no instance '{name}'; see vm_list");
     }

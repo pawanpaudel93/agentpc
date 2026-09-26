@@ -1,4 +1,4 @@
-//! Instances, golden images and the on-disk layout under `$AGENTPC_HOME` (default `~/.agentpc`).
+//! VM instances, images and the on-disk layout under `$AGENTPC_HOME` (default `~/.agentpc`).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -19,8 +19,8 @@ pub fn cache_dir() -> PathBuf {
     home().join("cache")
 }
 
-pub fn golden_dir() -> PathBuf {
-    home().join("golden")
+pub fn images_dir() -> PathBuf {
+    home().join("images")
 }
 
 pub fn instances_dir() -> PathBuf {
@@ -41,32 +41,41 @@ pub enum Os {
 impl Os {
     pub const ALL: [Os; 2] = [Os::Windows, Os::Ubuntu];
 
-    pub fn golden_disk(self) -> PathBuf {
-        golden_dir().join(format!("{self}.qcow2"))
+    pub fn image_disk(self) -> PathBuf {
+        images_dir().join(format!("{self}.qcow2"))
     }
 
-    pub fn golden_vars(self) -> PathBuf {
-        golden_dir().join(format!("{self}.vars.fd"))
+    pub fn image_vars(self) -> PathBuf {
+        images_dir().join(format!("{self}.vars.fd"))
     }
 
-    /// Golden image captured with the desktop already running, plus its saved RAM,
+    /// What the image contains (OS version, source), see `image::ImageInfo`.
+    pub fn image_info(self) -> PathBuf {
+        images_dir().join(format!("{self}.json"))
+    }
+
+    /// The image as captured with the desktop already running, plus its saved RAM,
     /// so clones resume instead of booting.
-    pub fn live_disk(self) -> PathBuf {
-        golden_dir().join(format!("{self}-live.qcow2"))
+    pub fn snapshot_disk(self) -> PathBuf {
+        images_dir().join(format!("{self}.snapshot.qcow2"))
     }
 
-    pub fn live_vars(self) -> PathBuf {
-        golden_dir().join(format!("{self}-live.vars.fd"))
+    pub fn snapshot_vars(self) -> PathBuf {
+        images_dir().join(format!("{self}.snapshot.vars.fd"))
     }
 
-    pub fn live_state(self) -> PathBuf {
-        golden_dir().join(format!("{self}-live.state"))
+    pub fn snapshot_state(self) -> PathBuf {
+        images_dir().join(format!("{self}.snapshot.state"))
     }
 
-    pub fn has_live(self) -> bool {
-        [self.live_disk(), self.live_vars(), self.live_state()]
-            .iter()
-            .all(|p| p.is_file())
+    pub fn has_snapshot(self) -> bool {
+        [
+            self.snapshot_disk(),
+            self.snapshot_vars(),
+            self.snapshot_state(),
+        ]
+        .iter()
+        .all(|p| p.is_file())
     }
 
     /// Seconds a cold boot may take before the desktop and its control server answer.
@@ -138,7 +147,7 @@ impl Instance {
         })
     }
 
-    /// User-visible instances; `_bake-*` build VMs are excluded.
+    /// User-visible instances; `_build-*` build VMs are excluded.
     pub fn list() -> Result<Vec<Self>> {
         let mut out = Vec::new();
         let Ok(entries) = std::fs::read_dir(instances_dir()) else {
@@ -194,14 +203,14 @@ impl Instance {
         let _ = std::fs::create_dir_all(&dir);
         dir.join(format!("{:016x}.qmp", h.finish()))
     }
-    /// Present while the clone's next boot should resume the live snapshot.
+    /// Present while the clone's next boot should resume the snapshot.
     pub fn resume_marker(&self) -> PathBuf {
         self.dir.join("resume")
     }
 
-    /// Whether the disk is backed by the live golden image (vs the cold one).
-    pub fn on_live_base(&self) -> bool {
-        read_trimmed(&self.dir.join("base")).is_ok_and(|b| b == "live")
+    /// Whether the disk is backed by the snapshot disk (vs the plain image).
+    pub fn on_snapshot_base(&self) -> bool {
+        read_trimmed(&self.dir.join("base")).is_ok_and(|b| b == "snapshot")
     }
 
     pub fn pid_file(&self) -> PathBuf {
@@ -232,11 +241,13 @@ struct Tm {
     sec: i32,
     min: i32,
     hour: i32,
+    mday: i32,
+    mon: i32,
+    year: i32,
     _rest: [u8; 64],
 }
 
-/// Local wall-clock time as HH:MM:SS, for log lines.
-pub fn local_hms() -> String {
+fn local_tm() -> Tm {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -245,10 +256,25 @@ pub fn local_hms() -> String {
         sec: 0,
         min: 0,
         hour: 0,
+        mday: 0,
+        mon: 0,
+        year: 0,
         _rest: [0; 64],
     };
     // SAFETY: both pointers are valid for the call; tm is large enough for struct tm.
     unsafe { localtime_r(&now, &mut tm) };
+    tm
+}
+
+/// Local date as YYYYMMDD, for image tags.
+pub fn local_date() -> String {
+    let tm = local_tm();
+    format!("{}{:02}{:02}", tm.year + 1900, tm.mon + 1, tm.mday)
+}
+
+/// Local wall-clock time as HH:MM:SS, for log lines.
+pub fn local_hms() -> String {
+    let tm = local_tm();
     format!("{:02}:{:02}:{:02}", tm.hour, tm.min, tm.sec)
 }
 

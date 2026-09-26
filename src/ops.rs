@@ -100,15 +100,15 @@ pub fn wait_ready(inst: &Instance, timeout: Duration) -> Result<Duration> {
     Ok(start.elapsed())
 }
 
-/// Copy-on-write clone of the golden image, preferring the live one so the first
+/// Copy-on-write clone of the image, preferring its snapshot disk so the first
 /// boot resumes in about a second. The backing path is relative so `$AGENTPC_HOME`
 /// can move.
 pub fn clone_disk(inst: &Instance) -> Result<()> {
-    let live = inst.os.has_live();
+    let live = inst.os.has_snapshot();
     let (base, vars) = if live {
-        (inst.os.live_disk(), inst.os.live_vars())
+        (inst.os.snapshot_disk(), inst.os.snapshot_vars())
     } else {
-        (inst.os.golden_disk(), inst.os.golden_vars())
+        (inst.os.image_disk(), inst.os.image_vars())
     };
     let base_name = base.file_name().unwrap().to_string_lossy();
     let _ = std::fs::remove_file(inst.disk());
@@ -120,7 +120,7 @@ pub fn clone_disk(inst: &Instance) -> Result<()> {
             "-f",
             "qcow2",
             "-b",
-            &format!("../../golden/{base_name}"),
+            &format!("../../images/{base_name}"),
             "-F",
             "qcow2",
             &inst.disk().to_string_lossy(),
@@ -128,8 +128,11 @@ pub fn clone_disk(inst: &Instance) -> Result<()> {
     )?;
     let _ = std::fs::remove_file(inst.vars());
     std::fs::copy(vars, inst.vars())?;
-    set_writable(&inst.vars())?; // golden copies are read-only
-    std::fs::write(inst.dir.join("base"), if live { "live" } else { "cold" })?;
+    set_writable(&inst.vars())?; // image files are read-only
+    std::fs::write(
+        inst.dir.join("base"),
+        if live { "snapshot" } else { "image" },
+    )?;
     if live {
         std::fs::write(inst.resume_marker(), "")?;
     } else {
@@ -169,8 +172,8 @@ pub fn info(inst: &Instance) -> String {
 }
 
 pub fn create(os: Os, name: Option<&str>) -> Result<String> {
-    if !os.golden_disk().is_file() {
-        bail!("no golden image for {os}; run: agentpc bake {os}");
+    if !os.image_disk().is_file() {
+        provision_image(os)?;
     }
     let slot = Instance::free_slot()?;
     let name = match name {
@@ -191,15 +194,33 @@ pub fn create(os: Os, name: Option<&str>) -> Result<String> {
     boot(&inst)
 }
 
+/// First `create` of an OS: fetch its image (Ubuntu), or say how to build it (Windows).
+fn provision_image(os: Os) -> Result<()> {
+    match os {
+        Os::Ubuntu => {
+            log!("no ubuntu image yet; downloading it");
+            if let Err(e) = crate::registry::pull(os, "latest") {
+                log!("download failed ({e:#}); building it locally instead (~3 min)");
+                crate::image::build(os, None)?;
+            }
+            Ok(())
+        }
+        Os::Windows => bail!(
+            "no windows image yet; build it once (~12 min) from a Windows 11 ARM64 ISO: \
+             agentpc image build windows --iso <path>"
+        ),
+    }
+}
+
 /// Start a stopped instance and wait until it's usable.
 pub fn boot(inst: &Instance) -> Result<String> {
     let mut resumed = false;
     if !inst.running() {
         // Only a clone's first boot can resume: afterwards its disk has moved on
         // from the saved RAM, so later starts are cold boots.
-        if inst.resume_marker().exists() && inst.os.has_live() {
+        if inst.resume_marker().exists() && inst.os.has_snapshot() {
             let _ = std::fs::remove_file(inst.resume_marker());
-            match qemu::start_resumed(inst, &inst.os.live_state()) {
+            match qemu::start_resumed(inst, &inst.os.snapshot_state()) {
                 Ok(()) => resumed = true,
                 Err(e) => {
                     log!("{}: resume failed ({e:#}); booting instead", inst.name);
@@ -276,15 +297,7 @@ pub fn list_table() -> Result<String> {
             viewer::url(&i)
         );
     }
-    for os in Os::ALL {
-        if let Ok(m) = std::fs::metadata(os.golden_disk()) {
-            let live = if os.has_live() {
-                "live snapshot: yes"
-            } else {
-                "live snapshot: no (agentpc snapshot)"
-            };
-            s += &format!("golden: {os} ({:.1} GB, {live})\n", m.len() as f64 / 1e9);
-        }
-    }
+    s += "\nIMAGES\n";
+    s += &crate::image::list()?;
     Ok(s)
 }

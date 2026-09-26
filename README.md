@@ -3,7 +3,7 @@
 Disposable Windows 11 and Ubuntu desktop VMs on an Apple Silicon Mac, controllable by AI
 coding agents (Claude Code, Codex, Gemini CLI, Cursor, VS Code, or any MCP client).
 One Rust binary, `agentpc`: a CLI and, via `agentpc mcp`, an MCP stdio server.
-Native QEMU + HVF; no manual steps after the one-time bake.
+Native QEMU + HVF; new VMs are ready in about a second.
 
 ## Install
 
@@ -25,26 +25,26 @@ Homebrew (handled by the installer).
 ## Quick start
 
 ```sh
-agentpc bake ubuntu        # once, ~3 min: builds the golden image
-agentpc new ubuntu         # a fresh desktop in ~1 s
+agentpc create ubuntu      # first time: downloads the Ubuntu image (~1.2 GB); then ~1 s per VM
 ```
 
 Then ask your agent things like *"open a terminal on ubuntu-1 and run uname -a"* or
 *"reset ubuntu-1 and check that my install script works on a clean machine"*.
 
-Windows needs a Windows 11 ARM64 ISO from Microsoft, and the first bake also needs
-colima + docker (`brew install colima docker`) to build the setup disk:
+Windows images can't be redistributed (Microsoft's license), so you build yours once from a
+Windows 11 ARM64 ISO. The first build also needs colima + docker
+(`brew install colima docker`) to prepare the setup disk:
 
 ```sh
-agentpc bake windows --iso ~/Downloads/<file>.iso   # once, ~12 min
-agentpc new windows                                  # ~4 s
+agentpc image build windows --iso ~/Downloads/<file>.iso   # once, ~12 min
+agentpc create windows                                      # ~4 s per VM
 ```
 
-Without `--iso`, bake uses `$WIN_ISO` or `~/Downloads/*A64FRE*.iso`.
+Without `--iso`, the build uses `$WIN_ISO` or `~/Downloads/*A64FRE*.iso`.
 
 ## MCP server
 
-One server, `agentpc`, for all instances. `agentpc mcp-install` registers it with Claude
+One server, `agentpc`, for all VMs. `agentpc mcp-install` registers it with Claude
 Code, Codex, Cursor, Gemini CLI and VS Code (user scope). For any other client:
 
 ```json
@@ -57,7 +57,7 @@ binary.
 
 | Tool | Use |
 |------|-----|
-| `vm_list` | Instances, their state, and which golden images exist |
+| `vm_list` | VMs, their state, and which images exist |
 | `vm_create`, `vm_start`, `vm_stop`, `vm_reset`, `vm_delete` | Lifecycle; `vm_reset` = back to a clean install |
 | `vm_screenshot` | PNG straight from the hypervisor, works while booting or hung |
 | `vm_exec` | Shell over SSH: PowerShell on Windows, bash on Ubuntu |
@@ -73,37 +73,52 @@ See [AGENTS.md](AGENTS.md) for tool usage tips.
 ## CLI
 
 ```sh
-agentpc bake ubuntu|windows [--iso PATH]   # install an OS once into a golden image
-agentpc snapshot ubuntu|windows            # recapture the live snapshot (bake does this)
-agentpc new ubuntu|windows [name]          # clone + resume (default name <os>-<n>)
-agentpc list                               # instances and golden images
+agentpc create ubuntu|windows [name]       # new VM (default name <os>-<n>); gets the image if missing
+agentpc list                               # VMs and images
 agentpc info ubuntu-1                      # viewer URL, SSH, VNC
-agentpc start|stop|reset|rm <name>         # reset = back to the golden state
+agentpc start|stop|reset|rm <name>         # reset = back to a fresh copy of the image
 agentpc ssh windows-1 'Get-Process'        # no command = interactive shell
-agentpc screen ubuntu-1 [out.png]          # screenshot
+agentpc screenshot ubuntu-1 [out.png]      # PNG screenshot
+
+agentpc image pull ubuntu [--tag 24.04]    # download the published Ubuntu image
+agentpc image build ubuntu|windows [--iso PATH]  # build an image locally instead
+agentpc image ls | rm <os>                 # list (with OS version) / delete local images
+agentpc image info windows                 # version, source (ISO + sha256), build date, desktop server
+agentpc image snapshot <os>                # recapture the RAM snapshot (build/pull do this)
+agentpc image push ubuntu                  # maintainers: publish to ghcr.io (needs oras login)
 agentpc mcp                                # MCP server on stdio (what agents launch)
 agentpc mcp-install [clients...]           # register with claude, codex, cursor, gemini, vscode
 agentpc doctor                             # check prerequisites
 ```
 
-State lives in `~/.agentpc` (override with `AGENTPC_HOME`). Every instance has a browser
-viewer (noVNC) on the shared viewer at `http://127.0.0.1:8100`; `agentpc info` prints the
-URL for each instance.
+State lives in `~/.agentpc` (override with `AGENTPC_HOME`). Every VM has a browser viewer
+(noVNC) on the shared viewer at `http://127.0.0.1:8100`; `agentpc info` prints its URL.
 
 ## How it works
 
-- **Golden images + copy-on-write clones.** `bake` installs a guest into a read-only golden
-  image, then boots it once and saves its RAM with the desktop already running (the live
-  snapshot; `agentpc snapshot <os>` recreates it). `new` creates a qcow2 overlay on it and
-  resumes that RAM, so a clone costs a few MB and is ready in ~1 s (Ubuntu) or ~4 s (Windows)
-  instead of booting (~14 s / ~25 s). Later `start`s after a `stop` are cold boots; `reset`
-  resumes a fresh copy again. Rebaking would break existing clones, so `bake` refuses while
-  any exist.
+- **Images + copy-on-write VMs.** An *image* is a read-only disk with the OS, desktop and
+  agent tools installed (`image build`, or `image pull` for Ubuntu). agentpc then boots it once
+  and saves its RAM with the desktop already running (its *snapshot*). `create` makes a qcow2
+  overlay on the image and resumes that RAM, so a VM costs a few MB and is ready in ~1 s
+  (Ubuntu) or ~4 s (Windows) instead of booting (~14 s / ~25 s). `start` after `stop` is a
+  cold boot; `reset` resumes a fresh copy again. Replacing an image would break the VMs built
+  on it, so `image build/pull/rm` refuse while any exist.
+- **Published images** live on GitHub Container Registry as OCI artifacts
+  (`ghcr.io/pawanpaudel93/agentpc-ubuntu`): a compressed qcow2 in 512 MB parts, downloaded in
+  parallel and checksum-verified. Only the disk is published; the RAM snapshot depends on the
+  Mac's chip and QEMU version, so it is recaptured locally after each pull (~35 s). The Ubuntu
+  image is based on the official Ubuntu 24.04 cloud image.
+- **Versions.** Each image records what it is in `~/.agentpc/images/<os>.json`: the OS version
+  as the guest reports it (e.g. `Ubuntu 24.04.5 LTS`, `Windows 11 Pro 24H2 (build 26100.4349)`),
+  what it was built from (the cloud-image serial or the Windows ISO), and the build date. The
+  same record is the published image's OCI config, and pushes are tagged `:latest`, `:24.04`
+  (newest build of that release) and `:24.04-YYYYMMDD` (pinned). `image ls`, `list` and the
+  MCP `vm_list` tool show the version.
 - **Screenshots** come straight from QEMU as PNG in ~40 ms, independent of the guest.
 - **Windows:** dockur/windows-arm builds `setup.img` once (answer file + ARM virtio
   drivers); the OEM script installs Windows-MCP at first logon.
 - **Ubuntu:** the cloud image + cloud-init installs XFCE on X11 and cua-driver; cloud-init
-  is disabled after the bake so clones don't re-provision.
+  is disabled after the build so VMs don't re-provision.
 - **Why not Docker?** dockur can't boot Windows on a Mac: Apple's vz gives nested KVM no
   PMU, and Windows ARM hangs. agentpc runs QEMU natively with HVF instead.
 
@@ -111,7 +126,7 @@ URL for each instance.
 
 Everything binds to 127.0.0.1. The desktop-control servers inside the guests are
 unauthenticated, but reachable only from this Mac. The guest login is `agent` / `agent`.
-Treat instances as disposable sandboxes, not as security boundaries for secrets.
+Treat VMs as disposable sandboxes, not as security boundaries for secrets.
 
 ## Build from source
 
@@ -126,5 +141,8 @@ Guest assets under `guests/` are embedded in the binary. MIT licensed.
 1. Bump `version` in `Cargo.toml`, commit, then tag and push `vX.Y.Z`. The Release workflow
    builds the tarball, the MCP bundle (`agentpc-X.Y.Z.mcpb`), their `.sha256` files, and a
    filled-in `server.json`, and attaches them all to the GitHub Release.
-2. Publish to the MCP Registry: download that release's `server.json` over the repo copy,
+2. Publish the Ubuntu image: `agentpc image build ubuntu`, then `oras login ghcr.io` and
+   `agentpc image push ubuntu` (tags `:latest` and the date). Make the ghcr.io package public
+   once in its GitHub package settings.
+3. Publish to the MCP Registry: download that release's `server.json` over the repo copy,
    then `brew install mcp-publisher`, `mcp-publisher login github`, `mcp-publisher publish`.

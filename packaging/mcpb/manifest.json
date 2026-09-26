@@ -4,7 +4,7 @@
   "display_name": "agentpc",
   "version": "0.0.0",
   "description": "Disposable Windows 11 and Ubuntu desktop VMs on Apple Silicon Macs for AI agents.",
-  "long_description": "Create, screenshot, drive and reset local Windows 11 ARM and Ubuntu desktop VMs over MCP. Requires QEMU from Homebrew (brew install qemu) and a one-time `agentpc bake ubuntu` / `agentpc bake windows`.",
+  "long_description": "Create, screenshot, drive and reset local Windows 11 ARM and Ubuntu desktop VMs over MCP. Requires QEMU from Homebrew (brew install qemu) and a one-time `agentpc image build ubuntu` / `agentpc image build windows`.",
   "author": { "name": "Pawan Paudel", "url": "https://github.com/pawanpaudel93" },
   "license": "MIT",
   "homepage": "https://github.com/pawanpaudel93/agentpc",
@@ -19,11 +19,11 @@
     }
   },
   "tools": [
-    { "name": "vm_list", "description": "Instances, their state, and which golden images exist" },
-    { "name": "vm_create", "description": "Clone a golden image into a new instance and boot it" },
+    { "name": "vm_list", "description": "VMs, their state, and which images exist" },
+    { "name": "vm_create", "description": "Create a VM from an image; ready in ~1 s (Ubuntu) or ~4 s (Windows)" },
     { "name": "vm_start", "description": "Start an instance" },
     { "name": "vm_stop", "description": "Stop an instance" },
-    { "name": "vm_reset", "description": "Discard all changes: back to the golden image" },
+    { "name": "vm_reset", "description": "Discard all changes: back to a fresh copy of the image" },
     { "name": "vm_delete", "description": "Stop and delete an instance" },
     { "name": "vm_screenshot", "description": "Hypervisor screenshot of an instance" },
     { "name": "vm_exec", "description": "Run a shell command (PowerShell on Windows, bash on Ubuntu)" },
