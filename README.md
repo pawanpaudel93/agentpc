@@ -6,8 +6,8 @@
 
 **Disposable Windows 11 and Ubuntu desktops for AI agents, on your Mac.**
 
-agentpc gives coding agents (Claude Code, Codex, Cursor, Gemini CLI, VS Code, or any MCP
-client) real desktop computers to work in: create a VM in about a second, let the agent click,
+agentpc gives AI agents (Claude Code, Claude Desktop, Codex, Cursor, Gemini CLI, VS Code, or
+any MCP client) real desktop computers to work in: create a VM in about a second, let the agent click,
 type, take screenshots and run commands, then reset it to a clean state. It is a single Rust
 binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents over MCP.
 
@@ -111,10 +111,11 @@ agentpc is an MCP server (`agentpc mcp`, stdio). One server handles every VM.
 **Register it** with every supported agent that's installed (the installer does this):
 
 ```sh
-agentpc mcp-install                  # or pick: agentpc mcp-install claude codex
+agentpc mcp-install                  # or pick: agentpc mcp-install claude claude-desktop codex
 ```
 
-Supported: Claude Code, Codex, Cursor, Gemini CLI and VS Code. For any other MCP client, add:
+Supported: Claude Code, Claude Desktop, Codex, Cursor, Gemini CLI and VS Code (restart Claude
+Desktop after registering). For any other MCP client, add:
 
 ```json
 {

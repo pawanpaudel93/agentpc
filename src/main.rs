@@ -64,7 +64,7 @@ enum Cmd {
     Image(ImageCmd),
     /// Run the MCP server on stdio (what agents launch)
     Mcp,
-    /// Register the MCP server with installed agents (claude, codex, cursor, gemini, vscode)
+    /// Register the MCP server with installed agents (claude, claude-desktop, codex, cursor, gemini, vscode)
     McpInstall { clients: Vec<String> },
     /// Check prerequisites
     Doctor,
@@ -104,6 +104,7 @@ enum ImageCmd {
 }
 
 fn main() {
+    ensure_path();
     if let Err(e) = run(Cli::parse()) {
         log!("FAIL: {e:#}");
         std::process::exit(1);
@@ -157,6 +158,27 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Viewer => viewer::serve(),
     }
+}
+
+/// Apps launched from the Dock (Claude Desktop, Cursor, VS Code) start MCP servers with a
+/// minimal PATH that lacks Homebrew, where QEMU lives.
+fn ensure_path() {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let mut dirs: Vec<&str> = path.split(':').filter(|d| !d.is_empty()).collect();
+    for d in [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    // SAFETY: runs first thing in main, before any other thread exists.
+    unsafe { std::env::set_var("PATH", dirs.join(":")) };
 }
 
 fn out(r: Result<String>) -> Result<()> {

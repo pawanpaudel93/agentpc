@@ -777,7 +777,10 @@ mod tests {
             ),
             "Windows 11 24H2 ISO, ARM64, consumer editions, build 26100.4349, en-us"
         );
-        assert_eq!(super::describe_iso("my-windows.iso"), "Windows ISO my-windows.iso");
+        assert_eq!(
+            super::describe_iso("my-windows.iso"),
+            "Windows ISO my-windows.iso"
+        );
     }
 
     /// Needs hdiutil and a dockur setup.img: set AGENTPC_TEST_SETUP_IMG to a scratch COPY

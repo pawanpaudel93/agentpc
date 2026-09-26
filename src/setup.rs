@@ -12,7 +12,14 @@ use crate::log;
 use crate::qemu::{edk2, which};
 
 const SERVER: &str = "agentpc";
-const DEFAULT_CLIENTS: [&str; 5] = ["claude", "codex", "cursor", "gemini", "vscode"];
+const DEFAULT_CLIENTS: [&str; 6] = [
+    "claude",
+    "claude-desktop",
+    "codex",
+    "cursor",
+    "gemini",
+    "vscode",
+];
 
 fn user_home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
@@ -89,6 +96,15 @@ pub fn mcp_install(clients: &[String]) -> Result<()> {
                     &["mcp", "add", "--scope", "user", SERVER, "--", &bin, "mcp"],
                     false,
                 )?;
+            }
+            "claude-desktop" => {
+                let dir = home.join("Library/Application Support/Claude");
+                if !dir.is_dir() {
+                    log!("skip claude-desktop (not installed)");
+                    continue;
+                }
+                json_register(&dir.join("claude_desktop_config.json"), &bin)?;
+                log!("restart Claude Desktop to load it");
             }
             "codex" => {
                 if which("codex").is_none() {
