@@ -348,7 +348,7 @@ pub fn set_writable(p: &Path) -> Result<()> {
 }
 
 /// Refuse an operation that needs more free space than the home volume has.
-fn ensure_free_space(need_gb: u64, action: &str) -> Result<()> {
+pub(crate) fn ensure_free_space(need_gb: u64, action: &str) -> Result<()> {
     if let Some(free) = crate::instance::free_disk_bytes(&crate::instance::home())
         && free < need_gb << 30
     {

@@ -135,6 +135,12 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
         std::fs::create_dir_all(&d).with_context(|| format!("create {}", d.display()))?;
     }
     ensure_ssh_key()?;
+    // Peak use: the build disk plus its flattened copy, then the image plus its snapshot.
+    let need_gb = match os {
+        Os::Windows => 35,
+        Os::Ubuntu => 12,
+    };
+    crate::ops::ensure_free_space(need_gb, &format!("build {image}"))?;
 
     let name = format!("_build-{image}");
     if instances_dir().join(&name).is_dir() {
@@ -251,6 +257,11 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
         let _ = std::fs::remove_file(p);
     }
     let state_tmp = state.with_extension("state.tmp");
+    let mem = u64::from(inst.size().0) << 30;
+    wait_for_space(
+        allocated(&inst.disk()) + mem + (1 << 30),
+        &format!("save the {} snapshot", inst.image),
+    )?;
     qemu::save_state(inst, &state_tmp)?;
     let disk_tmp = disk.with_extension("qcow2.tmp");
     run(
@@ -1084,6 +1095,36 @@ fn build_ubuntu(inst: &Instance) -> Result<()> {
     Ok(())
 }
 
+/// Bytes a file occupies on disk (a qcow2 is sparse; its length overstates it).
+fn allocated(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).map(|m| m.blocks() * 512).unwrap_or(0)
+}
+
+/// Wait up to 30 min for `need` free bytes, so a long build isn't thrown away when the
+/// disk fills up (macOS can reclaim tens of GB for updates mid-build). Errs if it never frees.
+fn wait_for_space(need: u64, what: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1800);
+    let mut told = false;
+    loop {
+        let free = crate::instance::free_disk_bytes(&home()).unwrap_or(u64::MAX);
+        if free >= need {
+            return Ok(());
+        }
+        let (need_gb, free_gb) = (need.div_ceil(1 << 30), free >> 30);
+        if std::time::Instant::now() > deadline {
+            bail!("not enough disk space to {what}: need ~{need_gb} GB, {free_gb} GB free");
+        }
+        if !told {
+            log!(
+                "need ~{need_gb} GB free to {what}, only {free_gb} GB; free some space and it continues (waiting up to 30 min)"
+            );
+            told = true;
+        }
+        std::thread::sleep(Duration::from_secs(15));
+    }
+}
+
 /// Freeze the cleanly shut-down build disk as the image (flattened, read-only).
 fn promote_image(inst: &Instance) -> Result<()> {
     let image = &inst.image;
@@ -1093,6 +1134,10 @@ fn promote_image(inst: &Instance) -> Result<()> {
     let _ = std::fs::remove_file(&disk);
     let _ = std::fs::remove_file(&vars);
     let tmp = disk.with_extension("qcow2.tmp");
+    wait_for_space(
+        allocated(&inst.disk()) + (1 << 30),
+        &format!("write the {image} image"),
+    )?;
     run(
         "qemu-img",
         &[
