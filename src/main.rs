@@ -7,6 +7,7 @@ mod ops;
 mod qemu;
 mod registry;
 mod setup;
+mod update;
 mod viewer;
 
 use std::path::PathBuf;
@@ -182,6 +183,13 @@ enum Cmd {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Update agentpc to the latest release (checksum-verified; images and VMs are kept)
+    #[command(visible_alias = "upgrade")]
+    Update {
+        /// Only say whether a newer release exists
+        #[arg(long)]
+        check: bool,
+    },
     /// Check prerequisites
     Doctor,
     /// Print a shell completion script: agentpc completions zsh > ~/.zfunc/_agentpc
@@ -348,6 +356,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::McpUninstall { clients } => setup::mcp_uninstall(&clients),
         Cmd::Clean { dry_run } => out(setup::clean(dry_run)),
         Cmd::Uninstall { keep_data, yes } => setup::uninstall(keep_data, yes),
+        Cmd::Update { check } => update::update(check),
         Cmd::Doctor => {
             if !setup::doctor()? {
                 std::process::exit(1);

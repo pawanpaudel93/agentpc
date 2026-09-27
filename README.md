@@ -75,7 +75,8 @@ The installer:
 4. registers the MCP server with the agents it finds (`agentpc mcp-install`),
 5. checks everything with `agentpc doctor`.
 
-Run it again to upgrade. Installer options:
+To upgrade later, run `agentpc update` (or `agentpc update --check` to just look); rerunning the
+installer works too. Installer options:
 
 | Variable | Effect |
 | --- | --- |
@@ -225,6 +226,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 | `agentpc mcp` | Run the MCP server on stdio (what agents launch) |
 | `agentpc mcp-install [clients…]` | Register the MCP server with agents (skips Claude Code when the plugin is installed; raises Codex's MCP timeouts so slow builds and boots don't trip it) |
 | `agentpc mcp-uninstall [clients…]` | Remove it from agents again |
+| `agentpc update [--check]` | Update to the latest release (checksum-verified; images and VMs are kept). Alias: `upgrade` |
 | `agentpc doctor` | Check prerequisites |
 | `agentpc clean [-n]` | Free disk space: downloaded ISOs and cloud images, and leftovers of interrupted builds or checkpoints. Never touches images or VMs; lists images no VM uses |
 | `agentpc uninstall [--keep-data] [-y]` | Remove agentpc (see [Uninstalling](#uninstalling)) |
