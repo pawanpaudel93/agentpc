@@ -46,11 +46,12 @@ pub fn push(image: &Image) -> Result<()> {
     }
     let oras =
         crate::qemu::which("oras").context("oras not found; install it with: brew install oras")?;
+    let cmd = crate::setup::cmd_name();
     if !image.exists() {
-        bail!("no {image} image to push; run: agentpc image build {image}");
+        bail!("no {image} image to push; run: {cmd} image build {image}");
     }
     let mut info = image::read_info(image).with_context(|| {
-        format!("{image} has no version info; run: agentpc image snapshot {image}")
+        format!("{image} has no version info; run: {cmd} image snapshot {image}")
     })?;
     let work = cache_dir().join(format!("push-{image}"));
     let _ = std::fs::remove_dir_all(&work);
@@ -132,7 +133,8 @@ pub fn pull(image: &Image) -> Result<()> {
 pub(crate) fn pull_locked(image: &Image) -> Result<()> {
     if image.os == Os::Windows {
         bail!(
-            "Windows images aren't published (Microsoft license); run: agentpc image build {image}"
+            "Windows images aren't published (Microsoft license); run: {} image build {image}",
+            crate::setup::cmd_name()
         );
     }
     if !image.instances()?.is_empty() {
@@ -167,6 +169,10 @@ async fn download(image: &Image) -> Result<()> {
     let base = format!("{scheme}://{}/v2/{}", r.host, r.repo);
     let http = reqwest::Client::builder()
         .user_agent(concat!("agentpc/", env!("CARGO_PKG_VERSION")))
+        // Cap connect and per-read stalls, but set no total timeout: image layers are large
+        // and a slow-but-progressing download must not be killed mid-stream.
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(60))
         .build()?;
     let token = anonymous_token(&http, &base, &r.repo).await?;
     let auth = |req: reqwest::RequestBuilder| match &token {

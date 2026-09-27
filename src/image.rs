@@ -80,6 +80,52 @@ pub fn build(image: &Image, iso: Option<PathBuf>) -> Result<()> {
 }
 
 /// `build`, for a caller already holding the image lock.
+/// Delete this image's half-written temp files (`*.qcow2.tmp`, `*.state.tmp`) left by an
+/// aborted build or snapshot. Best-effort: it runs on the failure path.
+fn remove_image_tmp(image: &Image) {
+    let prefix = format!("{image}.");
+    for e in std::fs::read_dir(images_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && name.ends_with(".tmp") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Owns a hidden build/snapshot VM for the duration of the work. If it's dropped before the
+/// artifacts are safely in place — an early `?` or a panic — it kills the VM, deletes its
+/// directory, and clears the image's temp partials, so a failed build never leaves a VM
+/// running or half-written files behind. Disarm with `keep()` on success. (A hard Ctrl-C
+/// still can't run Drop; `agentpc clean` sweeps whatever an interrupt leaves.)
+struct BuildGuard {
+    inst: Instance,
+    armed: bool,
+}
+
+impl BuildGuard {
+    fn new(inst: Instance) -> Self {
+        Self { inst, armed: true }
+    }
+    fn keep(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BuildGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        qemu::quit(&self.inst);
+        let _ = std::fs::remove_dir_all(&self.inst.dir);
+        remove_image_tmp(&self.inst.image);
+    }
+}
+
 pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     let os = image.os;
     if !image.instances()?.is_empty() {
@@ -105,20 +151,22 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
         }
         Os::Ubuntu => None,
     };
-    let inst = Instance::create(&name, image, 0)?;
+    let guard = BuildGuard::new(Instance::create(&name, image, 0)?);
     match &iso_path {
-        Some(iso) => build_windows(&inst, iso)?,
-        None => build_ubuntu(&inst)?,
+        Some(iso) => build_windows(&guard.inst, iso)?,
+        None => build_ubuntu(&guard.inst)?,
     }
     // Bake the defaults into the image too, so the prepare step at snapshot time (after a
     // pull, say) finds them in place instead of redoing slow work like installing Chrome.
-    prepare_guest(&inst)?;
-    let mut info = guest_info(&inst)?;
+    prepare_guest(&guard.inst)?;
+    let mut info = guest_info(&guard.inst)?;
     if let (Os::Windows, Some(p)) = (os, &iso_path) {
         record_iso(&mut info, p)?;
     }
     info.built = crate::instance::local_date();
-    promote_image(&inst)?;
+    promote_image(&guard.inst)?;
+    // The image disk is written and the build VM removed; snapshot_locked guards its own VM.
+    guard.keep();
     write_info(image, &info)?;
     snapshot_locked(image)
 }
@@ -135,7 +183,10 @@ pub fn snapshot(image: &Image) -> Result<()> {
 pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
     let os = image.os;
     if !image.exists() {
-        bail!("no {image} image; run: agentpc image build {image}");
+        bail!(
+            "no {image} image; run: {} image build {image}",
+            crate::setup::cmd_name()
+        );
     }
     if image.instances()?.iter().any(|i| i.on_snapshot_base()) {
         bail!("VMs of {image} depend on its snapshot; rm them first");
@@ -147,7 +198,8 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
         }
         std::fs::remove_dir_all(instances_dir().join(&name))?;
     }
-    let inst = Instance::create(&name, image, 0)?;
+    let guard = BuildGuard::new(Instance::create(&name, image, 0)?);
+    let inst = &guard.inst;
     run(
         "qemu-img",
         &[
@@ -166,9 +218,9 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
     crate::ops::set_writable(&inst.vars())?;
 
     log!("booting {image} to capture its snapshot");
-    qemu::start(&inst, &[])?;
-    let took = wait_ready(&inst, Duration::from_secs(os.boot_timeout()))?;
-    prepare_guest(&inst)?;
+    qemu::start(inst, &[])?;
+    let took = wait_ready(inst, Duration::from_secs(os.boot_timeout()))?;
+    prepare_guest(inst)?;
     // Let post-logon startup finish so clones don't all redo it after resuming.
     let settle = match os {
         Os::Windows => 45,
@@ -176,7 +228,7 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
     };
     log!("{os} ready in {}s; settling {settle}s", took.as_secs());
     // Guest-reported fields refresh; build-time ones (base, built, ISO checksum) are kept.
-    let fresh = guest_info(&inst)?;
+    let fresh = guest_info(inst)?;
     let mut info = read_info(image).unwrap_or_default();
     if info.base.is_empty() {
         info.base = fresh.base;
@@ -199,7 +251,7 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
         let _ = std::fs::remove_file(p);
     }
     let state_tmp = state.with_extension("state.tmp");
-    qemu::save_state(&inst, &state_tmp)?;
+    qemu::save_state(inst, &state_tmp)?;
     let disk_tmp = disk.with_extension("qcow2.tmp");
     run(
         "qemu-img",
@@ -220,6 +272,8 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
         std::fs::set_permissions(p, perm)?;
     }
     std::fs::remove_dir_all(&inst.dir)?;
+    // Snapshot artifacts are in place and the VM is gone; nothing left to clean up.
+    guard.keep();
     let gb = |p: &PathBuf| {
         std::fs::metadata(p)
             .map(|m| m.len() as f64 / 1e9)
@@ -492,7 +546,8 @@ pub fn list() -> Result<String> {
         s += &format!("{image:<22} {version:<42} {size:>5.1} GB  {snap}\n");
     }
     if s.is_empty() {
-        s = "no images (agentpc image pull ubuntu, or agentpc image build <os>)".into();
+        let cmd = crate::setup::cmd_name();
+        s = format!("no images ({cmd} image pull ubuntu, or {cmd} image build <os>)");
     }
     Ok(s)
 }
@@ -502,7 +557,10 @@ pub fn describe(image: &Image) -> Result<String> {
         bail!("no {image} image");
     }
     let info = read_info(image).with_context(|| {
-        format!("no version info for {image}; run: agentpc image snapshot {image}")
+        format!(
+            "no version info for {image}; run: {} image snapshot {image}",
+            crate::setup::cmd_name()
+        )
     })?;
     Ok(serde_json::to_string_pretty(&info)?)
 }
@@ -646,7 +704,23 @@ fn download_windows_iso(w: &WinIso) -> Result<PathBuf> {
     }
     let curl = |url: &str| {
         Command::new("curl")
-            .args(["-fL", "--retry", "3", "-C", "-", "-#", "-o"])
+            // Fail fast on a dead connection or a download that stalls under 1 KB/s for 2 min,
+            // rather than hanging an image build forever.
+            .args([
+                "-fL",
+                "--retry",
+                "3",
+                "-C",
+                "-",
+                "--connect-timeout",
+                "30",
+                "--speed-limit",
+                "1024",
+                "--speed-time",
+                "120",
+                "-#",
+                "-o",
+            ])
             .arg(&part)
             .arg(url)
             .status()
@@ -781,7 +855,18 @@ fn virtio_drivers() -> Result<PathBuf> {
     log!("downloading the virtio drivers for Windows");
     run(
         "curl",
-        &["-fsSL", "-o", &archive.to_string_lossy(), VIRTIO_URL],
+        &[
+            "-fsSL",
+            "--connect-timeout",
+            "30",
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "120",
+            "-o",
+            &archive.to_string_lossy(),
+            VIRTIO_URL,
+        ],
     )?;
     if sha256_file(&archive)? != VIRTIO_SHA256 {
         let _ = std::fs::remove_file(&archive);
@@ -910,7 +995,23 @@ fn build_ubuntu(inst: &Instance) -> Result<()> {
         log!("downloading the Ubuntu {version} cloud image");
         let url = format!("https://cloud-images.ubuntu.com/releases/{version}/release/{file}");
         let part = base.with_extension("img.part");
-        if run("curl", &["-fsSL", "-o", &part.to_string_lossy(), &url]).is_err() {
+        if run(
+            "curl",
+            &[
+                "-fsSL",
+                "--connect-timeout",
+                "30",
+                "--speed-limit",
+                "1024",
+                "--speed-time",
+                "120",
+                "-o",
+                &part.to_string_lossy(),
+                &url,
+            ],
+        )
+        .is_err()
+        {
             bail!(
                 "no Ubuntu {version} cloud image for arm64; releases are listed at \
                  https://cloud-images.ubuntu.com/releases/"
