@@ -352,10 +352,11 @@ pub fn info(inst: &Instance) -> String {
         format!("\n  checkpoints: {}", cps.join(", "))
     };
     format!(
-        "{} ({}): viewer {}\n  ssh: agentpc ssh {}    vnc: vnc://127.0.0.1:{}    login: agent/agent{cps}",
+        "{} ({}): viewer {}\n  ssh: {} ssh {}    vnc: vnc://127.0.0.1:{}    login: agent/agent{cps}",
         inst.name,
         inst.image,
         viewer::url(inst),
+        crate::setup::cmd_name(),
         inst.name,
         inst.vnc_port()
     )
@@ -425,7 +426,8 @@ fn provision_image(image: &Image) -> Result<()> {
         }
         Os::Windows => bail!(
             "no {image} image yet; build it once (~12 min, downloads the ISO from Microsoft): \
-             agentpc image build {image}"
+             {} image build {image}",
+            crate::setup::cmd_name()
         ),
     }
 }
@@ -675,6 +677,7 @@ pub fn progress(line: &str) {
 
 pub fn stop(inst: &Instance) -> Result<String> {
     let _lock = inst.lock()?;
+    stop_forwards(inst);
     qemu::stop(inst)?;
     viewer::stop_if_idle();
     Ok(format!("{} stopped", inst.name))
@@ -683,6 +686,7 @@ pub fn stop(inst: &Instance) -> Result<String> {
 // reset and delete discard the disk, so a clean guest shutdown would be wasted time.
 pub fn reset(inst: &Instance) -> Result<String> {
     let _lock = inst.lock()?;
+    stop_forwards(inst);
     qemu::quit(inst);
     clone_disk(inst)?;
     boot_locked(inst)
@@ -690,6 +694,7 @@ pub fn reset(inst: &Instance) -> Result<String> {
 
 pub fn delete(inst: &Instance) -> Result<String> {
     let _lock = inst.lock()?;
+    stop_forwards(inst);
     qemu::quit(inst);
     std::fs::remove_dir_all(&inst.dir)?;
     viewer::stop_if_idle();
@@ -708,7 +713,7 @@ pub fn list_json() -> Result<String> {
                 "name": i.name,
                 "os": i.os,
                 "image": i.image.to_string(),
-                "state": if running { run_state(i) } else { "stopped".to_string() },
+                "state": if running { qemu::status(i).unwrap_or_else(|| "running".into()) } else { "stopped".to_string() },
                 "slot": i.slot,
                 "memory_gb": memory_gb,
                 "cpus": cpus,
@@ -779,16 +784,6 @@ pub fn owner(inst: &Instance) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-}
-
-/// The live run-state from QMP (running / paused / io-error / …); "running" if QMP can't be
-/// reached but the process is alive. TODO(dedup): fold into `qemu::status` once merged.
-fn run_state(inst: &Instance) -> String {
-    qemu::Qmp::connect(inst)
-        .ok()
-        .and_then(|mut q| q.execute("query-status", None).ok())
-        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
-        .unwrap_or_else(|| "running".to_string())
 }
 
 // --- Port forwards ----------------------------------------------------------------------
