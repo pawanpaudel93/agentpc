@@ -347,10 +347,10 @@ The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
   compressed qcow2 split into 64 MB parts, downloaded in parallel and checksum-verified.
 - **Windows build.** agentpc writes a small setup disk next to the ISO: an unattended-install
   answer file (adapted from [dockur/windows-arm](https://github.com/dockur/windows-arm)), Red
-  Hat's ARM64 virtio drivers, and a first-logon script that installs OpenSSH and cua-driver.
+  Hat's ARM64 virtio drivers, and a first-logon script that installs OpenSSH and cua-driver (telemetry off).
   Windows Setup then runs in QEMU with no clicks.
 - **Ubuntu build.** The official cloud image is provisioned with cloud-init: XFCE on X11,
-  auto-login, and cua-driver (pinned, so tool names match these docs). cloud-init is then disabled so clones don't re-provision.
+  auto-login, and cua-driver (pinned, so tool names match these docs; telemetry off). cloud-init is then disabled so clones don't re-provision. To opt in to cua-driver's telemetry, run `cua-driver telemetry enable` in the VM.
 - **Agent-ready guests.** Each time a snapshot is captured, a prepare script turns off what
   interrupts unattended work (Windows SmartScreen, updates, first-run and tip pop-ups; Ubuntu's
   background apt jobs) and installs Google Chrome on Ubuntu for cua-driver's browser tools.

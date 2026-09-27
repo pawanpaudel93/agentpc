@@ -68,8 +68,15 @@ runcmd:
   - systemctl set-default graphical.target
   # xfce4 pulls in light-locker, which would lock the agent out of the session.
   - apt-get purge -y light-locker
-  # Pinned: the skill and docs describe this version's tools. Bump deliberately.
-  - su - agent -c 'CUA_DRIVER_RS_VERSION=0.29.1 /bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"'
+  # Pinned: the skill and docs describe this version's tools. Bump deliberately. The
+  # installer runs a sibling _install-rust.sh if present (else the latest from cua.ai), so
+  # fetch both from the same tag. Telemetry off: VMs don't report to a third party.
+  - |
+    su - agent -c 'set -e; d=$(mktemp -d); cd "$d"
+      curl -fsSLO https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.30.1/install.sh
+      curl -fsSLO https://raw.githubusercontent.com/trycua/cua/cua-driver-rs-v0.30.1/libs/cua-driver/scripts/_install-rust.sh
+      CUA_DRIVER_RS_VERSION=0.30.1 CUA_DRIVER_RS_TELEMETRY_ENABLED=0 bash ./install.sh
+      ~/.local/bin/cua-driver telemetry disable; rm -rf "$d"'
   - touch /var/lib/cloud/agent-ready
   # VMs cloned from the image boot without a seed; stop cloud-init treating them as
   # new instances and re-running this whole file.

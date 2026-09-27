@@ -16,6 +16,8 @@ Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalizatio
 # interactive session (Session 0, where sshd runs, cannot see the desktop).
 # Pinned: the skill and docs describe this version's tools. Bump deliberately.
 $env:CUA_DRIVER_RS_VERSION = '0.30.1'
+# Telemetry off: VMs don't report to a third party.
+$env:CUA_DRIVER_RS_TELEMETRY_ENABLED = '0'
 $ProgressPreference = 'SilentlyContinue'
 # The installer imports a sibling _install-common.psm1 if present, else the latest from
 # cua.ai; fetch the one from the same tag so builds are reproducible.
@@ -27,6 +29,7 @@ Invoke-WebRequest https://raw.githubusercontent.com/trycua/cua/cua-driver-rs-v0.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$dir\install.ps1"
 $cua = "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin\cua-driver.exe"
 if (Test-Path $cua) {
+    & $cua telemetry disable
     # The installer only registers the logon task; start it for this session too.
     & $cua autostart kick
 } else {
