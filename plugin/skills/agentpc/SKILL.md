@@ -54,6 +54,9 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 - Processes started over `run_command` end when the command returns; start long-running servers
   with a scheduled task, and open the Windows firewall for ports you `forward_port`.
 - SmartScreen, Windows Update and first-run pop-ups are turned off. Edge is the browser.
+- It's a clean install: no Visual C++ redistributable, no .NET (only .NET Framework 4.8.1),
+  no PowerShell 7. A missing `VCRUNTIME140.dll` means the app under test doesn't ship its
+  runtime; report that rather than installing it, unless the user asks.
 
 ## Ubuntu (desktop tools from cua-driver, XFCE on X11)
 
@@ -76,6 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 - Windows images can't be downloaded. If `list_vms` shows no Windows image, ask the user to
   build one once (~12 min) and don't start it yourself:
   `agentpc image build windows` (downloads the official ISO from Microsoft, 7.3 GB). Other
-  versions: `windows-11-24h2`, `windows-11-23h2`.
+  versions: `windows-11-24h2`, `windows-11-23h2`. Pass `version` (e.g. `"11-24h2"`) when the
+  Windows release matters; without it you get 25H2, or the newest Windows 11 image installed.
 - Don't put real credentials or secrets into a VM. The guest login is `agent` / `agent`, and
   the VMs are reachable from anything on the Mac.

@@ -33,7 +33,7 @@ pub(crate) struct WinIso {
 /// generic Pro key doesn't install it).
 pub(crate) const WINDOWS_ISOS: [WinIso; 3] = [
     WinIso {
-        version: "11",
+        version: "11-25h2",
         what: "Windows 11 25H2 (Home/Pro)",
         urls: &[
             "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_a64fre_en-us.iso",
@@ -92,7 +92,11 @@ pub fn build(image: &Image, iso: Option<PathBuf>) -> Result<()> {
         std::fs::remove_dir_all(instances_dir().join(&name))?;
     }
     let iso_path = match os {
-        Os::Windows => Some(windows_iso(&image.version, iso)?),
+        Os::Windows => {
+            let iso = windows_iso(&image.version, iso)?;
+            log!("installing from {}", iso.display());
+            Some(iso)
+        }
         Os::Ubuntu => None,
     };
     let inst = Instance::create(&name, image, 0)?;
@@ -393,14 +397,9 @@ fn describe_iso(name: &str) -> String {
     let Ok(build_no) = build.parse::<u32>() else {
         return format!("Windows ISO {name}");
     };
-    let release = match build_no {
-        26200.. => " 25H2",
-        26100.. => " 24H2",
-        22631.. => " 23H2",
-        22621.. => " 22H2",
-        22000.. => " 21H2",
-        _ => "",
-    };
+    let release = release_of_build(build_no)
+        .map(|r| format!(" {}", r.to_ascii_uppercase()))
+        .unwrap_or_default();
     let major = if build_no >= 22000 { "11" } else { "10" };
     let upper = stem.to_ascii_uppercase();
     let arch = if upper.contains("A64FRE") {
@@ -426,6 +425,32 @@ fn describe_iso(name: &str) -> String {
         .map(|l| format!(", {l}"))
         .unwrap_or_default();
     format!("Windows {major}{release} ISO, {arch}{editions}, build {build}.{ubr}{lang}")
+}
+
+fn release_of_build(build: u32) -> Option<&'static str> {
+    match build {
+        26200..=26299 => Some("25h2"),
+        26100..=26199 => Some("24h2"),
+        22631..=22999 => Some("23h2"),
+        22621..=22630 => Some("22h2"),
+        22000..=22620 => Some("21h2"),
+        _ => None,
+    }
+}
+
+/// The Windows 11 release an ISO holds, as an image version ("11-24h2"), read from its
+/// file name: Microsoft's names lead with the build number, mirrors' spell out "24H2".
+fn iso_release(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let build = lower.split('.').next().and_then(|b| b.parse::<u32>().ok());
+    let release = match build {
+        Some(b) => release_of_build(b)?.to_string(),
+        None => lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .find(|t| t.len() == 4 && t.as_bytes()[2] == b'h' && t[..2].parse::<u8>().is_ok())?
+            .to_string(),
+    };
+    Some(format!("11-{release}"))
 }
 
 /// SHA-256 of a file via `shasum`, for recording which ISO an image was built from.
@@ -522,8 +547,8 @@ fn create_vars(inst: &Instance) -> Result<()> {
 }
 
 /// A Windows ISO already on this Mac for `version`: `--iso`, `$WIN_ISO`, an earlier download,
-/// or (for the default version) `~/Downloads/*A64FRE*.iso`. An explicitly named path is
-/// returned even if it doesn't exist.
+/// or a Home/Pro ISO of that release in `~/Downloads`. An explicitly named path is returned
+/// even if it doesn't exist.
 pub(crate) fn find_windows_iso(version: &str, iso: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(p) = iso.or_else(|| std::env::var_os("WIN_ISO").map(PathBuf::from)) {
         return Some(p);
@@ -534,11 +559,6 @@ pub(crate) fn find_windows_iso(version: &str, iso: Option<PathBuf>) -> Option<Pa
     {
         return Some(p);
     }
-    // A consumer ISO the user downloaded themselves can't be told apart from other
-    // editions by name alone, so only the default version picks one up.
-    if version != Os::Windows.default_version() {
-        return None;
-    }
     let downloads = PathBuf::from(std::env::var_os("HOME")?).join("Downloads");
     let mut isos: Vec<PathBuf> = std::fs::read_dir(downloads)
         .into_iter()
@@ -546,9 +566,16 @@ pub(crate) fn find_windows_iso(version: &str, iso: Option<PathBuf>) -> Option<Pa
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.to_ascii_lowercase().contains("a64fre") && n.ends_with(".iso"))
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                let l = n.to_ascii_lowercase();
+                // The answer file installs Home/Pro; other editions don't finish.
+                l.ends_with(".iso")
+                    && (l.contains("a64fre") || l.contains("arm64"))
+                    && !["eval", "ltsc", "enterprise", "iot", "server"]
+                        .iter()
+                        .any(|e| l.contains(e))
+                    && iso_release(n).as_deref() == Some(version)
+            })
         })
         .collect();
     isos.sort();
@@ -566,7 +593,22 @@ fn downloaded_iso_path(w: &WinIso) -> PathBuf {
 /// The ISO to install from, downloading Microsoft's official one if none is on this Mac.
 fn windows_iso(version: &str, iso: Option<PathBuf>) -> Result<PathBuf> {
     match find_windows_iso(version, iso) {
-        Some(p) if p.is_file() => Ok(p),
+        Some(p) if p.is_file() => {
+            // Keep release names honest: windows-11-25h2 must not hold 24H2.
+            let found = p
+                .file_name()
+                .and_then(|n| iso_release(&n.to_string_lossy()));
+            if windows_iso_entry(version).is_some()
+                && let Some(found) = found.filter(|f| f != version)
+            {
+                bail!(
+                    "{} is a Windows {} ISO, not windows-{version}; build it as windows-{found}",
+                    p.display(),
+                    found.replace('-', " ").to_ascii_uppercase()
+                );
+            }
+            Ok(p)
+        }
         Some(p) => bail!("Windows ISO {} not found", p.display()),
         None => match windows_iso_entry(version) {
             Some(w) => download_windows_iso(w),
@@ -986,6 +1028,26 @@ mod tests {
             super::describe_iso("my-windows.iso"),
             "Windows ISO my-windows.iso"
         );
+    }
+
+    #[test]
+    fn reads_the_release_from_iso_names() {
+        use super::iso_release;
+        for (name, release) in [
+            (
+                "26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_a64fre_en-us.iso",
+                Some("11-25h2"),
+            ),
+            (
+                "26100.4349.250607-1500.ge_release_svc_refresh_CLIENTCONSUMER_RET_A64FRE_en-us.iso",
+                Some("11-24h2"),
+            ),
+            ("Win11_24H2_English_Arm64.iso", Some("11-24h2")),
+            ("en-us_windows_11_23h2_arm64.iso", Some("11-23h2")),
+            ("my-windows.iso", None),
+        ] {
+            assert_eq!(iso_release(name).as_deref(), release, "{name}");
+        }
     }
 
     /// Downloads the virtio drivers and writes setup.img with hdiutil; run with AGENTPC_HOME

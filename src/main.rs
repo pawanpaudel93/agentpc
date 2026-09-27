@@ -90,14 +90,15 @@ enum ImageCmd {
     #[command(after_help = "\
 Images are <os>-<version>; a bare os means the default version.
   ubuntu-<release>            any release at cloud-images.ubuntu.com/releases (default 24.04)
-  windows-11                  Windows 11 25H2 Home/Pro (default)
+  windows-11-25h2             Windows 11 25H2 Home/Pro (default: windows, windows-11)
   windows-11-24h2             Windows 11 24H2 Home/Pro (archive mirror)
   windows-11-23h2             Windows 11 23H2 Home/Pro (archive mirror)
-ISOs are checksum-verified; --iso installs from your own under any name.")]
+ISOs are checksum-verified. --iso installs your own: it must match a release name above,
+or use any other name (windows-custom).")]
     Build {
         image: String,
         /// Windows ARM64 ISO to install from (default: $WIN_ISO, an earlier download,
-        /// ~/Downloads/*A64FRE*.iso for windows-11, else download it)
+        /// a Home/Pro ISO of that release in ~/Downloads, else download it)
         #[arg(long)]
         iso: Option<PathBuf>,
     },
@@ -128,7 +129,7 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::Create { image, name } => out(ops::create(&image.parse()?, name.as_deref())),
+        Cmd::Create { image, name } => out(ops::create(&Image::resolve(&image)?, name.as_deref())),
         Cmd::List => out(ops::list_table()),
         Cmd::Info { name } => out(Ok(ops::info(&Instance::load(&name)?))),
         Cmd::Start { name } => out(ops::boot(&Instance::load(&name)?)),
@@ -165,7 +166,7 @@ fn run(cli: Cli) -> Result<()> {
             ImageCmd::Pull { image: i } => registry::pull(&i.parse()?),
             ImageCmd::Push { image: i } => registry::push(&i.parse()?),
             ImageCmd::Ls => out(image::list()),
-            ImageCmd::Info { image: i } => out(image::describe(&i.parse()?)),
+            ImageCmd::Info { image: i } => out(image::describe(&Image::resolve(&i)?)),
             ImageCmd::Rm { image: i } => out(image::remove(&i.parse()?)),
             ImageCmd::Snapshot { image: i } => image::snapshot(&i.parse::<Image>()?),
         },

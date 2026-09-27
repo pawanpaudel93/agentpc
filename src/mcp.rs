@@ -34,8 +34,8 @@ use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance
 Windows desktop tools come from Windows-MCP (call Snapshot first; Click/Type need a loc
 [x, y] or label). Ubuntu desktop tools come from cua-driver (keyboard/mouse input needs
 \"delivery_mode\": \"foreground\"). run_command runs PowerShell on Windows and bash on Ubuntu.
-create_vm takes an optional version (Ubuntu release like \"22.04\"; Windows \"11\",
-\"11-23h2\", ...; see agentpc image build --help); list_vms shows which images exist.
+create_vm takes an optional version (Ubuntu release like \"22.04\"; Windows \"11-25h2\",
+\"11-24h2\" or \"11-23h2\"); list_vms shows which images exist.
 ";
 
 pub async fn serve() -> Result<()> {
@@ -88,7 +88,8 @@ enum OsArg {
 struct CreateArgs {
     os: OsArg,
     /// Default: ubuntu 24.04, windows 11. Ubuntu: any release, e.g. "22.04", "26.04".
-    /// Windows: "11", "11-24h2" or "11-23h2".
+    /// Windows: "11-25h2", "11-24h2" or "11-23h2". Omitted, Windows uses 25H2, or the newest
+    /// installed Windows 11 image if 25H2 isn't built.
     version: Option<String>,
     name: Option<String>,
 }
@@ -192,7 +193,11 @@ impl Gateway {
         };
         text(
             blocking(move || {
-                ops::create(&Image::new(os, a.version.as_deref())?, a.name.as_deref())
+                let name = match a.version {
+                    Some(v) => format!("{os}-{v}"),
+                    None => os.to_string(),
+                };
+                ops::create(&Image::resolve(&name)?, a.name.as_deref())
             })
             .await,
         )

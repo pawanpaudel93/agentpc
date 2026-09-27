@@ -41,10 +41,10 @@ pub enum Os {
 impl Os {
     pub const ALL: [Os; 2] = [Os::Windows, Os::Ubuntu];
 
-    /// The version a bare `ubuntu` or `windows` means.
+    /// The version a bare `ubuntu` or `windows` means: the newest release agentpc knows.
     pub fn default_version(self) -> &'static str {
         match self {
-            Os::Windows => "11",
+            Os::Windows => "11-25h2",
             Os::Ubuntu => "24.04",
         }
     }
@@ -58,8 +58,8 @@ impl Os {
     }
 }
 
-/// An OS image VMs are cloned from, named `<os>-<version>` (`ubuntu-24.04`, `windows-11`).
-/// Several versions of an OS can be installed side by side.
+/// An OS image VMs are cloned from, named `<os>-<version>` (`ubuntu-24.04`,
+/// `windows-11-25h2`). Several versions of an OS can be installed side by side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Image {
     pub os: Os,
@@ -68,7 +68,10 @@ pub struct Image {
 
 impl Image {
     pub fn new(os: Os, version: Option<&str>) -> Result<Self> {
-        let version = version.unwrap_or(os.default_version()).to_ascii_lowercase();
+        let mut version = version.unwrap_or(os.default_version()).to_ascii_lowercase();
+        if os == Os::Windows && version == "11" {
+            version = os.default_version().into();
+        }
         // It becomes part of file names and registry tags.
         if version.is_empty()
             || !version
@@ -78,6 +81,23 @@ impl Image {
             bail!("invalid {os} version '{version}'");
         }
         Ok(Self { os, version })
+    }
+
+    /// What a user means by `name`. Like parsing it, except that a bare `windows` or
+    /// `windows-11` whose default release isn't installed falls back to the newest installed
+    /// Windows 11 image: building one takes 12+ minutes.
+    pub fn resolve(name: &str) -> Result<Self> {
+        let image: Self = name.parse()?;
+        if matches!(name, "windows" | "windows-11") && !image.exists() {
+            let newest = Self::all()
+                .into_iter()
+                .filter(|i| i.os == Os::Windows && i.version.starts_with("11-"))
+                .max_by(|a, b| a.version.cmp(&b.version));
+            if let Some(i) = newest {
+                return Ok(i);
+            }
+        }
+        Ok(image)
     }
 
     /// Installed images, sorted by name.
@@ -159,7 +179,8 @@ impl fmt::Display for Image {
     }
 }
 
-/// `ubuntu` (default version) or `ubuntu-22.04`.
+/// `ubuntu` (default version) or `ubuntu-22.04`; `windows-11` means the default Windows 11
+/// release.
 impl FromStr for Image {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -318,45 +339,52 @@ impl Instance {
     }
 }
 
-/// Rename images from before versions were tracked (`ubuntu.qcow2` → `ubuntu-24.04.qcow2`)
-/// and repoint their clones. Waits while such a clone is running: its disk is locked.
+const IMAGE_FILES: [&str; 6] = [
+    ".qcow2",
+    ".vars.fd",
+    ".json",
+    ".snapshot.qcow2",
+    ".snapshot.vars.fd",
+    ".snapshot.state",
+];
+
+/// Rename images from before their names carried the full version, and repoint their clones:
+/// `ubuntu.qcow2` → `ubuntu-24.04.qcow2`, and `windows.qcow2` or `windows-11.qcow2` →
+/// `windows-11-<release>.qcow2`. The release comes from the image's recorded info. Waits
+/// while such a clone is running: its disk is locked.
 pub fn migrate_legacy_images() -> Result<()> {
-    for os in Os::ALL {
-        let legacy = |suffix: &str| images_dir().join(format!("{os}{suffix}"));
-        if !legacy(".qcow2").is_file() {
+    for stem in ["ubuntu", "windows", "windows-11"] {
+        let os: Os = stem.split('-').next().unwrap_or(stem).parse()?;
+        let old = |suffix: &str| images_dir().join(format!("{stem}{suffix}"));
+        if !old(".qcow2").is_file() {
             continue;
         }
+        let version = std::fs::read(old(".json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["version_id"].as_str().map(str::to_ascii_lowercase));
+        let Some(version) = version else { continue };
+        let image = Image::new(os, Some(&version))?;
+        if image.exists() {
+            continue;
+        }
+        // Clones name their image in an `image` file; the oldest ones only have `os`.
         let clones: Vec<Instance> = std::fs::read_dir(instances_dir())
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| !e.path().join("image").exists())
+            .filter(|e| match read_trimmed(&e.path().join("image")) {
+                Ok(name) => name == stem,
+                Err(_) => read_trimmed(&e.path().join("os")).is_ok_and(|o| o == stem),
+            })
             .filter_map(|e| Instance::load(&e.file_name().to_string_lossy()).ok())
-            .filter(|i| i.os == os)
             .collect();
         if clones.iter().any(|i| i.running()) {
             continue;
         }
-        // Builds before this recorded the Ubuntu release; Windows ones were all Windows 11.
-        let version = std::fs::read(legacy(".json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v["version_id"].as_str().map(String::from))
-            .filter(|_| os == Os::Ubuntu);
-        let image = Image::new(os, version.as_deref())?;
-        if image.exists() {
-            continue;
-        }
-        for suffix in [
-            ".qcow2",
-            ".vars.fd",
-            ".json",
-            ".snapshot.qcow2",
-            ".snapshot.vars.fd",
-            ".snapshot.state",
-        ] {
-            if legacy(suffix).exists() {
-                std::fs::rename(legacy(suffix), image.file(suffix))?;
+        for suffix in IMAGE_FILES {
+            if old(suffix).exists() {
+                std::fs::rename(old(suffix), image.file(suffix))?;
             }
         }
         for inst in clones {
@@ -379,7 +407,7 @@ pub fn migrate_legacy_images() -> Result<()> {
             }
             std::fs::write(inst.dir.join("image"), image.to_string())?;
         }
-        crate::log!("renamed the {os} image to {image}");
+        crate::log!("renamed the {stem} image to {image}");
     }
     Ok(())
 }
@@ -456,6 +484,12 @@ mod tests {
         assert_eq!((i.os, i.to_string()), (Os::Ubuntu, "ubuntu-24.04".into()));
         let i: Image = "windows-11-23h2".parse().unwrap();
         assert_eq!((i.os, i.version.as_str()), (Os::Windows, "11-23h2"));
+        for bare in ["windows", "windows-11"] {
+            assert_eq!(
+                bare.parse::<Image>().unwrap().to_string(),
+                "windows-11-25h2"
+            );
+        }
         assert_eq!(
             "Ubuntu-22.04".parse::<Image>().err().map(|e| e.to_string()),
             Some("unknown os 'Ubuntu' (windows|ubuntu)".into())

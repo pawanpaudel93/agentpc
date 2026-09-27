@@ -213,23 +213,32 @@ pick the server up automatically.
 An **image** is a read-only disk with the OS, desktop and agent tools installed. Every VM is a
 copy-on-write clone of an image, so a VM starts from a clean install and costs only a few MB.
 
-Images are named `<os>-<version>`; a bare `ubuntu` or `windows` means the default version.
-Several versions can be installed side by side, and each VM remembers which one it came from.
+Images are named `<os>-<version>`, and several can be installed side by side; each VM
+remembers which one it came from. A bare `ubuntu` means `ubuntu-24.04`, and a bare `windows`
+(or `windows-11`) means `windows-11-25h2`. To save a 12-minute build, `create` and
+`image info` fall back to your newest installed Windows 11 image if 25H2 isn't built. Pin the
+full name when the release matters, e.g. in test harnesses.
 
 | Image | Source | How to get it |
 | --- | --- | --- |
 | `ubuntu` = `ubuntu-24.04` | Official Ubuntu 24.04 cloud image | `image pull` (automatic on first `create`) or `image build` |
 | `ubuntu-<release>` | Any release in [cloud-images.ubuntu.com/releases](https://cloud-images.ubuntu.com/releases/), e.g. `22.04`, `26.04` | `image build ubuntu-22.04`, or `image pull` if published |
-| `windows` = `windows-11` | Windows 11 25H2 (Home/Pro), 7.3 GB ISO from Microsoft | `image build windows` |
+| `windows-11-25h2` (`windows`) | Windows 11 25H2 (Home/Pro), 7.3 GB ISO from Microsoft | `image build windows` |
 | `windows-11-24h2`, `windows-11-23h2` | Earlier Windows 11 releases (Home/Pro) | `image build windows-11-23h2` |
-| `windows-<anything>` | Your own Windows 11 ARM64 Home/Pro ISO | `image build windows-<anything> --iso <path>` |
+| `windows-<name>` | Your own Windows 11 ARM64 Home/Pro ISO | `image build windows-<name> --iso <path>` |
 
 Only ARM64 Windows runs at native speed on Apple Silicon, so x64-only releases aren't offered,
 and Windows 10's ARM64 build hangs at boot on Apple Silicon, so Windows 11 is the minimum.
-The unattended install handles the Home/Pro ISO; Enterprise and LTSC ISOs don't finish
-installing.
+The unattended install uses the Home/Pro setup key, so Enterprise and LTSC ISOs aren't
+supported. An ISO in `~/Downloads` is used when its file name shows the release being built;
+`--iso` with a release name must match it too (a 24H2 ISO can't become `windows-11-25h2`).
 Windows runs unactivated (a watermark, nothing else); activate it with your own key if you
-need to. Microsoft's evaluation ISOs aren't offered: they install already expired and shut
+need to.
+
+Images are clean installs, like a customer's new PC: Windows has no Visual C++ redistributable,
+no .NET (only the built-in .NET Framework 4.8.1) and no PowerShell 7. A program that runs on
+your machine but fails in a VM with a missing `VCRUNTIME140.dll` or similar is missing a
+dependency its installer should provide. Microsoft's evaluation ISOs aren't offered: they install already expired and shut
 down every hour.
 
 Microsoft serves only its current ARM64 ISOs; the older ones download from archive mirrors
@@ -247,14 +256,14 @@ Each image records what it is (`agentpc image info <image>`):
 ```json
 {
   "os": "windows",
-  "version": "Windows 11 Pro 24H2 (build 26100.4349)",
-  "version_id": "11-24H2",
+  "version": "Windows 11 Pro 25H2 (build 26200.6584)",
+  "version_id": "11-25H2",
   "arch": "arm64",
-  "base": "Windows 11 24H2 ISO, ARM64, consumer editions, build 26100.4349, en-us",
-  "built": "20260926",
+  "base": "Windows 11 25H2 (Home/Pro) ISO, ARM64, en-us",
+  "built": "20260927",
   "agentpc": "0.1.0",
   "desktop_server": "Windows-MCP 0.8.5",
-  "iso_sha256": "f788b83e…"
+  "iso_sha256": "32cde007…"
 }
 ```
 
@@ -273,7 +282,7 @@ name. Only Ubuntu is published (Windows images can't be redistributed):
 | --- | --- | --- |
 | `AGENTPC_HOME` | `~/.agentpc` | Where images, VMs, keys and caches live |
 | `AGENTPC_IMAGE_REPO` | `ghcr.io/pawanpaudel93/agentpc` | Package for `image pull`/`push` (tagged by image name) |
-| `WIN_ISO` | an earlier download, `~/Downloads/*A64FRE*.iso` (`windows-11` only), else a download | Windows ISO used by `image build windows-…` without `--iso` |
+| `WIN_ISO` | an earlier download, a matching ISO in `~/Downloads`, else a download | Windows ISO used by `image build windows-…` without `--iso` |
 
 Each VM gets its own ports on `127.0.0.1`, derived from its slot number `n`:
 
