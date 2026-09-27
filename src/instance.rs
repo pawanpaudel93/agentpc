@@ -441,12 +441,20 @@ impl Instance {
         {
             return Ok(p);
         }
-        // VNC's classic auth uses only the first 8 chars, so 4 random bytes as hex is plenty.
-        let mut buf = [0u8; 4];
+        // VNC auth only uses 8 chars, so make each one count: 8 alphanumerics is ~47 bits.
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut buf = [0u8; 64];
         std::fs::File::open("/dev/urandom")
             .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
             .context("read /dev/urandom")?;
-        let pass = buf.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        // Rejection sampling (bytes >= 248 skipped) keeps the pick unbiased.
+        let pass: String = buf
+            .iter()
+            .filter(|&&b| b < 248)
+            .take(8)
+            .map(|&b| ALPHABET[b as usize % ALPHABET.len()] as char)
+            .collect();
+        anyhow::ensure!(pass.len() == 8, "not enough randomness for a VNC password");
         write_private(&self.vnc_password_file(), &pass)?;
         Ok(pass)
     }
@@ -662,26 +670,26 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// `/tmp/agentpc-<uid>`, created 0700 and owned by us. Refuses a pre-existing directory
-/// owned by someone else or writable by group/other, so a QMP socket can't be hijacked.
+/// `/tmp/agentpc-<uid>`, created 0700 and owned by us. A pre-existing path that is a
+/// symlink, owned by someone else, or group/world-writable could let another user hijack
+/// the QMP socket, so we fall back to `$AGENTPC_HOME/run` rather than trust it.
 fn runtime_dir() -> PathBuf {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     // SAFETY: getuid(2) has no preconditions.
     let uid = unsafe { getuid() };
     let dir = PathBuf::from(format!("/tmp/agentpc-{uid}"));
-    match std::fs::metadata(&dir) {
-        Ok(m) => {
-            if m.uid() != uid || m.mode() & 0o022 != 0 {
-                // Someone else's, or group/world-writable: don't trust it.
-                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-            }
-        }
-        Err(_) => {
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        }
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    let trusted = std::fs::symlink_metadata(&dir)
+        .is_ok_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0);
+    if trusted {
+        return dir;
     }
-    dir
+    let fallback = home().join("run");
+    let _ = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&fallback);
+    fallback
 }
 
 /// Write `contents` to `path` with 0600 permissions (owner-only), for the VNC password.

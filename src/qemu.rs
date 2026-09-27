@@ -14,7 +14,8 @@ use crate::instance::{Instance, Os, kill};
 use crate::log;
 
 pub fn qemu_bin() -> Result<PathBuf> {
-    which("qemu-system-aarch64").context("qemu not found; install it with: brew install qemu")
+    which("qemu-system-aarch64")
+        .with_context(|| format!("qemu not found; {}", crate::setup::QEMU_HINT))
 }
 
 /// EDK2 firmware shipped next to the QEMU binary (<prefix>/share/qemu).

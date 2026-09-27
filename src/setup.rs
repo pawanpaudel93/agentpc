@@ -13,7 +13,7 @@ use crate::qemu::{edk2, which};
 
 const SERVER: &str = "agentpc";
 /// How the docs tell people to get QEMU; reused in hints so they match install.sh.
-const QEMU_HINT: &str = "install: curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.sh | sh   (or: brew install qemu)";
+pub const QEMU_HINT: &str = "install: curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.sh | sh   (or: brew install qemu)";
 const DEFAULT_CLIENTS: [&str; 6] = [
     "claude",
     "claude-desktop",
