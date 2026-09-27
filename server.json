@@ -7,11 +7,11 @@
     "url": "https://github.com/pawanpaudel93/agentpc",
     "source": "github"
   },
-  "version": "0.1.1",
+  "version": "0.1.2",
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/pawanpaudel93/agentpc/releases/download/v0.1.1/agentpc-0.1.1.mcpb",
+      "identifier": "https://github.com/pawanpaudel93/agentpc/releases/download/v0.1.2/agentpc-0.1.2.mcpb",
       "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "transport": {
         "type": "stdio"
