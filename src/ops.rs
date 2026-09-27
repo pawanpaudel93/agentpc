@@ -1,5 +1,6 @@
 //! Instance lifecycle shared by the CLI and the MCP gateway.
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -13,7 +14,7 @@ use crate::{log, qemu, viewer};
 pub const UBUNTU_SESSION_ENV: &str = "DISPLAY=:0 XAUTHORITY=/home/agent/.Xauthority \
      XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus";
 
-pub const SSH_OPTS: [&str; 12] = [
+pub const SSH_OPTS: [&str; 16] = [
     "-o",
     "StrictHostKeyChecking=no",
     "-o",
@@ -22,6 +23,11 @@ pub const SSH_OPTS: [&str; 12] = [
     "LogLevel=ERROR",
     "-o",
     "ConnectTimeout=5",
+    // Notice a wedged VM or a dropped tunnel instead of blocking forever (4 * 15 s).
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
     "-o",
     "BatchMode=yes",
     // Otherwise keys in the user's ssh-agent are offered first and can exhaust the server's
@@ -93,11 +99,14 @@ fn scp(inst: &Instance, from: &str, to: &str) -> Result<()> {
     Ok(())
 }
 
-/// Forward a host port on 127.0.0.1 to a guest port until the VM stops. With no
+/// Make a server inside the VM reachable from this Mac. A detached SSH local tunnel
+/// (`ssh -N -L`) reaches servers bound to the guest's own 127.0.0.1 (the Vite/Next default),
+/// which QEMU's hostfwd cannot. The tunnel lives until the VM stops or `remove_forward`/
+/// `stop_forwards`; its pid is recorded under `<instance>/forwards/<host_port>.pid`. With no
 /// `host_port`, a free one is picked.
 pub fn forward(inst: &Instance, guest_port: u16, host_port: Option<u16>) -> Result<String> {
     if !inst.running() {
-        bail!("{} is not running", inst.name);
+        bail!("{} is not running; start it first", inst.name);
     }
     let host_port = match host_port {
         Some(p) => p,
@@ -105,20 +114,76 @@ pub fn forward(inst: &Instance, guest_port: u16, host_port: Option<u16>) -> Resu
             .local_addr()?
             .port(),
     };
-    let reply = qemu::Qmp::connect(inst)?.execute(
-        "human-monitor-command",
-        Some(serde_json::json!({
-            "command-line": format!("hostfwd_add net0 tcp:127.0.0.1:{host_port}-:{guest_port}")
-        })),
-    )?;
-    let msg = reply.as_str().unwrap_or_default().trim();
-    if !msg.is_empty() {
-        bail!("forwarding failed: {msg}");
+    let dir = inst.dir.join("forwards");
+    std::fs::create_dir_all(&dir)?;
+    let pid_file = dir.join(format!("{host_port}.pid"));
+    // A live tunnel already on this host port: reuse it rather than start a second one.
+    if read_forward(&pid_file).is_some_and(|(pid, _)| pid_alive(pid)) {
+        return Ok(forward_url(inst, host_port, guest_port));
     }
-    Ok(format!(
-        "127.0.0.1:{host_port} -> {}:{guest_port} (until the VM stops)",
+    let log_path = dir.join(format!("{host_port}.log"));
+    let log = std::fs::File::create(&log_path)?;
+    let mut cmd = Command::new("ssh");
+    cmd.args([
+        "-i".to_string(),
+        ssh_key().display().to_string(),
+        "-p".into(),
+        inst.ssh_port().to_string(),
+    ])
+    .args(SSH_OPTS)
+    .args([
+        "-N",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-L",
+        &format!("127.0.0.1:{host_port}:127.0.0.1:{guest_port}"),
+        "agent@127.0.0.1",
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(log)
+    // Own process group: a Ctrl-C in the CLI must not take the tunnel down.
+    .process_group(0);
+    let mut child = cmd.spawn().context("spawn ssh tunnel")?;
+    let pid = child.id() as i32;
+    // ExitOnForwardFailure makes ssh exit fast if it can't bind the local port; otherwise the
+    // listener is up within a moment of the connection succeeding.
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let err = std::fs::read_to_string(&log_path).unwrap_or_default();
+            bail!(
+                "forwarding port {host_port} failed ({status}): {}",
+                err.trim()
+            );
+        }
+        if std::net::TcpStream::connect_timeout(
+            &([127, 0, 0, 1], host_port).into(),
+            Duration::from_millis(200),
+        )
+        .is_ok()
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            crate::instance::kill(pid, 9);
+            bail!("forwarding port {host_port}: the tunnel did not come up");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::fs::write(&pid_file, format!("{pid}\n{guest_port}\n"))?;
+    // Reap it when the VM stops and the tunnel dies, so a long-lived MCP server keeps no zombie.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(forward_url(inst, host_port, guest_port))
+}
+
+fn forward_url(inst: &Instance, host_port: u16, guest_port: u16) -> String {
+    format!(
+        "127.0.0.1:{host_port} -> {}:{guest_port} (until the VM stops or remove_forward)",
         inst.name
-    ))
+    )
 }
 
 pub fn ssh(inst: &Instance, remote: &str) -> Result<Output> {
@@ -545,19 +610,25 @@ pub fn list_json() -> Result<String> {
         .iter()
         .map(|i| {
             let (memory_gb, cpus) = i.size();
-            json!({
+            let running = i.running();
+            let mut obj = json!({
                 "name": i.name,
                 "os": i.os,
                 "image": i.image.to_string(),
-                "state": if i.running() { "running" } else { "stopped" },
+                "state": if running { run_state(i) } else { "stopped".to_string() },
                 "slot": i.slot,
                 "memory_gb": memory_gb,
                 "cpus": cpus,
                 "offline": i.offline(),
-                "viewer": viewer::url(i),
                 "ssh_port": i.ssh_port(),
                 "checkpoints": checkpoints(i),
-            })
+                "owner": owner(i),
+            });
+            // A stopped VM has no viewer to point at.
+            if running {
+                obj["viewer"] = json!(viewer::url(i));
+            }
+            obj
         })
         .collect();
     let images: Vec<_> = Image::all()
@@ -568,7 +639,8 @@ pub fn list_json() -> Result<String> {
                 "image": image.to_string(),
                 "os": image.os,
                 "version": info.as_ref().map(|i| i.version.clone()),
-                "based_on": info.as_ref().map(|i| i.base.clone()),
+                // `base` matches the ImageInfo field and `agentpc image info` output.
+                "base": info.as_ref().map(|i| i.base.clone()),
                 "desktop_server": info.as_ref().map(|i| i.desktop_server.clone()),
                 "fast_start": image.has_snapshot(),
             })
@@ -598,4 +670,136 @@ pub fn list_table() -> Result<String> {
     s += "\nIMAGES\n";
     s += &crate::image::list()?;
     Ok(s)
+}
+
+// --- Ownership (who created a VM through MCP) -------------------------------------------
+
+/// Record an owner string (MCP client name + session id) on a VM.
+pub fn set_owner(inst: &Instance, owner: &str) -> Result<()> {
+    std::fs::write(inst.dir.join("owner"), owner)?;
+    Ok(())
+}
+
+/// The owner recorded on a VM, if any (CLI-created VMs have none).
+pub fn owner(inst: &Instance) -> Option<String> {
+    std::fs::read_to_string(inst.dir.join("owner"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The live run-state from QMP (running / paused / io-error / …); "running" if QMP can't be
+/// reached but the process is alive. TODO(dedup): fold into `qemu::status` once merged.
+fn run_state(inst: &Instance) -> String {
+    qemu::Qmp::connect(inst)
+        .ok()
+        .and_then(|mut q| q.execute("query-status", None).ok())
+        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
+        .unwrap_or_else(|| "running".to_string())
+}
+
+// --- Port forwards ----------------------------------------------------------------------
+
+fn read_forward(pid_file: &Path) -> Option<(i32, u16)> {
+    let s = std::fs::read_to_string(pid_file).ok()?;
+    let mut lines = s.lines();
+    let pid = lines.next()?.trim().parse().ok()?;
+    let guest = lines.next().unwrap_or("").trim().parse().unwrap_or(0);
+    Some((pid, guest))
+}
+
+fn pid_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { c_kill(pid, 0) == 0 }
+}
+
+/// Active forwards on a VM as `(host_port, guest_port, alive)`, sorted by host port.
+pub fn list_forwards(inst: &Instance) -> Vec<(u16, u16, bool)> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(inst.dir.join("forwards")) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "pid")
+                && let Some((pid, guest)) = read_forward(&p)
+            {
+                let host = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                out.push((host, guest, pid_alive(pid)));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// One line per forward, for the CLI and the MCP `list_forwards` tool.
+pub fn forwards_text(inst: &Instance) -> String {
+    let list = list_forwards(inst);
+    if list.is_empty() {
+        return format!("{}: no forwarded ports", inst.name);
+    }
+    list.into_iter()
+        .map(|(h, g, alive)| {
+            format!(
+                "127.0.0.1:{h} -> {}:{g}{}",
+                inst.name,
+                if alive { "" } else { " (down)" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Tear down one forward by its host port.
+pub fn remove_forward(inst: &Instance, host_port: u16) -> Result<String> {
+    let dir = inst.dir.join("forwards");
+    let pid_file = dir.join(format!("{host_port}.pid"));
+    let Some((pid, _)) = read_forward(&pid_file) else {
+        bail!("{}: no forward on port {host_port}", inst.name);
+    };
+    crate::instance::kill(pid, 15);
+    let _ = std::fs::remove_file(&pid_file);
+    let _ = std::fs::remove_file(dir.join(format!("{host_port}.log")));
+    Ok(format!("removed the forward on 127.0.0.1:{host_port}"))
+}
+
+/// Tear down every forward of a VM. Call on stop/delete/reset/restore (the tunnels die with
+/// the VM anyway, but their pid files should not linger).
+pub fn stop_forwards(inst: &Instance) {
+    if let Ok(entries) = std::fs::read_dir(inst.dir.join("forwards")) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "pid")
+                && let Some((pid, _)) = read_forward(&p)
+            {
+                crate::instance::kill(pid, 15);
+            }
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
+// --- VM logs ----------------------------------------------------------------------------
+
+/// The tail of a VM's `qemu.log` or `serial.log`.
+pub fn read_log(inst: &Instance, which: &str, tail: usize) -> Result<String> {
+    let file = match which {
+        "qemu" => "qemu.log",
+        "serial" => "serial.log",
+        _ => bail!("log must be 'qemu' or 'serial'"),
+    };
+    let path = inst.dir.join(file);
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(tail);
+    Ok(lines[start..].join("\n"))
+}
+
+unsafe extern "C" {
+    #[link_name = "kill"]
+    fn c_kill(pid: i32, sig: i32) -> i32;
 }
