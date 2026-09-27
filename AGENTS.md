@@ -18,7 +18,7 @@ can run `agentpc mcp-install` (or install first: see README.md).
 | `take_screenshot(name)` | Hypervisor screenshot; works even while booting or hung. |
 | `run_command(name, command, background?)` | Shell over SSH: PowerShell on windows, bash on ubuntu. Returns exit code, stdout, stderr (long output trimmed); `background: true` for servers and long jobs. |
 | `upload_file` / `download_file` | Copy files or folders between the Mac and a VM. |
-| `forward_port(name, guest_port)` | Reach a server in the VM at `127.0.0.1:<port>` on the Mac. |
+| `forward_port(name, guest_port, host_port?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). |
 | `list_desktop_tools(name, tool?)` | Desktop-control tools in that VM, or one tool's full schema. |
 | `use_desktop_tool(name, tool, arguments)` | Call one of those tools (click, type, launch, snapshot…). |
 
@@ -35,10 +35,29 @@ tools need `"delivery_mode": "foreground"`. `launch_app` takes a command name su
 `xfce4-terminal`. Google Chrome is installed for the `browser_*` tools (see the plugin skill
 for the call sequence).
 
+Guest tips:
+
+- **Networking.** VMs are isolated behind user-mode NAT. From a guest, `10.0.2.2` is the Mac
+  host (a Mac server on `127.0.0.1`/`0.0.0.0` is reachable at `10.0.2.2:<port>`). For VM-to-VM,
+  `forward_port(B, guest_port, host_port)` then connect from A to `10.0.2.2:<host_port>`. An
+  offline VM can't reach `10.0.2.2` but forwarded ports still work. A guest inherits no Mac
+  proxy; set `HTTP(S)_PROXY` and import a corporate CA in the guest itself.
+- **Reboots** (Windows Update, some installers) drop SSH: call `start_vm` (it waits until the
+  VM is ready again) or retry `run_command`.
+- **Windows:** GUI installers return at once — `Start-Process x.exe -ArgumentList '/S' -Wait
+  -PassThru` and check `ExitCode`. Windows Update is disabled (`wuauserv` off + `NoAutoUpdate`),
+  which blocks DISM/`Add-WindowsCapability`; re-enable with `Set-Service wuauserv -StartupType
+  Manual; Start-Service wuauserv`, then set it back to `Disabled`. Defender real-time protection
+  is on (only SmartScreen is off) and may quarantine test binaries — `Add-MpPreference
+  -ExclusionPath C:\work`.
+- Guests are 1280x800 with a 2D-only GPU (no acceleration) and no audio device.
+
 Rules:
 
-- Instances are disposable; `reset_vm` instead of repairing a broken one.
-- Don't create instances you won't use, and `delete_vm` scratch instances when done.
+- Instances are disposable; create your own uniquely named VM per task and `reset_vm` it
+  instead of repairing a broken one. Don't reset, stop, restore or delete a VM you didn't
+  create unless the user asks.
+- Don't create instances you won't use, and `delete_vm` your instances when done.
   Each running VM takes 4 GB (ubuntu) or 8 GB (windows) of RAM.
 - `create_vm ubuntu` downloads the Ubuntu image on first use (~1.2 GB); pass `version`
   (e.g. "22.04") for another release. A Windows image must be built by the user once:

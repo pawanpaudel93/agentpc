@@ -22,7 +22,7 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 - [Images](#images)
 - [Configuration](#configuration)
 - [How it works](#how-it-works)
-- [Troubleshooting](#troubleshooting)
+- [Troubleshooting & guest tips](#troubleshooting--guest-tips)
 - [Uninstalling](#uninstalling)
 - [Security](#security)
 - [Development](#development)
@@ -337,7 +337,7 @@ The guest login is `agent` / `agent`.
   interrupts unattended work (Windows SmartScreen, updates, first-run and tip pop-ups; Ubuntu's
   background apt jobs) and installs Google Chrome on Ubuntu for cua-driver's browser tools.
 
-## Troubleshooting
+## Troubleshooting & guest tips
 
 - **Check the setup:** `agentpc doctor`.
 - **See the screen:** `agentpc screenshot <name>`, or open the viewer URL from
@@ -347,6 +347,59 @@ The guest login is `agent` / `agent`.
 - **A VM is in a bad state:** `agentpc reset <name>`.
 - **`image build`/`pull`/`rm` refuses:** VMs still depend on that image; `agentpc rm` them
   first.
+
+### Networking
+
+Each VM sits behind QEMU's user-mode NAT, so VMs are isolated from each other but share the
+Mac's network (a VPN or proxy configured on the Mac applies to a VM's outbound traffic).
+
+- **Reach a server in a VM from the Mac:** `agentpc forward <name> <guest-port> [host-port]`
+  (MCP: `forward_port`), then connect to `127.0.0.1:<host-port>`.
+- **Reach the Mac from a guest:** `10.0.2.2` is the Mac host — the NAT maps it to the Mac's
+  loopback, so a dev server listening on `127.0.0.1` or `0.0.0.0` is reachable at
+  `10.0.2.2:<port>` from inside the VM.
+- **VM to VM:** there's no direct route. Forward the server VM's port to the Mac
+  (`forward_port(B, guest_port, host_port)`), then from the other VM connect to
+  `10.0.2.2:<host_port>`.
+- **Offline VMs** (`--offline` / `offline: true`) can't reach `10.0.2.2` or the internet, but
+  ports you forward from the Mac still reach them.
+- **Corporate proxy / CA:** a guest inherits no proxy settings from the Mac. Set `HTTP_PROXY`
+  and `HTTPS_PROXY` inside the guest, and import your corporate root CA with
+  `Import-Certificate` (Windows) or `update-ca-certificates` (Ubuntu).
+
+### Guest reboots
+
+Rebooting a guest (a Windows Update install, some installers) drops the SSH connection. Call
+`start_vm` on the same VM — it waits until the desktop is ready again even when the VM is
+already running — or simply retry `run_command` once it's back.
+
+### Windows guest tips
+
+- **GUI installers return immediately.** Run them silently and wait for the process:
+  `Start-Process installer.exe -ArgumentList '/S' -Wait -PassThru` (the switch varies:
+  `/S`, `/silent`, `/quiet`), then check its `ExitCode`. A `run_command` process ends when
+  the command returns, so start servers and GUI apps with `background: true`.
+- **Windows Update is disabled** in the image (the `wuauserv` service is stopped and set to
+  Disabled, and the `NoAutoUpdate` policy is set) so updates never interrupt a task. This also
+  blocks optional features that fetch from Windows Update — DISM `/online` (e.g. .NET 3.5) and
+  `Add-WindowsCapability` (RSAT, language packs; OpenSSH is already installed). To use one,
+  re-enable it temporarily and set it back afterwards:
+
+  ```powershell
+  Set-Service wuauserv -StartupType Manual; Start-Service wuauserv
+  # … Add-WindowsCapability / DISM …
+  Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled
+  ```
+
+- **Defender real-time protection is on.** agentpc only disables SmartScreen, not Defender, so
+  Defender may quarantine a freshly built or unsigned test binary. Exclude your work directory
+  with `Add-MpPreference -ExclusionPath C:\work`, or turn real-time monitoring off with
+  `Set-MpPreference -DisableRealtimeMonitoring $true` (Tamper Protection may block the latter).
+
+### Hardware limits
+
+Guests have a fixed 1280x800 display, a 2D-only virtio GPU (no 3D/GPU acceleration; WebGL is
+software-rendered or unavailable), and no audio device.
 
 ## Uninstalling
 

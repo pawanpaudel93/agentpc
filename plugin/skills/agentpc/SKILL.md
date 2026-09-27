@@ -32,13 +32,14 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 | `take_screenshot(name)` | PNG screenshot; works even while booting or hung |
 | `run_command(name, command, background?)` | Shell command: PowerShell on Windows, bash on Ubuntu. Returns `exit code: N` plus stdout and stderr; each is trimmed to its first and last 10,000 characters. `background: true` keeps it running after the call (servers, long jobs) and says where its output goes |
 | `upload_file` / `download_file` | Copy files or folders between this Mac and a VM |
-| `forward_port(name, guest_port)` | Reach a server running in the VM at `127.0.0.1:<port>` on the Mac |
+| `forward_port(name, guest_port, host_port?)` | Reach a server running in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted) |
 | `list_desktop_tools(name, tool?)` | List the GUI tools inside a VM, or one tool's full schema |
 | `use_desktop_tool(name, tool, arguments)` | Call a GUI tool: click, type, launch apps, read the UI tree |
 
 ## How to work
 
-1. `list_vms`; reuse a running VM of the right OS and version, or `create_vm` one.
+1. `list_vms` to see images and existing VMs, then `create_vm` your own VM for the task with a
+   name that identifies it (e.g. the task or your agent name). Don't reuse a VM you didn't create.
 2. Prefer `run_command` for anything a shell can do. It's faster and more reliable than the GUI.
    Use `upload_file` to bring in what you need to test (an installer, a script, a build).
 3. Before a risky or slow-to-redo step (an installer, a config change), `checkpoint_vm` so
@@ -74,9 +75,33 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
   `get_browser_state` with those to get `target_id`/`tab_id`, then `browser_navigate`,
   `browser_click`, `browser_type`. Pass the same `session` label on every call.
 
+## Guest tips
+
+- **Reaching the Mac / other VMs.** From a guest, `10.0.2.2` is the Mac host (a Mac dev server
+  on `127.0.0.1` or `0.0.0.0` is reachable there). VMs can't reach each other directly: to let VM
+  A hit a server in VM B, `forward_port(B, guest_port, host_port)`, then from A connect to
+  `10.0.2.2:<host_port>`. An `offline: true` VM can't reach `10.0.2.2`; its forwarded ports still work.
+- **Reboots.** A reboot (Windows Update, some installers) drops SSH. Call `start_vm` on the same
+  VM — it waits until the desktop is ready again — or just retry `run_command`.
+- **GUI installers** return immediately; run them silently and wait:
+  `Start-Process installer.exe -ArgumentList '/S' -Wait -PassThru` (check `.ExitCode`).
+- **Windows Update is disabled** in the image, which breaks DISM/`Add-WindowsCapability` optional
+  features (.NET 3.5, RSAT, language packs). Re-enable temporarily:
+  `Set-Service wuauserv -StartupType Manual; Start-Service wuauserv`, then set it back to `Disabled`.
+- **Defender real-time protection is on** (only SmartScreen is disabled) and may quarantine freshly
+  built or unsigned test binaries. Exclude a path: `Add-MpPreference -ExclusionPath C:\work`
+  (Tamper Protection can block `Set-MpPreference -DisableRealtimeMonitoring $true`).
+- **Proxy / corporate CA.** The guest inherits no Mac proxy; set `HTTP(S)_PROXY` inside it and
+  import a corporate root with `Import-Certificate` (Windows) or `update-ca-certificates` (Ubuntu).
+  Mac VPNs apply automatically (the VM's NAT rides the Mac's network).
+- **No GPU acceleration** (2D virtio GPU: WebGL is software or off), **no audio device**, fixed
+  1280x800.
+
 ## Rules
 
-- VMs are disposable: `reset_vm` a broken one instead of repairing it.
+- Act only on VMs you created. Never `reset_vm`, `stop_vm`, `restore_vm` or `delete_vm` a VM
+  you didn't create unless the user asks. VMs are disposable: `reset_vm` your own broken one
+  instead of repairing it, and `delete_vm` it when done.
 - To test untrusted software or offline behaviour, `create_vm` with `offline: true`: no internet
   and no access to the Mac, while `run_command`, files, desktop tools and `forward_port` work.
 - For a heavy build, `create_vm` accepts `memory_gb` and `cpus`; a non-default size boots
