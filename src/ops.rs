@@ -170,7 +170,7 @@ pub fn wait_ready(inst: &Instance, timeout: Duration) -> Result<Duration> {
             bail!(
                 "{}: qemu exited (see {})",
                 inst.name,
-                inst.dir.join("serial.log").display()
+                inst.dir.join("qemu.log").display()
             );
         }
         if start.elapsed() > timeout {
@@ -232,6 +232,42 @@ pub fn set_writable(p: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Refuse an operation that needs more free space than the home volume has.
+fn ensure_free_space(need_gb: u64, action: &str) -> Result<()> {
+    if let Some(free) = crate::instance::free_disk_bytes(&crate::instance::home())
+        && free < need_gb << 30
+    {
+        bail!(
+            "not enough disk space to {action}: need ~{need_gb} GB, only {} GB free",
+            free >> 30
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a VM whose RAM exceeds the Mac's, and warn if running VMs would oversubscribe it.
+fn check_memory(want_gb: u32) -> Result<()> {
+    let Some(total_gb) = crate::instance::host_mem_bytes().map(|b| b >> 30) else {
+        return Ok(());
+    };
+    if u64::from(want_gb) > total_gb {
+        bail!("requested {want_gb} GB RAM but the Mac has only {total_gb} GB");
+    }
+    let running: u64 = Instance::list()
+        .unwrap_or_default()
+        .iter()
+        .filter(|i| i.running())
+        .map(|i| u64::from(i.size().0))
+        .sum();
+    if running + u64::from(want_gb) > total_gb {
+        log!(
+            "warning: running VMs would use {} GB RAM, over the Mac's {total_gb} GB",
+            running + u64::from(want_gb)
+        );
+    }
+    Ok(())
+}
+
 pub fn run(cmd: &str, args: &[&str]) -> Result<()> {
     let st = Command::new(cmd)
         .args(args)
@@ -256,7 +292,7 @@ pub fn info(inst: &Instance) -> String {
         inst.image,
         viewer::url(inst),
         inst.name,
-        5900 + inst.vnc_display()
+        inst.vnc_port()
     )
 }
 
@@ -268,6 +304,8 @@ pub fn create(
     offline: bool,
 ) -> Result<String> {
     let os = image.os;
+    check_memory(memory.unwrap_or(os.default_size().0))?;
+    ensure_free_space(4, "create a VM")?;
     if !image.exists() {
         provision_image(image)?;
     }
@@ -329,6 +367,12 @@ fn provision_image(image: &Image) -> Result<()> {
 
 /// Start a stopped instance and wait until it's usable.
 pub fn boot(inst: &Instance) -> Result<String> {
+    let _lock = inst.lock()?;
+    boot_locked(inst)
+}
+
+/// `boot`, for a caller already holding this instance's lock (reset).
+fn boot_locked(inst: &Instance) -> Result<String> {
     // Only a clone's first boot can resume: afterwards its disk has moved on from the
     // saved RAM, so later starts are cold boots.
     let mut state = None;
@@ -339,13 +383,16 @@ pub fn boot(inst: &Instance) -> Result<String> {
     boot_from(inst, state.as_deref())
 }
 
-/// Start an instance (resuming `state` if given) and wait until it's usable.
+/// Start an instance (resuming `state` if given) and wait until it's usable. Assumes the
+/// caller holds this instance's lock.
 fn boot_from(inst: &Instance, state: Option<&Path>) -> Result<String> {
-    let mut resumed = false;
-    if !inst.running() {
+    if inst.running() {
+        // Already up: a checkpoint interrupted mid-save can leave it paused. Nudge it on.
+        qemu::resume_if_paused(inst);
+    } else {
         match state {
             Some(state) => match qemu::start_resumed(inst, state) {
-                Ok(()) => resumed = true,
+                Ok(()) => {}
                 Err(e) => {
                     log!("{}: resume failed ({e:#}); booting instead", inst.name);
                     qemu::quit(inst);
@@ -355,11 +402,13 @@ fn boot_from(inst: &Instance, state: Option<&Path>) -> Result<String> {
             None => qemu::start(inst, &[])?,
         }
     }
-    viewer::ensure_running()?;
-    let took = wait_ready(inst, Duration::from_secs(inst.os.boot_timeout()))?;
-    if resumed {
-        sync_clock(inst);
+    // The viewer is a convenience; a download or start failure must not fail the boot.
+    if let Err(e) = viewer::ensure_running() {
+        log!("{}: viewer unavailable ({e:#})", inst.name);
     }
+    let took = wait_ready(inst, Duration::from_secs(inst.os.boot_timeout()))?;
+    // Set the clock (a resumed guest keeps its stale snapshot clock) and time zone.
+    sync_clock(inst);
     log!("{} ready in {:.1}s", inst.name, took.as_secs_f32());
     Ok(info(inst))
 }
@@ -383,6 +432,8 @@ pub fn checkpoints(inst: &Instance) -> Vec<String> {
             .into_iter()
             .flatten()
             .flatten()
+            // Skip in-progress `.partial-*` siblings (labels never start with a dot).
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
             .filter(|e| e.path().join("disk.qcow2").is_file())
             .map(|e| {
                 let t = e
@@ -400,8 +451,17 @@ pub fn checkpoints(inst: &Instance) -> Vec<String> {
 /// older checkpoint of that name). A running VM pauses for a few seconds and carries on.
 /// Disk copies are APFS clones, so they take no space until the VM writes more.
 pub fn checkpoint(inst: &Instance, label: &str) -> Result<String> {
+    let _lock = inst.lock()?;
     let dir = checkpoint_dir(inst, label)?;
-    let tmp = dir.with_extension("partial");
+    // A checkpoint clones the disk and, for a running VM, writes a RAM-sized state file.
+    let (mem_gb, _) = inst.size();
+    ensure_free_space(u64::from(mem_gb) + 2, "checkpoint")?;
+    // Sibling that can't be a valid label (labels never start with a dot), so `v1` and
+    // `v1.2` get distinct temps — `with_extension("partial")` would collide them.
+    let tmp = inst
+        .dir
+        .join("checkpoints")
+        .join(format!(".partial-{label}"));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
     let copy = || -> Result<()> {
@@ -434,6 +494,7 @@ pub fn checkpoint(inst: &Instance, label: &str) -> Result<String> {
 /// Put the instance back exactly as it was at checkpoint `label` and start it: it resumes
 /// in seconds if the checkpoint has its memory, else it boots. Port forwards are lost.
 pub fn restore(inst: &Instance, label: &str) -> Result<String> {
+    let _lock = inst.lock()?;
     let dir = checkpoint_dir(inst, label)?;
     if !dir.join("disk.qcow2").is_file() {
         let have = checkpoints(inst);
@@ -448,14 +509,25 @@ pub fn restore(inst: &Instance, label: &str) -> Result<String> {
         );
     }
     qemu::quit(inst);
-    std::fs::copy(dir.join("disk.qcow2"), inst.disk())?;
-    std::fs::copy(dir.join("vars.fd"), inst.vars())?;
+    // Clone (APFS) into a temp in the same dir, then rename over the live files, so an
+    // interrupted restore can't leave a half-written disk. fs::copy is a clonefile here.
+    let disk_tmp = inst.dir.join(".disk.restore.qcow2");
+    let vars_tmp = inst.dir.join(".vars.restore.fd");
+    let _ = std::fs::remove_file(&disk_tmp);
+    let _ = std::fs::remove_file(&vars_tmp);
+    std::fs::copy(dir.join("disk.qcow2"), &disk_tmp)?;
+    std::fs::copy(dir.join("vars.fd"), &vars_tmp)?;
+    set_writable(&disk_tmp)?;
+    set_writable(&vars_tmp)?;
+    std::fs::rename(&disk_tmp, inst.disk())?;
+    std::fs::rename(&vars_tmp, inst.vars())?;
     let _ = std::fs::remove_file(inst.resume_marker());
     let state = Some(dir.join("state")).filter(|p| p.is_file());
     boot_from(inst, state.as_deref())
 }
 
 pub fn delete_checkpoint(inst: &Instance, label: &str) -> Result<String> {
+    let _lock = inst.lock()?;
     let dir = checkpoint_dir(inst, label)?;
     if !dir.is_dir() {
         bail!("{} has no checkpoint '{label}'", inst.name);
@@ -486,6 +558,24 @@ fn sync_clock(inst: &Instance) {
     }) {
         log!("{}: clock sync failed: {e:#}", inst.name);
     }
+    sync_timezone(inst);
+}
+
+/// Set the guest's time zone to the Mac's (from `/etc/localtime`). Best-effort: unknown
+/// zones or an offline guest are ignored.
+fn sync_timezone(inst: &Instance) {
+    let Some(tz) = crate::instance::mac_timezone() else {
+        return;
+    };
+    let cmd = match inst.os {
+        Os::Ubuntu => format!("sudo timedatectl set-timezone {tz} >/dev/null 2>&1 || true"),
+        // On Win11 (ICU) FindSystemTimeZoneById accepts an IANA id and yields the Windows id.
+        Os::Windows => format!(
+            "$ErrorActionPreference='SilentlyContinue'; \
+             try {{ $tz=[TimeZoneInfo]::FindSystemTimeZoneById('{tz}'); tzutil /s $tz.Id }} catch {{}}"
+        ),
+    };
+    let _ = ssh(inst, &cmd);
 }
 
 thread_local! {
@@ -519,6 +609,7 @@ pub fn progress(line: &str) {
 }
 
 pub fn stop(inst: &Instance) -> Result<String> {
+    let _lock = inst.lock()?;
     qemu::stop(inst)?;
     viewer::stop_if_idle();
     Ok(format!("{} stopped", inst.name))
@@ -526,12 +617,14 @@ pub fn stop(inst: &Instance) -> Result<String> {
 
 // reset and delete discard the disk, so a clean guest shutdown would be wasted time.
 pub fn reset(inst: &Instance) -> Result<String> {
+    let _lock = inst.lock()?;
     qemu::quit(inst);
     clone_disk(inst)?;
-    boot(inst)
+    boot_locked(inst)
 }
 
 pub fn delete(inst: &Instance) -> Result<String> {
+    let _lock = inst.lock()?;
     qemu::quit(inst);
     std::fs::remove_dir_all(&inst.dir)?;
     viewer::stop_if_idle();
