@@ -134,6 +134,7 @@ cargo build --release --locked --target "$TARGET"
 BIN="target/$TARGET/release/agentpc"
 # Stripping can drop the linker's ad-hoc signature; arm64 macOS refuses unsigned binaries.
 codesign --force --sign - "$BIN"
+codesign --verify "$BIN" || die "codesign verification failed for $BIN"
 GOT=$("$BIN" --version)
 [ "$GOT" = "agentpc $VERSION" ] || die "built binary reports '$GOT', expected 'agentpc $VERSION'."
 

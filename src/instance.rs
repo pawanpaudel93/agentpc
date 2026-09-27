@@ -407,6 +407,19 @@ pub fn image_lock() -> Result<std::fs::File> {
     )
 }
 
+/// The image lock if it's free right now, else None (a build, pull or snapshot holds it).
+/// Never blocks. Used by `clean` to tell a crashed build's leftovers from a live build.
+pub fn try_image_lock() -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    let path = images_dir().join(".lock");
+    std::fs::create_dir_all(images_dir()).ok()?;
+    let f = std::fs::File::create(&path).ok()?;
+    // SAFETY: flock(2) on a descriptor we own.
+    (unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0).then_some(f)
+}
+
 fn lock(path: &Path, waiting: Option<&str>) -> Result<std::fs::File> {
     use std::os::fd::AsRawFd;
     const LOCK_EX: i32 = 2;

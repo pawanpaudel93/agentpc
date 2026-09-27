@@ -12,6 +12,8 @@ use crate::log;
 use crate::qemu::{edk2, which};
 
 const SERVER: &str = "agentpc";
+/// How the docs tell people to get QEMU; reused in hints so they match install.sh.
+const QEMU_HINT: &str = "install: curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.sh | sh   (or: brew install qemu)";
 const DEFAULT_CLIENTS: [&str; 6] = [
     "claude",
     "claude-desktop",
@@ -23,6 +25,19 @@ const DEFAULT_CLIENTS: [&str; 6] = [
 
 fn user_home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+}
+
+/// How to invoke agentpc in hint text: `agentpc` when that resolves on PATH to this same
+/// executable, otherwise the full path to the running binary. MCPB-bundle and one-off
+/// downloads aren't on PATH, so a bare `agentpc` in a hint would fail for them.
+pub fn cmd_name() -> String {
+    let exe = std::env::current_exe().ok();
+    let same = |a: &Path, b: &Path| std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok();
+    match (exe, which("agentpc")) {
+        (Some(exe), Some(on_path)) if same(&exe, &on_path) => "agentpc".into(),
+        (Some(exe), _) => exe.to_string_lossy().into_owned(),
+        (None, _) => "agentpc".into(),
+    }
 }
 
 /// Run a registration command, echoing it so the user sees what changed.
@@ -67,6 +82,72 @@ fn json_register(path: &Path, bin: &str) -> Result<()> {
     Ok(())
 }
 
+/// True when the agentpc Claude Code plugin is installed. The plugin already ships an MCP
+/// server entry, so `mcp-install` must not also register a stdio server for Claude Code —
+/// that lists agentpc twice.
+fn claude_plugin_installed() -> bool {
+    let path = user_home().join(".claude/plugins/installed_plugins.json");
+    let Ok(s) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(cfg) = serde_json::from_str::<Value>(&s) else {
+        return false;
+    };
+    // Keys look like "<name>@<marketplace>"; match on the plugin name.
+    cfg.get("plugins")
+        .and_then(Value::as_object)
+        .is_some_and(|m| m.keys().any(|k| k.split('@').next() == Some(SERVER)))
+}
+
+/// codex has no CLI flag for MCP timeouts, so add them to the `[mcp_servers.agentpc]` block
+/// `codex mcp add` just wrote. Image builds and first-boot resumes take minutes; codex's
+/// short default would abort the tool call. Existing values are left untouched.
+fn codex_set_timeouts() -> Result<()> {
+    let path = user_home().join(".codex/config.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(()); // no config: codex uses its defaults, nothing to amend
+    };
+    let header = format!("[mcp_servers.{SERVER}]");
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(start) = lines.iter().position(|l| l.trim() == header) else {
+        return Ok(());
+    };
+    // The section runs to the next table header or end of file.
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map_or(lines.len(), |i| start + 1 + i);
+    let has = |key: &str| {
+        lines[start + 1..end]
+            .iter()
+            .any(|l| l.trim_start().starts_with(key))
+    };
+    let mut add: Vec<&str> = Vec::new();
+    if !has("tool_timeout_sec") {
+        add.push("tool_timeout_sec = 900");
+    }
+    if !has("startup_timeout_sec") {
+        add.push("startup_timeout_sec = 60");
+    }
+    if add.is_empty() {
+        return Ok(());
+    }
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        out.push_str(line);
+        out.push('\n');
+        if i == start {
+            for a in &add {
+                out.push_str(a);
+                out.push('\n');
+            }
+        }
+    }
+    std::fs::write(&path, out)?;
+    log!("set codex MCP timeouts in {}", path.display());
+    Ok(())
+}
+
 pub fn mcp_install(clients: &[String]) -> Result<()> {
     let clients: Vec<&str> = if clients.is_empty() {
         DEFAULT_CLIENTS.to_vec()
@@ -88,6 +169,10 @@ pub fn mcp_install(clients: &[String]) -> Result<()> {
             "claude" => {
                 if which("claude").is_none() {
                     log!("skip claude (not installed)");
+                    continue;
+                }
+                if claude_plugin_installed() {
+                    log!("skip claude ({SERVER} plugin already registers the MCP server)");
                     continue;
                 }
                 register_cmd("claude", &["mcp", "remove", "-s", "user", SERVER], true)?;
@@ -113,6 +198,7 @@ pub fn mcp_install(clients: &[String]) -> Result<()> {
                 }
                 register_cmd("codex", &["mcp", "remove", SERVER], true)?;
                 register_cmd("codex", &["mcp", "add", SERVER, "--", &bin, "mcp"], false)?;
+                codex_set_timeouts()?;
             }
             "cursor" => {
                 if !home.join(".cursor").is_dir() {
@@ -182,7 +268,14 @@ pub fn doctor() -> Result<bool> {
     println!("host:");
     check("Apple Silicon", std::env::consts::ARCH == "aarch64", "");
     check("macOS", std::env::consts::OS == "macos", "");
-    check("qemu (brew install qemu)", edk2().is_ok(), "");
+    let qemu_ok = edk2().is_ok();
+    check("qemu", qemu_ok, QEMU_HINT);
+    // An x86_64 QEMU (e.g. from a Rosetta brew) can't use HVF here; warn but don't fail.
+    if qemu_ok && !qemu_is_arm64() {
+        println!(
+            "  warn qemu is not an arm64 build — VMs will be slow or fail; reinstall with: brew install qemu"
+        );
+    }
     let h = home();
     check(
         &format!("free disk >= 40 GB ({})", h.display()),
@@ -199,16 +292,38 @@ pub fn doctor() -> Result<bool> {
         ),
     }
 
+    // No image yet is the normal fresh-install state, not a failure: report it as info
+    // with the command that builds or pulls one, so `doctor` doesn't scare a new user.
     println!("images:");
     let images = Image::all();
+    let cmd = cmd_name();
     for os in Os::ALL {
-        check(
-            &os.to_string(),
-            images.iter().any(|i| i.os == os),
-            &format!("run: agentpc image build {os} (or image pull ubuntu)"),
-        );
+        if images.iter().any(|i| i.os == os) {
+            println!("  ok   {os}");
+        } else {
+            let hint = match os {
+                Os::Windows => format!("{cmd} image build windows"),
+                Os::Ubuntu => format!("{cmd} image pull ubuntu (or {cmd} image build ubuntu)"),
+            };
+            println!("  info {os}: none yet — build or pull one: {hint}");
+        }
     }
     Ok(all_ok)
+}
+
+/// True when the QEMU binary is a native arm64 Mach-O (so it can use HVF acceleration).
+fn qemu_is_arm64() -> bool {
+    let Ok(bin) = crate::qemu::qemu_bin() else {
+        return false;
+    };
+    // `file` names each Mach-O slice; a usable build has an arm64/arm64e one.
+    Command::new("file")
+        .arg("-b")
+        .arg(&bin)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("arm64"))
+        .unwrap_or(true) // if `file` is unavailable, don't cry wolf
 }
 
 /// Drop `agentpc` from the `key` object of a JSON config; leaves the file alone otherwise.
@@ -298,10 +413,18 @@ fn disk_use(p: &Path) -> u64 {
         .map_or(0, |k| k * 1024)
 }
 
+/// A checkpoint dir name that is interrupted-write scratch rather than a real checkpoint.
+/// Matches the current `<label>.partial` temp and the newer `.partial-<label>` form; a real
+/// checkpoint that merely ends in `.partial` (so it's in `valid`) is left alone.
+fn partial_checkpoint(name: &str, valid: &[String]) -> bool {
+    name.starts_with(".partial-")
+        || (name.ends_with(".partial") && !valid.iter().any(|v| v == name))
+}
+
 /// Delete what can be downloaded or rebuilt again, and leftovers of interrupted work.
 /// Images and VMs are never touched; unused images are listed.
 pub fn clean(dry_run: bool) -> Result<String> {
-    use crate::instance::{Instance, cache_dir, instances_dir};
+    use crate::instance::{Instance, cache_dir, images_dir, instances_dir};
     let mut targets: Vec<(PathBuf, &str)> = Vec::new();
     for e in std::fs::read_dir(cache_dir())
         .into_iter()
@@ -322,28 +445,62 @@ pub fn clean(dry_run: bool) -> Result<String> {
         };
         targets.push((e.path(), why));
     }
-    let running = |dir: &Path| {
-        dir.file_name()
-            .and_then(|n| Instance::load(&n.to_string_lossy()).ok())
-            .is_some_and(|i| i.running())
-    };
+    // Hidden `_`-prefixed VMs are build/snapshot scratch. A held image lock means a build is
+    // live right now, so leave them alone; otherwise any that remain are crash leftovers.
+    let build_active = crate::instance::try_image_lock().is_none();
     for e in std::fs::read_dir(instances_dir())
         .into_iter()
         .flatten()
         .flatten()
     {
         let name = e.file_name().to_string_lossy().into_owned();
-        if (name.starts_with("_build-") || name.starts_with("_snap-")) && !running(&e.path()) {
-            targets.push((e.path(), "leftover from an interrupted image build"));
+        let inst = Instance::load(&name).ok();
+        if name.starts_with('_') {
+            if build_active {
+                continue;
+            }
+            if let Some(i) = inst.as_ref().filter(|i| i.running()) {
+                // A crashed build can leave its VM up; stop it before removing its files.
+                if !dry_run {
+                    crate::qemu::quit(i);
+                }
+                targets.push((
+                    e.path(),
+                    "leftover from an interrupted image build (was still running)",
+                ));
+            } else {
+                targets.push((e.path(), "leftover from an interrupted image build"));
+            }
+            continue;
         }
+        // A real VM: sweep only unfinished checkpoint temp dirs, never a real checkpoint.
+        let valid = inst
+            .as_ref()
+            .map(crate::ops::checkpoints)
+            .unwrap_or_default();
         for cp in std::fs::read_dir(e.path().join("checkpoints"))
             .into_iter()
             .flatten()
             .flatten()
         {
-            if cp.file_name().to_string_lossy().ends_with(".partial") {
+            let cp_name = cp.file_name().to_string_lossy().into_owned();
+            if partial_checkpoint(&cp_name, &valid) {
                 targets.push((cp.path(), "unfinished checkpoint"));
             }
+        }
+    }
+
+    // Half-written image files from a crashed build or snapshot (`.qcow2.tmp`, `.state.tmp`).
+    for e in std::fs::read_dir(images_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if e.file_name().to_string_lossy().ends_with(".tmp") {
+            targets.push((
+                e.path(),
+                "half-written image file from an interrupted build",
+            ));
         }
     }
 
@@ -375,6 +532,7 @@ pub fn clean(dry_run: bool) -> Result<String> {
         format!("freed {:.2} GB\n", gb(total))
     };
     let used: Vec<Image> = Instance::list()?.into_iter().map(|i| i.image).collect();
+    let cmd = cmd_name();
     for image in Image::all().into_iter().filter(|i| !used.contains(i)) {
         let size = ["", ".snapshot"]
             .iter()
@@ -382,7 +540,7 @@ pub fn clean(dry_run: bool) -> Result<String> {
             .sum::<u64>()
             + disk_use(&image.snapshot_state());
         out += &format!(
-            "kept: {image} ({:.1} GB) has no VMs; remove it with: agentpc image rm {image}\n",
+            "kept: {image} ({:.1} GB) has no VMs; remove it with: {cmd} image rm {image}\n",
             gb(size)
         );
     }
@@ -469,4 +627,31 @@ pub fn uninstall(keep_data: bool, yes: bool) -> Result<()> {
     }
     println!("  - the Claude plugin, if you added it: /plugin uninstall agentpc@agentpc");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_checkpoint_selection() {
+        let valid = vec!["clean".to_string(), "before-update".to_string()];
+        // Both temp-dir spellings are scratch.
+        assert!(partial_checkpoint("clean.partial", &valid));
+        assert!(partial_checkpoint(".partial-clean", &valid));
+        // A real checkpoint is never scratch, even if it ends in `.partial`.
+        assert!(!partial_checkpoint("clean", &valid));
+        let valid2 = vec!["weird.partial".to_string()];
+        assert!(!partial_checkpoint("weird.partial", &valid2));
+        // An orphaned `<label>.partial` whose checkpoint no longer exists is scratch.
+        assert!(partial_checkpoint("gone.partial", &valid));
+    }
+
+    #[test]
+    fn cmd_name_is_usable() {
+        // Either the bare command (on PATH) or an absolute path to a real binary; never empty.
+        let c = cmd_name();
+        assert!(!c.is_empty());
+        assert!(c == "agentpc" || Path::new(&c).is_absolute());
+    }
 }

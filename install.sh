@@ -43,7 +43,11 @@ else
     TAG=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null |
       sed -n 's#.*/releases/tag/##p') || TAG=""
   fi
-  [ -n "$TAG" ] || die "could not determine the latest release; set AGENTPC_VERSION=x.y.z and retry."
+  if [ -z "$TAG" ]; then
+    die "no agentpc release is published yet (or GitHub is unreachable).
+  Build from source instead:  cargo install --git https://github.com/$REPO
+  Or, if you know a published version:  AGENTPC_VERSION=x.y.z curl ... | sh"
+  fi
   VERSION="${TAG#v}"
 fi
 

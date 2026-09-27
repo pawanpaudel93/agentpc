@@ -380,7 +380,8 @@ fn copy(src: &str, dst: &str) -> Result<String> {
         (None, Some((inst, path))) => ops::upload(&inst, &std::path::absolute(src)?, &path),
         (Some((inst, path)), None) => ops::download(&inst, &path, &std::path::absolute(dst)?),
         _ => anyhow::bail!(
-            "exactly one side must be <vm>:<path>, e.g. agentpc cp ./file ubuntu-1:/tmp/"
+            "exactly one side must be <vm>:<path>, e.g. {} cp ./file ubuntu-1:/tmp/",
+            crate::setup::cmd_name()
         ),
     }
 }
