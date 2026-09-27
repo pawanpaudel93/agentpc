@@ -23,7 +23,7 @@ can run `agentpc mcp-install` (or install first: see README.md).
 | `list_forwards(name)` / `delete_forward(name, host_port)` | List a VM's forwards / stop one. |
 | `read_vm_log(name, which, tail_lines?)` | Tail a VM's `qemu` or `serial` log when it won't boot or the desktop is unreachable. |
 | `list_desktop_tools(name, tool?)` | Desktop-control tools in that VM, or one tool's full schema. |
-| `use_desktop_tool(name, tool, arguments)` | Call one of those tools (click, type, launch, snapshot…). |
+| `use_desktop_tool(name, tool, arguments?)` | Call one of those tools (click, type, launch, snapshot…). |
 
 Work in a loop: look (`take_screenshot` or a snapshot tool) → act (`use_desktop_tool`) → look again to
 verify. Prefer `run_command` for anything a shell can do; use `use_desktop_tool` for GUI-only work.
