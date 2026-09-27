@@ -14,11 +14,14 @@ use base64::Engine;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ContentBlock, Implementation, JsonObject,
-    ServerCapabilities, ServerConfig,
+    ProgressNotificationParam, ServerCapabilities, ServerConfig,
 };
-use rmcp::service::RunningService;
+use rmcp::service::{RequestContext, RunningService};
 use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
-use rmcp::{RoleClient, ServerHandler, ServiceError, ServiceExt, tool, tool_handler, tool_router};
+use rmcp::{
+    RoleClient, RoleServer, ServerHandler, ServiceError, ServiceExt, tool, tool_handler,
+    tool_router,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
@@ -98,6 +101,10 @@ struct CreateArgs {
     memory_gb: Option<u32>,
     /// CPUs (default 4). A non-default count boots cold, like memory_gb.
     cpus: Option<u32>,
+    /// Cut the VM off from the internet and this Mac; run_command, files, the desktop tools
+    /// and forward_port still work. For testing offline behaviour or untrusted software.
+    #[serde(default)]
+    offline: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -169,7 +176,8 @@ struct DesktopArgs {
 impl Gateway {
     #[tool(
         description = "List VM instances (name, image, state, size, checkpoints, viewer URL) and which images\n\
-                          exist."
+                          exist.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_vms(&self) -> CallToolResult {
         text(blocking(ops::list_json).await)
@@ -177,15 +185,24 @@ impl Gateway {
 
     #[tool(
         description = "Create and boot a new instance cloned from its image (~1 s ubuntu, ~4 s windows).\n\
-                          Returns once the desktop and its control server are ready."
+                          Returns once the desktop and its control server are ready.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
-    async fn create_vm(&self, Parameters(a): Parameters<CreateArgs>) -> CallToolResult {
+    async fn create_vm(
+        &self,
+        Parameters(a): Parameters<CreateArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> CallToolResult {
         let os = match a.os {
             OsArg::Windows => Os::Windows,
             OsArg::Ubuntu => Os::Ubuntu,
         };
         text(
-            blocking(move || {
+            with_progress(&ctx, move || {
                 let name = match a.version {
                     Some(v) => format!("{os}-{v}"),
                     None => os.to_string(),
@@ -195,44 +212,98 @@ impl Gateway {
                     a.name.as_deref(),
                     a.memory_gb,
                     a.cpus,
+                    a.offline,
                 )
             })
             .await,
         )
     }
 
-    #[tool(description = "Boot a stopped instance and wait until its desktop is ready.")]
-    async fn start_vm(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
-        text(self.lifecycle(&a.name, ops::boot).await)
-    }
-
-    #[tool(description = "Shut an instance down cleanly (its disk is kept).")]
-    async fn stop_vm(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
-        text(self.lifecycle(&a.name, ops::stop).await)
+    #[tool(
+        description = "Boot a stopped instance and wait until its desktop is ready.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn start_vm(
+        &self,
+        Parameters(a): Parameters<NameArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        text(self.lifecycle(&a.name, ops::boot, &ctx).await)
     }
 
     #[tool(
-        description = "Discard all changes: restore the instance to a fresh copy of its image and boot it."
+        description = "Shut an instance down cleanly (its disk is kept).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn reset_vm(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
-        text(self.lifecycle(&a.name, ops::reset).await)
+    async fn stop_vm(
+        &self,
+        Parameters(a): Parameters<NameArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        text(self.lifecycle(&a.name, ops::stop, &ctx).await)
     }
 
-    #[tool(description = "Stop an instance and delete it with its disk and checkpoints.")]
-    async fn delete_vm(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
-        text(self.lifecycle(&a.name, ops::delete).await)
+    #[tool(
+        description = "Discard all changes: restore the instance to a fresh copy of its image and boot it.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn reset_vm(
+        &self,
+        Parameters(a): Parameters<NameArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        text(self.lifecycle(&a.name, ops::reset, &ctx).await)
+    }
+
+    #[tool(
+        description = "Stop an instance and delete it with its disk and checkpoints.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn delete_vm(
+        &self,
+        Parameters(a): Parameters<NameArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        text(self.lifecycle(&a.name, ops::delete, &ctx).await)
     }
 
     #[tool(
         description = "Save the instance's disk and memory under a label (replacing an older one of that\n\
                           name). A running VM pauses for a few seconds and carries on. Use before a risky\n\
-                          step; restore_vm returns to it in seconds."
+                          step; restore_vm returns to it in seconds.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
-    async fn checkpoint_vm(&self, Parameters(a): Parameters<CheckpointArgs>) -> CallToolResult {
+    async fn checkpoint_vm(
+        &self,
+        Parameters(a): Parameters<CheckpointArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> CallToolResult {
         text(
             async {
                 let inst = load(&a.name)?;
-                blocking(move || ops::checkpoint(&inst, &a.label)).await
+                with_progress(&ctx, move || ops::checkpoint(&inst, &a.label)).await
             }
             .await,
         )
@@ -240,14 +311,23 @@ impl Gateway {
 
     #[tool(
         description = "Put the instance back exactly as it was at a checkpoint and start it (resumes in\n\
-                          seconds). Port forwards must be set up again."
+                          seconds). Port forwards must be set up again.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn restore_vm(&self, Parameters(a): Parameters<CheckpointArgs>) -> CallToolResult {
+    async fn restore_vm(
+        &self,
+        Parameters(a): Parameters<CheckpointArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> CallToolResult {
         self.drop_session(&a.name);
         text(
             async {
                 let inst = load(&a.name)?;
-                blocking(move || ops::restore(&inst, &a.label)).await
+                with_progress(&ctx, move || ops::restore(&inst, &a.label)).await
             }
             .await,
         )
@@ -255,7 +335,8 @@ impl Gateway {
 
     #[tool(
         description = "Screenshot the instance's display from the hypervisor. Works at any time, even while\n\
-                          booting or when the desktop server is unresponsive."
+                          booting or when the desktop server is unresponsive.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn take_screenshot(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
         let png = async {
@@ -263,10 +344,25 @@ impl Gateway {
             blocking(move || qemu::screenshot(&inst, &inst.dir.join("screen.png"))).await
         };
         reply(png.await.map(|png| {
-            vec![ContentBlock::image(
-                base64::engine::general_purpose::STANDARD.encode(png),
-                "image/png",
-            )]
+            // A PNG's width and height sit at bytes 16..24 of its IHDR chunk.
+            let dim = |i: usize| {
+                png.get(i..i + 4)
+                    .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+            };
+            let size = match (dim(16), dim(20)) {
+                (Some(w), Some(h)) => format!(
+                    "{w}x{h} screenshot; pixel coordinates in it are the screen coordinates the \
+                     desktop tools use (no scaling)."
+                ),
+                _ => "screenshot".into(),
+            };
+            vec![
+                ContentBlock::image(
+                    base64::engine::general_purpose::STANDARD.encode(&png),
+                    "image/png",
+                ),
+                ContentBlock::text(size),
+            ]
         }))
     }
 
@@ -275,7 +371,12 @@ impl Gateway {
                           Returns the exit code, stdout and stderr; each stream is trimmed to its first and\n\
                           last 10,000 characters (write big output to a file and download_file it).\n\
                           With background: true the command keeps running after the call (servers, long\n\
-                          jobs); the reply says where its output goes and how to stop it."
+                          jobs); the reply says where its output goes and how to stop it.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn run_command(&self, Parameters(a): Parameters<ExecArgs>) -> CallToolResult {
         if a.background {
@@ -284,7 +385,14 @@ impl Gateway {
         text(exec(&a.name, &a.command, a.timeout).await)
     }
 
-    #[tool(description = "Copy a file or directory from this Mac into a VM (scp).")]
+    #[tool(
+        description = "Copy a file or directory from this Mac into a VM (scp).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn upload_file(&self, Parameters(a): Parameters<UploadArgs>) -> CallToolResult {
         text(
             async {
@@ -296,7 +404,14 @@ impl Gateway {
         )
     }
 
-    #[tool(description = "Copy a file or directory from a VM to this Mac (scp).")]
+    #[tool(
+        description = "Copy a file or directory from a VM to this Mac (scp).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn download_file(&self, Parameters(a): Parameters<DownloadArgs>) -> CallToolResult {
         text(
             async {
@@ -310,7 +425,12 @@ impl Gateway {
 
     #[tool(
         description = "Make a server running inside a VM reachable from this Mac: forwards a port on\n\
-                          127.0.0.1 to the guest port until the VM stops. Returns the host address."
+                          127.0.0.1 to the guest port until the VM stops. Returns the host address.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn forward_port(&self, Parameters(a): Parameters<ForwardArgs>) -> CallToolResult {
         text(
@@ -324,7 +444,8 @@ impl Gateway {
 
     #[tool(
         description = "List the desktop-control tools available in an instance (name + summary), or the full\n\
-                          input schema of one tool when `tool` is given. Call them with `use_desktop_tool`."
+                          input schema of one tool when `tool` is given. Call them with `use_desktop_tool`.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_desktop_tools(&self, Parameters(a): Parameters<ToolsArgs>) -> CallToolResult {
         let r = async {
@@ -363,7 +484,12 @@ impl Gateway {
 
     #[tool(
         description = "Call a desktop-control tool inside an instance (see list_desktop_tools for names and schemas).\n\
-                          Screenshots and other content are returned as-is."
+                          Screenshots and other content are returned as-is.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn use_desktop_tool(&self, Parameters(a): Parameters<DesktopArgs>) -> CallToolResult {
         let params = CallToolRequestParams::new(a.tool.clone())
@@ -421,10 +547,15 @@ impl ServerHandler for Gateway {
 
 impl Gateway {
     /// A lifecycle op invalidates the desktop session (guest restarted or gone).
-    async fn lifecycle(&self, name: &str, op: fn(&Instance) -> Result<String>) -> Result<String> {
+    async fn lifecycle(
+        &self,
+        name: &str,
+        op: fn(&Instance) -> Result<String>,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<String> {
         self.drop_session(name);
         let inst = load(name)?;
-        blocking(move || op(&inst)).await
+        with_progress(ctx, move || op(&inst)).await
     }
 
     fn drop_session(&self, name: &str) {
@@ -591,6 +722,30 @@ fn load(name: &str) -> Result<Instance> {
         bail!("no instance '{name}'; see list_vms");
     }
     Instance::load(name).map_err(|_| anyhow!("no instance '{name}'; see list_vms"))
+}
+
+/// `blocking`, plus: when the client asked for progress (a progressToken), each progress
+/// line agentpc logs meanwhile is sent to it as an MCP progress notification.
+async fn with_progress<T: Send + 'static>(
+    ctx: &RequestContext<RoleServer>,
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let Some(token) = ctx.meta.get_progress_token() else {
+        return blocking(f).await;
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let peer = ctx.peer.clone();
+    let forward = tokio::spawn(async move {
+        let mut n = 0.0;
+        while let Some(line) = rx.recv().await {
+            n += 1.0;
+            let note = ProgressNotificationParam::new(token.clone(), n).with_message(line);
+            let _ = peer.notify_progress(note).await;
+        }
+    });
+    let result = blocking(move || ops::with_progress(tx, f)).await;
+    let _ = forward.await;
+    result
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {

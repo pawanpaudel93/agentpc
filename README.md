@@ -155,7 +155,7 @@ pick the server up automatically.
 | Tool | Description |
 | --- | --- |
 | `list_vms` | VMs (state, size, checkpoints) and the available images with their OS versions |
-| `create_vm` | Create a VM (optionally of a given version) and wait until its desktop is ready |
+| `create_vm` | Create a VM (optionally of a given version, size, or offline) and wait until its desktop is ready |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down cleanly |
 | `reset_vm` | Discard all changes: back to a fresh copy of the image |
 | `checkpoint_vm` / `restore_vm` | Save a VM's disk and memory under a label; go back to it in seconds |
@@ -184,7 +184,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 
 | Command | Description |
 | --- | --- |
-| `agentpc create <image> [name] [--memory GB] [--cpus N]` | Create a VM from `ubuntu`, `windows` or a version such as `ubuntu-22.04`; fetches Ubuntu images if missing. A non-default size boots cold instead of resuming |
+| `agentpc create <image> [name] [--memory GB] [--cpus N] [--offline]` | Create a VM from `ubuntu`, `windows` or a version such as `ubuntu-22.04`; fetches Ubuntu images if missing. A non-default size boots cold instead of resuming. `--offline`: no internet or access to this Mac |
 | `agentpc list [--json]` (`ls`) | VMs and images; `--json` gives the same data as the MCP `list_vms` tool |
 | `agentpc info <name>` | Viewer URL, SSH and VNC details, and checkpoints |
 | `agentpc start <name>… \| --all` | Boot stopped VMs |
@@ -371,6 +371,12 @@ To only reclaim disk space, `agentpc clean` deletes what can be downloaded again
 - Guests use the fixed login `agent` / `agent`.
 - To keep agents unblocked, Windows VMs have UAC prompts, SmartScreen and Windows Update turned
   off. Don't use them for anything that needs those protections.
+- VMs can reach the internet and, through its gateway `10.0.2.2`, services on your Mac. Create
+  a VM with `--offline` (`offline: true` in `create_vm`) to cut both off, e.g. for untrusted
+  software; SSH, the viewer and forwarded ports keep working.
+- The MCP tools carry annotations: `list_vms`, `take_screenshot` and `list_desktop_tools` are
+  read-only, and tools that discard or overwrite state (including `download_file`, which writes
+  to your Mac) are marked destructive, so clients can auto-approve or confirm accordingly.
 - Treat VMs as disposable sandboxes, not as a place for secrets.
 
 ## Development

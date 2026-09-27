@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 | Tool | Use |
 | --- | --- |
 | `list_vms` | VMs (state, size, checkpoints) and the available images with OS versions. Start here. |
-| `create_vm(os, version?, name?)` | New VM (`ubuntu` or `windows`, optionally a version such as `22.04`); returns when the desktop is ready |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New VM (`ubuntu` or `windows`, optionally a version such as `22.04`); returns when the desktop is ready. `offline: true` cuts it off from the internet and this Mac |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down |
 | `reset_vm(name)` | Discard all changes: back to a clean install |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` | Save the VM's disk and memory; go back to exactly that state in seconds |
@@ -77,6 +77,8 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 ## Rules
 
 - VMs are disposable: `reset_vm` a broken one instead of repairing it.
+- To test untrusted software or offline behaviour, `create_vm` with `offline: true`: no internet
+  and no access to the Mac, while `run_command`, files, desktop tools and `forward_port` work.
 - For a heavy build, `create_vm` accepts `memory_gb` and `cpus`; a non-default size boots
   cold (~25 s Windows, ~15 s Ubuntu) instead of resuming in seconds.
 - Output that needs more than 10,000 characters from each end: write it to a file in the VM

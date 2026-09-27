@@ -20,7 +20,7 @@
   },
   "tools": [
     { "name": "list_vms", "description": "VMs (state, size, checkpoints) and which images exist" },
-    { "name": "create_vm", "description": "Create a VM, optionally of a given OS version; ready in ~1 s (Ubuntu) or ~4 s (Windows)" },
+    { "name": "create_vm", "description": "Create a VM (optionally a given OS version, size, or offline); ready in ~1 s (Ubuntu) or ~4 s (Windows)" },
     { "name": "start_vm", "description": "Start an instance" },
     { "name": "stop_vm", "description": "Stop an instance" },
     { "name": "reset_vm", "description": "Discard all changes: back to a fresh copy of the image" },

@@ -12,7 +12,7 @@ can run `agentpc mcp-install` (or install first: see README.md).
 | Tool | Use |
 | --- | --- |
 | `list_vms` | VMs (state, size, checkpoints) and the images (with OS version) they come from. Start here. |
-| `create_vm(os, version?, name?)` | New clone: ubuntu ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready. |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New clone: ubuntu ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready. `offline` cuts off the internet. |
 | `start_vm` / `stop_vm` / `reset_vm` / `delete_vm` | Lifecycle. `reset_vm` = back to a clean install. |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` | Save disk + memory before a risky step; restore in seconds. |
 | `take_screenshot(name)` | Hypervisor screenshot; works even while booting or hung. |

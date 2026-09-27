@@ -19,9 +19,11 @@ use instance::{Image, Instance};
 /// Timestamped progress line on stderr (stdout stays clean for results and MCP).
 #[macro_export]
 macro_rules! log {
-    ($($arg:tt)*) => {
-        eprintln!("[{}] {}", $crate::instance::local_hms(), format!($($arg)*))
-    };
+    ($($arg:tt)*) => {{
+        let line = format!($($arg)*);
+        eprintln!("[{}] {}", $crate::instance::local_hms(), line);
+        $crate::ops::progress(&line);
+    }};
 }
 
 #[derive(Parser)]
@@ -49,6 +51,9 @@ enum Cmd {
         /// CPUs (default 4); a non-default count cold-boots
         #[arg(long)]
         cpus: Option<u32>,
+        /// No internet or access to this Mac (SSH, the viewer and forwarded ports still work)
+        #[arg(long)]
+        offline: bool,
     },
     /// List VMs and images
     #[command(visible_alias = "ls")]
@@ -251,11 +256,13 @@ fn run(cli: Cli) -> Result<()> {
             name,
             memory,
             cpus,
+            offline,
         } => out(ops::create(
             &Image::resolve(&image)?,
             name.as_deref(),
             memory,
             cpus,
+            offline,
         )),
         Cmd::List { json } => out(if json {
             ops::list_json()

@@ -265,6 +265,7 @@ pub fn create(
     name: Option<&str>,
     memory: Option<u32>,
     cpus: Option<u32>,
+    offline: bool,
 ) -> Result<String> {
     let os = image.os;
     if !image.exists() {
@@ -287,7 +288,15 @@ pub fn create(
     }
     let inst = Instance::create(&name, image, slot)?;
     drop(lock);
-    let made = inst.set_size(memory, cpus).and_then(|()| clone_disk(&inst));
+    let made = inst
+        .set_size(memory, cpus)
+        .and_then(|()| {
+            if offline {
+                std::fs::write(inst.dir.join("offline"), "")?;
+            }
+            Ok(())
+        })
+        .and_then(|()| clone_disk(&inst));
     if let Err(e) = made {
         let _ = std::fs::remove_dir_all(&inst.dir);
         return Err(e);
@@ -348,7 +357,7 @@ fn boot_from(inst: &Instance, state: Option<&Path>) -> Result<String> {
     }
     viewer::ensure_running()?;
     let took = wait_ready(inst, Duration::from_secs(inst.os.boot_timeout()))?;
-    if resumed && inst.os == Os::Windows {
+    if resumed {
         sync_clock(inst);
     }
     log!("{} ready in {:.1}s", inst.name, took.as_secs_f32());
@@ -455,16 +464,20 @@ pub fn delete_checkpoint(inst: &Instance, label: &str) -> Result<String> {
     Ok(format!("deleted checkpoint {label} of {}", inst.name))
 }
 
-/// A resumed Windows guest keeps the clock it had when the snapshot was taken
-/// (Linux reads the host-backed arch timer and needs no fix).
+/// A resumed guest keeps the clock it had when the snapshot was taken, so HTTPS fails
+/// ("certificate is not yet valid") until its own time sync catches up, ~20 s later on
+/// Ubuntu. Set it from the Mac's clock straight away.
 fn sync_clock(inst: &Instance) {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let cmd = format!(
-        "Set-Date -Date ([DateTimeOffset]::FromUnixTimeMilliseconds({ms}).LocalDateTime) | Out-Null"
-    );
+    let cmd = match inst.os {
+        Os::Windows => format!(
+            "Set-Date -Date ([DateTimeOffset]::FromUnixTimeMilliseconds({ms}).LocalDateTime) | Out-Null"
+        ),
+        Os::Ubuntu => format!("sudo date -s @{}.{:03} >/dev/null", ms / 1000, ms % 1000),
+    };
     if let Err(e) = ssh(inst, &cmd).and_then(|o| {
         o.status
             .success()
@@ -473,6 +486,36 @@ fn sync_clock(inst: &Instance) {
     }) {
         log!("{}: clock sync failed: {e:#}", inst.name);
     }
+}
+
+thread_local! {
+    static PROGRESS: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedSender<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Pass this thread's `log!` lines to `tx` while `f` runs; the MCP server turns them into
+/// progress notifications. Lines from threads `f` starts itself aren't forwarded.
+pub fn with_progress<T>(
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PROGRESS.with(|p| p.borrow_mut().take());
+        }
+    }
+    PROGRESS.with(|p| *p.borrow_mut() = Some(tx));
+    let _reset = Reset;
+    f()
+}
+
+pub fn progress(line: &str) {
+    PROGRESS.with(|p| {
+        if let Some(tx) = p.borrow().as_ref() {
+            let _ = tx.send(line.to_string());
+        }
+    });
 }
 
 pub fn stop(inst: &Instance) -> Result<String> {
@@ -510,6 +553,7 @@ pub fn list_json() -> Result<String> {
                 "slot": i.slot,
                 "memory_gb": memory_gb,
                 "cpus": cpus,
+                "offline": i.offline(),
                 "viewer": viewer::url(i),
                 "ssh_port": i.ssh_port(),
                 "checkpoints": checkpoints(i),

@@ -298,6 +298,12 @@ impl Instance {
         (read("memory", mem), read("cpus", cpus))
     }
 
+    /// Whether the VM is cut off from the internet and this Mac (`create --offline`). SSH,
+    /// the desktop server and forwarded ports still reach it.
+    pub fn offline(&self) -> bool {
+        self.dir.join("offline").exists()
+    }
+
     /// Record a non-default size (defaults leave no file, so older VMs keep theirs).
     pub fn set_size(&self, memory: Option<u32>, cpus: Option<u32>) -> Result<()> {
         if let Some(m) = memory {

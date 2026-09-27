@@ -221,7 +221,11 @@ fn launch(
     ])
     .args([
         "-netdev",
-        &format!("user,id=net0,{fwd}"),
+        &format!(
+            "user,id=net0,{fwd}{}",
+            // restrict=on blocks the guest's own connections; host forwards still work.
+            if inst.offline() { ",restrict=on" } else { "" }
+        ),
         "-device",
         "virtio-net-pci,netdev=net0",
     ])
