@@ -101,9 +101,9 @@ fn scp(inst: &Instance, from: &str, to: &str) -> Result<()> {
 
 /// Make a server inside the VM reachable from this Mac. A detached SSH local tunnel
 /// (`ssh -N -L`) reaches servers bound to the guest's own 127.0.0.1 (the Vite/Next default),
-/// which QEMU's hostfwd cannot. The tunnel lives until the VM stops or `remove_forward`/
-/// `stop_forwards`; its pid is recorded under `<instance>/forwards/<host_port>.pid`. With no
-/// `host_port`, a free one is picked.
+/// which QEMU's hostfwd cannot. The tunnel lives until the VM stops or it is removed
+/// (`remove_forward`/`stop_forwards`); its pid is recorded under
+/// `<instance>/forwards/<host_port>.pid`. With no `host_port`, a free one is picked.
 pub fn forward(inst: &Instance, guest_port: u16, host_port: Option<u16>) -> Result<String> {
     if !inst.running() {
         bail!("{} is not running; start it first", inst.name);
@@ -181,7 +181,7 @@ pub fn forward(inst: &Instance, guest_port: u16, host_port: Option<u16>) -> Resu
 
 fn forward_url(inst: &Instance, host_port: u16, guest_port: u16) -> String {
     format!(
-        "127.0.0.1:{host_port} -> {}:{guest_port} (until the VM stops or remove_forward)",
+        "127.0.0.1:{host_port} -> {}:{guest_port} (until the VM stops or the forward is removed)",
         inst.name
     )
 }

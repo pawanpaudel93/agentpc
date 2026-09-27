@@ -471,15 +471,19 @@ describes the code layout for contributors and coding agents.
 <summary>Releasing (maintainers)</summary>
 
 1. On an up-to-date, clean `main`, run `scripts/release.sh X.Y.Z` (needs `gh` logged in,
-   Node for `npx`, and `jq`). It sets the version everywhere, runs the CI checks, builds
-   `dist/` (binary tarball, MCP bundle `agentpc-X.Y.Z.mcpb`, their `.sha256` files and a
-   filled-in `server.json`), then asks before it commits `chore: release vX.Y.Z`, tags
-   `vX.Y.Z`, pushes `main` and the tag, and creates the GitHub Release with those assets.
-   `--dry-run` stops after building `dist/` and reverts the version edits.
-2. Publish the Ubuntu image: `agentpc image build ubuntu`, `oras login ghcr.io`, then
-   `agentpc image push ubuntu`. Make the ghcr.io package public once in its package settings.
-3. Publish to the MCP Registry: copy `dist/server.json` over the repo copy (don't commit it),
-   then `brew install mcp-publisher`, `mcp-publisher login github`, `mcp-publisher publish`.
+   Node for `npx`, and `jq`). It sets the version everywhere (skipped when `Cargo.toml` is
+   already at X.Y.Z), runs the CI checks, builds `dist/` (binary tarball, MCP bundle
+   `agentpc-X.Y.Z.mcpb`, their `.sha256` files, a filled-in `server.json` and `NOTES.md`,
+   the release notes grouped from the Conventional Commit subjects since the last tag), then
+   asks before it commits `chore: release vX.Y.Z`, tags `vX.Y.Z`, pushes `main` and the tag,
+   and creates the GitHub Release. `--dry-run` stops after building `dist/`.
+2. Publish the Ubuntu image: `agentpc image build ubuntu`, then log `oras` in with a token
+   that can write packages (`gh auth refresh -s write:packages`, then
+   `gh auth token | oras login ghcr.io -u <user> --password-stdin`) and run
+   `agentpc image push ubuntu`. It uploads 64 MB parts, retries failures and links the package
+   to this repo; make the package public once in its settings.
+3. Publish to the MCP Registry: `brew install mcp-publisher`, `mcp-publisher login github`,
+   then `mcp-publisher publish dist/server.json`.
 
 </details>
 

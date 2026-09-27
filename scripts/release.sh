@@ -244,8 +244,7 @@ cat <<EOF
 Released $TAG: https://github.com/$REPO/releases/tag/$TAG
 
 Follow-ups:
-  MCP Registry: cp dist/server.json server.json, then
-                mcp-publisher login github && mcp-publisher publish, then git checkout server.json
+  MCP Registry: mcp-publisher login github && mcp-publisher publish dist/server.json
                 (brew install mcp-publisher)
   Ubuntu image (separate): agentpc image build ubuntu, oras login ghcr.io, agentpc image push ubuntu
 EOF
