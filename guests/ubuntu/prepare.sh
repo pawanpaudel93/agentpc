@@ -32,3 +32,9 @@ cat > /etc/opt/chrome/policies/managed/agentpc.json <<'EOF'
   "PasswordManagerEnabled": false
 }
 EOF
+
+# Smaller images: drop downloaded packages and old logs, then hand free blocks back to the
+# qcow2 (the disk is attached with discard). Package lists stay so `apt install` just works.
+apt-get clean
+journalctl --vacuum-size=16M >/dev/null 2>&1 || true
+fstrim -a >/dev/null 2>&1 || true
