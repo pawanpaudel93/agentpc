@@ -42,6 +42,54 @@ pub fn which(cmd: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// The concrete versioned machine type that `virt` currently aliases (e.g. `virt-11.1`),
+/// from `-machine help`. Saved states record it so they resume on the exact machine they
+/// were made on; a fresh boot uses whatever `virt` means today. Falls back to `virt`.
+pub fn machine_type() -> String {
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let Ok(bin) = qemu_bin() else {
+                return "virt".into();
+            };
+            let Ok(out) = Command::new(bin).args(["-machine", "help"]).output() else {
+                return "virt".into();
+            };
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|l| {
+                    let mut it = l.split_whitespace();
+                    (it.next() == Some("virt")).then(|| {
+                        l.split_once("alias of ")
+                            .and_then(|(_, r)| {
+                                r.trim().trim_end_matches(')').split_whitespace().next()
+                            })
+                            .unwrap_or("virt")
+                            .to_string()
+                    })
+                })
+                .unwrap_or_else(|| "virt".into())
+        })
+        .clone()
+}
+
+/// Sidecar next to a saved-state file recording the machine type it was captured on.
+fn machine_sidecar(state: &Path) -> PathBuf {
+    let mut s = state.as_os_str().to_owned();
+    s.push(".machine");
+    PathBuf::from(s)
+}
+
+/// The machine type to launch a resumed state with: its recorded sidecar, or `virt` for a
+/// legacy state saved before sidecars existed.
+fn resume_machine(state: &Path) -> String {
+    std::fs::read_to_string(machine_sidecar(state))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "virt".into())
+}
+
 /// Boot an instance in the background. `extra` adds install media for image builds.
 pub fn start(inst: &Instance, extra: &[String]) -> Result<()> {
     launch(inst, extra, None, false)
@@ -116,7 +164,11 @@ fn pause_and_save(inst: &Instance, q: &mut Qmp, out: &Path) -> Result<()> {
     loop {
         let st = q.execute("query-migrate", None)?;
         match st["status"].as_str().unwrap_or("") {
-            "completed" => return Ok(()),
+            "completed" => {
+                // Record the machine type so this state resumes on the same machine.
+                let _ = std::fs::write(machine_sidecar(out), machine_type());
+                return Ok(());
+            }
             "failed" | "cancelled" => bail!(
                 "saving {} failed: {}",
                 inst.name,
@@ -135,7 +187,15 @@ fn launch(
     installer: bool,
 ) -> Result<()> {
     let d = &inst.dir;
+    // Refuse to relaunch a VM that's already up, rather than unlinking a live control socket.
+    if Qmp::connect(inst).is_ok() {
+        bail!("{} is already running", inst.name);
+    }
     let _ = std::fs::remove_file(inst.qmp_socket());
+    let machine = match incoming {
+        Some(state) => resume_machine(state),
+        None => machine_type(),
+    };
     let mut fwd = format!("hostfwd=tcp:127.0.0.1:{}-:22", inst.ssh_port());
     let (mem, cpus) = inst.size();
     let mut args: Vec<String> = vec![
@@ -187,71 +247,67 @@ fn launch(
     }
     let log_file = std::fs::File::create(d.join("qemu.log"))?;
     let mut cmd = Command::new(qemu_bin()?);
-    cmd.args([
-        "-machine",
-        "virt,highmem=on",
-        "-accel",
-        "hvf",
-        "-cpu",
-        "host",
-    ])
-    .args(&args)
-    .arg("-drive")
-    .arg(format!(
-        "if=pflash,unit=0,format=raw,readonly=on,file={}",
-        edk2()?.display()
-    ))
-    .arg("-drive")
-    .arg(format!(
-        "if=pflash,unit=1,format=raw,file={}",
-        inst.vars().display()
-    ))
-    .args([
-        "-fw_cfg",
-        "name=opt/org.tianocore/UninstallMemAttrProtocol,string=y",
-    ])
-    // Enough root ports: EDK2 makes no boot entry for USB media behind a hub.
-    .args([
-        "-device",
-        "qemu-xhci,id=xhci,p2=7,p3=7",
-        "-device",
-        "usb-kbd",
-        "-device",
-        "usb-tablet",
-    ])
-    .args([
-        "-netdev",
-        &format!(
-            "user,id=net0,{fwd}{}",
-            // restrict=on blocks the guest's own connections; host forwards still work.
-            if inst.offline() { ",restrict=on" } else { "" }
-        ),
-        "-device",
-        "virtio-net-pci,netdev=net0",
-    ])
-    .args([
-        "-vnc",
-        &format!(
-            "127.0.0.1:{},websocket={}",
-            inst.vnc_display(),
-            inst.ws_port()
-        ),
-    ])
-    .arg("-qmp")
-    .arg(format!(
-        "unix:{},server=on,wait=off",
-        inst.qmp_socket().display()
-    ))
-    .arg("-serial")
-    .arg(format!("file:{}", d.join("serial.log").display()))
-    .arg("-pidfile")
-    .arg(inst.pid_file())
-    .args(extra)
-    .stdin(Stdio::null())
-    .stdout(log_file.try_clone()?)
-    .stderr(log_file)
-    // Own process group: Ctrl-C in the CLI must not take the VM down.
-    .process_group(0);
+    cmd.args(["-machine", &format!("{machine},highmem=on")])
+        .args(["-accel", "hvf", "-cpu", "host"])
+        .args(&args)
+        .arg("-drive")
+        .arg(format!(
+            "if=pflash,unit=0,format=raw,readonly=on,file={}",
+            edk2()?.display()
+        ))
+        .arg("-drive")
+        .arg(format!(
+            "if=pflash,unit=1,format=raw,file={}",
+            inst.vars().display()
+        ))
+        .args([
+            "-fw_cfg",
+            "name=opt/org.tianocore/UninstallMemAttrProtocol,string=y",
+        ])
+        // Enough root ports: EDK2 makes no boot entry for USB media behind a hub.
+        .args([
+            "-device",
+            "qemu-xhci,id=xhci,p2=7,p3=7",
+            "-device",
+            "usb-kbd",
+            "-device",
+            "usb-tablet",
+        ])
+        .args([
+            "-netdev",
+            &format!(
+                "user,id=net0,{fwd}{}",
+                // restrict=on blocks the guest's own connections; host forwards still work.
+                if inst.offline() { ",restrict=on" } else { "" }
+            ),
+            "-device",
+            "virtio-net-pci,netdev=net0",
+        ])
+        .args([
+            "-vnc",
+            &format!(
+                // password=on gates both the raw and websocket VNC on a per-VM password,
+                // set over QMP once the monitor is up (below).
+                "127.0.0.1:{},websocket={},password=on",
+                inst.vnc_display(),
+                inst.ws_port()
+            ),
+        ])
+        .arg("-qmp")
+        .arg(format!(
+            "unix:{},server=on,wait=off",
+            inst.qmp_socket().display()
+        ))
+        .arg("-serial")
+        .arg(format!("file:{}", d.join("serial.log").display()))
+        .arg("-pidfile")
+        .arg(inst.pid_file())
+        .args(extra)
+        .stdin(Stdio::null())
+        .stdout(log_file.try_clone()?)
+        .stderr(log_file)
+        // Own process group: Ctrl-C in the CLI must not take the VM down.
+        .process_group(0);
     // Spawned detached rather than with -daemonize: QEMU's fork-based daemonizing
     // crashes during RAM snapshot save/restore under HVF.
     let mut child = cmd.spawn().context("spawn qemu")?;
@@ -273,7 +329,35 @@ fn launch(
     // Reap it when it exits so a long-lived parent (the MCP server) keeps no zombie,
     // which would still look alive to kill(pid, 0).
     std::thread::spawn(move || child.wait());
+    set_vnc_password(inst);
     Ok(())
+}
+
+/// Apply this VM's stored VNC password over QMP (VNC was started with password=on, so it
+/// rejects connections until this runs). Best-effort: a failure only affects the viewer,
+/// and the password never reaches the log.
+fn set_vnc_password(inst: &Instance) {
+    let Ok(pass) = inst.ensure_vnc_password() else {
+        log!(
+            "{}: could not set a VNC password; viewer may be unavailable",
+            inst.name
+        );
+        return;
+    };
+    if Qmp::connect(inst)
+        .and_then(|mut q| {
+            q.execute(
+                "set_password",
+                Some(json!({"protocol": "vnc", "password": pass})),
+            )
+        })
+        .is_err()
+    {
+        log!(
+            "{}: setting the VNC password failed; viewer may be unavailable",
+            inst.name
+        );
+    }
 }
 
 /// Terminate QEMU immediately, without a guest shutdown.
@@ -309,16 +393,50 @@ pub fn stop(inst: &Instance) -> Result<()> {
     Ok(())
 }
 
+/// QMP run state ("running", "paused", "postmigrate", "io-error", …), or `None` if the VM
+/// isn't up. Exposed for callers that report state (e.g. `list_json`).
+pub fn status(inst: &Instance) -> Option<String> {
+    let mut q = Qmp::connect(inst).ok()?;
+    let r = q.execute("query-status", None).ok()?;
+    r["status"].as_str().map(String::from)
+}
+
+/// Resume a VM that's up but not running — paused, `postmigrate`, or `io-error` left by an
+/// interrupted checkpoint. Best-effort.
+pub fn resume_if_paused(inst: &Instance) {
+    if let Some(st) = status(inst)
+        && st != "running"
+    {
+        let _ = Qmp::connect(inst).and_then(|mut q| q.execute("cont", None));
+    }
+}
+
 /// Screenshot straight to PNG (QEMU encodes it; no conversion step).
 pub fn screenshot(inst: &Instance, out: &Path) -> Result<Vec<u8>> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     if !inst.running() {
         bail!("{} is not running", inst.name);
     }
-    Qmp::connect(inst)?.execute(
-        "screendump",
-        Some(json!({"filename": out.to_string_lossy(), "format": "png"})),
-    )?;
-    std::fs::read(out).context("read screenshot")
+    // Unique temp so parallel screenshots of one VM don't read each other's half-written PNG.
+    let tmp = out.with_file_name(format!(
+        ".screenshot-{}-{}.png",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let r = Qmp::connect(inst).and_then(|mut q| {
+        q.execute(
+            "screendump",
+            Some(json!({"filename": tmp.to_string_lossy(), "format": "png"})),
+        )
+    });
+    if let Err(e) = r {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let data = std::fs::read(&tmp).context("read screenshot");
+    let _ = std::fs::rename(&tmp, out);
+    data
 }
 
 pub struct Qmp {
@@ -342,8 +460,16 @@ impl Qmp {
 
     fn read_msg(&mut self) -> Result<Value> {
         let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
-            bail!("QMP connection closed");
+        match self.reader.read_line(&mut line) {
+            Ok(0) => bail!("QMP connection closed"),
+            Ok(_) => {}
+            // The read timeout (SO_RCVTIMEO) surfaces as EAGAIN / "os error 35".
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(35) =>
+            {
+                bail!("QEMU monitor timed out");
+            }
+            Err(e) => return Err(e.into()),
         }
         Ok(serde_json::from_str(&line)?)
     }

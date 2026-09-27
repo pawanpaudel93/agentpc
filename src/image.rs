@@ -265,6 +265,13 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
     )?;
     std::fs::rename(&disk_tmp, &disk)?;
     std::fs::copy(inst.vars(), &vars)?;
+    // Move the machine-type sidecar save_state wrote next to the temp state alongside it.
+    let sidecar = |p: &std::path::Path| {
+        let mut s = p.as_os_str().to_owned();
+        s.push(".machine");
+        PathBuf::from(s)
+    };
+    let _ = std::fs::rename(sidecar(&state_tmp), sidecar(&state));
     std::fs::rename(&state_tmp, &state)?;
     for p in [&disk, &vars, &state] {
         let mut perm = std::fs::metadata(p)?.permissions();

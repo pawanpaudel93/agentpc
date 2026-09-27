@@ -220,6 +220,23 @@ impl FromStr for Os {
     }
 }
 
+/// Per-slot host ports. Kept in an uncommon 47xxx range so they don't collide with the
+/// dev servers people run on 22/8000/5900. Slot n (1..=50) gets `<base>+n` in each band.
+const SSH_BASE: u16 = 47000;
+const MCP_BASE: u16 = 47100;
+const WS_BASE: u16 = 47200;
+const VNC_BASE: u16 = 47300;
+
+/// The four host ports a slot occupies, for slot-selection bind tests.
+fn slot_host_ports(slot: u16) -> [u16; 4] {
+    [
+        SSH_BASE + slot,
+        MCP_BASE + slot,
+        WS_BASE + slot,
+        VNC_BASE + slot,
+    ]
+}
+
 /// A VM instance. Its ports derive from its slot so several can run at once.
 #[derive(Debug, Clone)]
 pub struct Instance {
@@ -324,21 +341,27 @@ impl Instance {
     pub fn free_slot() -> Result<u16> {
         let used: Vec<u16> = Self::list()?.iter().map(|i| i.slot).collect();
         (1..=50)
-            .find(|s| !used.contains(s))
-            .context("no free slot (50 instances max)")
+            .filter(|s| !used.contains(s))
+            // Skip a slot whose host ports something else is already bound to.
+            .find(|s| slot_host_ports(*s).iter().all(|p| port_free(*p)))
+            .context("no free slot (all taken or their ports are busy)")
     }
 
     pub fn ssh_port(&self) -> u16 {
-        2200 + self.slot
+        SSH_BASE + self.slot
     }
     pub fn mcp_port(&self) -> u16 {
-        8000 + self.slot
+        MCP_BASE + self.slot
+    }
+    /// Actual VNC port (QEMU adds 5900 to the display number).
+    pub fn vnc_port(&self) -> u16 {
+        VNC_BASE + self.slot
     }
     pub fn vnc_display(&self) -> u16 {
-        10 + self.slot
+        self.vnc_port() - 5900
     }
     pub fn ws_port(&self) -> u16 {
-        5700 + self.slot
+        WS_BASE + self.slot
     }
 
     pub fn disk(&self) -> PathBuf {
@@ -348,15 +371,11 @@ impl Instance {
         self.dir.join("vars.fd")
     }
     /// Kept under /tmp: a unix socket path must stay under 104 bytes, which a
-    /// long `$AGENTPC_HOME` would exceed.
+    /// long `$AGENTPC_HOME` would exceed. The hash is a fixed algorithm (FNV-1a),
+    /// not `DefaultHasher`, so the path is stable across builds and processes.
     pub fn qmp_socket(&self) -> PathBuf {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.dir.hash(&mut h);
-        // SAFETY: getuid(2) has no preconditions.
-        let dir = PathBuf::from(format!("/tmp/agentpc-{}", unsafe { getuid() }));
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join(format!("{:016x}.qmp", h.finish()))
+        let hash = fnv1a(self.dir.to_string_lossy().as_bytes());
+        runtime_dir().join(format!("{hash:016x}.qmp"))
     }
     /// Present while the clone's next boot should resume the snapshot.
     pub fn resume_marker(&self) -> PathBuf {
@@ -372,14 +391,75 @@ impl Instance {
         self.dir.join("qemu.pid")
     }
 
+    /// Our QEMU's pid, or `None` if the pid file is missing or stale. A stale file (the
+    /// process is gone, or the pid was recycled by something that isn't our QEMU) is
+    /// removed, so an old pid can't make `running()` report a VM that isn't there.
     pub fn pid(&self) -> Option<i32> {
         let pid: i32 = read_trimmed(&self.pid_file()).ok()?.parse().ok()?;
         // SAFETY: signal 0 only checks that the process exists.
-        (unsafe { libc_kill(pid, 0) } == 0).then_some(pid)
+        let alive = unsafe { libc_kill(pid, 0) } == 0;
+        if alive && self.pid_is_our_qemu(pid) {
+            return Some(pid);
+        }
+        let _ = std::fs::remove_file(self.pid_file());
+        None
+    }
+
+    /// Confirm `pid` is a QEMU process launched for this instance (its argv names this
+    /// instance's dir), guarding signals against a recycled pid.
+    fn pid_is_our_qemu(&self, pid: i32) -> bool {
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        let cmd = String::from_utf8_lossy(&out.stdout);
+        cmd.contains("qemu-system")
+            && (cmd.contains(&*self.dir.to_string_lossy())
+                || cmd.contains(&*self.qmp_socket().to_string_lossy()))
     }
 
     pub fn running(&self) -> bool {
         self.pid().is_some()
+    }
+
+    /// Held for the length of a lifecycle op (start/stop/reset/…) so two of them can't
+    /// race on this instance's disk. Same helper as `creation_lock`; released on drop.
+    pub fn lock(&self) -> Result<std::fs::File> {
+        lock(
+            &self.dir.join(".lock"),
+            Some("waiting for another operation on this VM to finish"),
+        )
+    }
+
+    /// This VM's VNC password file (0600), created with a fresh password if absent.
+    /// Kept out of logs; only the viewer URL carries it.
+    pub fn ensure_vnc_password(&self) -> Result<String> {
+        if let Ok(p) = read_trimmed(&self.vnc_password_file())
+            && !p.is_empty()
+        {
+            return Ok(p);
+        }
+        // VNC's classic auth uses only the first 8 chars, so 4 random bytes as hex is plenty.
+        let mut buf = [0u8; 4];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+            .context("read /dev/urandom")?;
+        let pass = buf.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        write_private(&self.vnc_password_file(), &pass)?;
+        Ok(pass)
+    }
+
+    /// The stored VNC password if one exists (no side effects), for building the viewer URL.
+    pub fn vnc_password(&self) -> Option<String> {
+        read_trimmed(&self.vnc_password_file())
+            .ok()
+            .filter(|p| !p.is_empty())
+    }
+
+    fn vnc_password_file(&self) -> PathBuf {
+        self.dir.join("vnc-pass")
     }
 }
 
@@ -572,9 +652,114 @@ pub fn read_trimmed(p: &Path) -> Result<String> {
         .to_string())
 }
 
+/// FNV-1a (64-bit) over `bytes`: a fixed, process-independent hash for the QMP socket name.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// `/tmp/agentpc-<uid>`, created 0700 and owned by us. Refuses a pre-existing directory
+/// owned by someone else or writable by group/other, so a QMP socket can't be hijacked.
+fn runtime_dir() -> PathBuf {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // SAFETY: getuid(2) has no preconditions.
+    let uid = unsafe { getuid() };
+    let dir = PathBuf::from(format!("/tmp/agentpc-{uid}"));
+    match std::fs::metadata(&dir) {
+        Ok(m) => {
+            if m.uid() != uid || m.mode() & 0o022 != 0 {
+                // Someone else's, or group/world-writable: don't trust it.
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        Err(_) => {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    dir
+}
+
+/// Write `contents` to `path` with 0600 permissions (owner-only), for the VNC password.
+fn write_private(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("write {}", path.display()))?;
+    f.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
+/// True if nothing is bound to `port` on 127.0.0.1 (used to skip busy slots).
+fn port_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Free space in bytes on the volume holding `path`, via `df -k`. `None` if it can't be read.
+pub fn free_disk_bytes(path: &Path) -> Option<u64> {
+    let out = std::process::Command::new("df")
+        .args(["-k", &path.to_string_lossy()])
+        .output()
+        .ok()?;
+    // Last line, "Avail" column (4th field), in 1024-byte blocks.
+    let line = String::from_utf8_lossy(&out.stdout);
+    let avail_kb: u64 = line
+        .lines()
+        .nth(1)?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()?;
+    Some(avail_kb * 1024)
+}
+
+/// Total physical RAM in bytes (`sysctl hw.memsize`). `None` if it can't be read.
+pub fn host_mem_bytes() -> Option<u64> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// The Mac's IANA time zone (e.g. `Asia/Kathmandu`), from `/etc/localtime`'s target.
+pub fn mac_timezone() -> Option<String> {
+    let target = std::fs::read_link("/etc/localtime").ok()?;
+    let s = target.to_string_lossy();
+    // .../zoneinfo/Asia/Kathmandu -> Asia/Kathmandu
+    s.split_once("zoneinfo/").map(|(_, tz)| tz.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Image, Os};
+    use super::{Image, Os, fnv1a, slot_host_ports};
+
+    #[test]
+    fn fnv1a_matches_known_vectors() {
+        // Canonical FNV-1a 64-bit test vectors.
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    #[test]
+    fn slot_ports_dont_overlap_across_slots() {
+        // No port a slot uses may collide with any port another slot uses (1..=50).
+        let mut seen = std::collections::HashSet::new();
+        for s in 1..=50 {
+            for p in slot_host_ports(s) {
+                assert!(seen.insert(p), "port {p} reused");
+            }
+        }
+    }
 
     #[test]
     fn parses_image_names() {

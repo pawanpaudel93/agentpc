@@ -12,10 +12,17 @@ use crate::instance::{Instance, cache_dir, home, kill, read_trimmed};
 
 pub const PORT: u16 = 8100;
 const NOVNC: &str = "v1.6.0";
+/// Pinned so a tampered or swapped tarball can't slip in. Recompute if `NOVNC` changes.
+const NOVNC_SHA256: &str = "5066103959ef4e9b10f37e5a148627360dd8414e4cf8a7db92bdbd022e728aaa";
 
 pub fn url(inst: &Instance) -> String {
+    // The per-VM VNC password (if set) is handed to noVNC so the URL still auto-connects.
+    let pass = inst
+        .vnc_password()
+        .map(|p| format!("&password={p}"))
+        .unwrap_or_default();
     format!(
-        "http://127.0.0.1:{PORT}/vnc.html?autoconnect=1&resize=scale&host=127.0.0.1&port={}&path=",
+        "http://127.0.0.1:{PORT}/vnc.html?autoconnect=1&resize=scale&host=127.0.0.1&port={}&path={pass}",
         inst.ws_port()
     )
 }
@@ -33,18 +40,45 @@ fn ensure_novnc() -> Result<()> {
         return Ok(());
     }
     std::fs::create_dir_all(cache_dir())?;
+    let tarball = cache_dir().join("novnc.tar.gz");
+    let st = Command::new("curl")
+        .args([
+            "-fsSL",
+            "-o",
+            &tarball.to_string_lossy(),
+            &format!("https://github.com/novnc/noVNC/archive/refs/tags/{NOVNC}.tar.gz"),
+        ])
+        .status()?;
+    if !st.success() {
+        let _ = std::fs::remove_file(&tarball);
+        bail!("downloading noVNC failed");
+    }
+    let got = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(std::fs::read(&tarball)?);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    if got != NOVNC_SHA256 {
+        let _ = std::fs::remove_file(&tarball);
+        bail!("noVNC {NOVNC} checksum mismatch (got {got})");
+    }
     let tmp = cache_dir().join("novnc.tmp");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
-    let st = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "curl -fsSL https://github.com/novnc/noVNC/archive/refs/tags/{NOVNC}.tar.gz | tar xz -C '{}' --strip-components 1",
-            tmp.display()
-        ))
+    let st = Command::new("tar")
+        .args(["xzf", &tarball.to_string_lossy(), "-C"])
+        .arg(&tmp)
+        .args(["--strip-components", "1"])
         .status()?;
+    let _ = std::fs::remove_file(&tarball);
     if !st.success() {
-        bail!("downloading noVNC failed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        bail!("unpacking noVNC failed");
     }
     std::fs::rename(&tmp, novnc_dir())?;
     Ok(())
@@ -76,11 +110,25 @@ pub fn ensure_running() -> Result<()> {
 /// Stop the viewer once no instance is running.
 pub fn stop_if_idle() {
     if Instance::list().is_ok_and(|l| l.iter().all(|i| !i.running())) {
-        if let Ok(pid) = read_trimmed(&pid_file()).and_then(|p| Ok(p.parse::<i32>()?)) {
+        if let Ok(pid) = read_trimmed(&pid_file()).and_then(|p| Ok(p.parse::<i32>()?))
+            && pid_is_our_viewer(pid)
+        {
             kill(pid, 15);
         }
         let _ = std::fs::remove_file(pid_file());
     }
+}
+
+/// Confirm `pid` is our viewer subprocess (`agentpc __viewer`) before signalling it, so a
+/// recycled pid in a stale viewer.pid isn't killed by mistake.
+fn pid_is_our_viewer(pid: i32) -> bool {
+    let Ok(out) = Command::new("ps")
+        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout).contains("__viewer")
 }
 
 /// Foreground server loop (`agentpc __viewer`).
