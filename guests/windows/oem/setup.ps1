@@ -11,33 +11,18 @@ powercfg /hibernate off
 New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization' -Force | Out-Null
 Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization' -Name NoLockScreen -Value 1 -Type DWord
 
-# uv and its tools live at machine scope so sshd sessions (system PATH only) see them.
-$uv = 'C:\uv'
-$vars = @{ UV_INSTALL_DIR = $uv; UV_TOOL_DIR = "$uv\tools"; UV_TOOL_BIN_DIR = "$uv\bin"; UV_PYTHON_INSTALL_DIR = "$uv\python" }
-foreach ($k in $vars.Keys) {
-    [Environment]::SetEnvironmentVariable($k, $vars[$k], 'Machine')
-    Set-Item "env:$k" $vars[$k]
-}
-$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-[Environment]::SetEnvironmentVariable('Path', "$machinePath;$uv;$uv\bin", 'Machine')
-$env:Path += ";$uv;$uv\bin"
-
-# Windows-MCP first, so the desktop is drivable before the slow OpenSSH download.
-Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
+# cua-driver first, so the desktop is drivable before the slow OpenSSH download.
+# The installer registers a logon task that runs its `serve` daemon elevated in the
+# interactive session (Session 0, where sshd runs, cannot see the desktop).
 # Pinned: the skill and docs describe this version's tools. Bump deliberately.
-& "$uv\uv.exe" tool install windows-mcp==0.8.5 --python 3.13
-
-# Must run in the logged-on user's interactive session (a service in Session 0
-# cannot see the desktop); elevated so it can drive admin windows despite UIPI.
-# No auth key: the guest sits behind QEMU user-mode NAT and is reachable only via
-# the host's 127.0.0.1 port forwards.
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -WindowStyle Hidden -Command `"& '$uv\bin\windows-mcp.exe' serve --transport streamable-http --host 0.0.0.0 --port 8000 --allow-insecure-remote *> C:\OEM\windows-mcp.log`""
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-$principal = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\Administrators' -RunLevel Highest
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries
-Register-ScheduledTask -TaskName 'windows-mcp' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
-New-NetFirewallRule -DisplayName 'windows-mcp' -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
-Start-ScheduledTask -TaskName 'windows-mcp'
+$env:CUA_DRIVER_RS_VERSION = '0.30.1'
+$ProgressPreference = 'SilentlyContinue'
+# Its own process: the installer sets ErrorActionPreference=Stop and calls exit.
+$installer = "$env:TEMP\cua-driver-install.ps1"
+Invoke-WebRequest https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.30.1/install.ps1 -OutFile $installer -UseBasicParsing
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer
+# The installer only registers the logon task; start it for this session too.
+& "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin\cua-driver.exe" autostart kick
 
 # OpenSSH with key auth and PowerShell as the default shell. The download takes 10-15 min.
 Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0

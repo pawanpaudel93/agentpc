@@ -53,11 +53,17 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 5. Call `list_desktop_tools` once per VM to learn the exact tool names and arguments.
 6. When finished, `delete_vm` VMs you created, unless the user wants to keep them.
 
-## Windows (desktop tools from Windows-MCP)
+## Windows (desktop tools from cua-driver)
 
-- Call `Snapshot` first to get element labels and coordinates.
-- `Click` takes `loc: [x, y]`; `Type` needs `loc` or `label`.
-- `App` with `mode: "launch"` opens programs by name; `Shortcut` sends key combinations.
+- `launch_app` takes a name such as `notepad` and returns the `pid` and `window_id`s. It
+  launches without stealing focus.
+- `get_window_state(pid, window_id)` returns numbered elements and a `snapshot_id`;
+  `click` and `type_text` take that `snapshot_id` with an `element_index`.
+- `get_desktop_state` returns a screenshot of the whole screen.
+- If `get_window_state` returns no elements, look for another window of the same app (e.g.
+  Notepad's first-run tip, "PopupHost") and dismiss it first.
+- Windows images built by agentpc 0.1.0 use Windows-MCP instead (`list_desktop_tools` shows
+  which): call `Snapshot` first; `Click` takes `loc: [x, y]`; `Type` needs `loc` or `label`.
 - `run_command` runs PowerShell as the `agent` administrator. The screen is 1280x800.
 - Processes started over `run_command` end when the command returns: start servers and GUI apps
   with `background: true`. `forward_port` tunnels over SSH, so it reaches a server on the guest's

@@ -1,5 +1,6 @@
 //! MCP gateway over stdio. Lifecycle tools wrap `ops`; `use_desktop_tool` forwards to the
-//! instance's own desktop-control server (Windows-MCP over HTTP, cua-driver over SSH)
+//! instance's own desktop-control server (cua-driver over SSH; Windows-MCP over HTTP on
+//! older Windows images)
 //! through one session kept open per instance, so element references returned by one
 //! call stay valid in the next.
 
@@ -41,9 +42,11 @@ on Ubuntu; the guest login is agent/agent. create_vm takes an optional version (
 like \"22.04\"; Windows \"11-25h2\", \"11-24h2\", \"11-23h2\"); list_vms shows which images exist.
 The first create of an image can take minutes (download/build); after that it's seconds.
 
-Desktop tools: Windows come from Windows-MCP (call Snapshot first; Click/Type need a loc [x, y]
-or label). Ubuntu come from cua-driver (keyboard/mouse input needs \"delivery_mode\":
-\"foreground\").
+Desktop tools come from cua-driver on both OSes: launch_app returns a pid and window_ids;
+get_window_state(pid, window_id) returns numbered elements and a snapshot_id to pass with
+element_index to click/type_text. On Ubuntu, keyboard/mouse input needs \"delivery_mode\":
+\"foreground\". Windows images built by agentpc 0.1.0 use Windows-MCP instead (call Snapshot
+first; Click/Type need a loc [x, y] or label); list_desktop_tools shows which.
 
 Rules:
 - Ownership: create your OWN uniquely named VM and work in it. Never reset/delete/restore a VM you
@@ -902,6 +905,19 @@ async fn connect(name: &str) -> Result<RunningService<RoleClient, ()>> {
     }
     let session = async {
         match inst.os {
+            // The `serve` daemon runs in the logged-in desktop session; SSH is Session 0,
+            // where plain `mcp` refuses to start, so name the daemon's pipe explicitly.
+            // Images built before cua-driver shipped still run Windows-MCP over HTTP.
+            Os::Windows if windows_has_cua_driver(&inst).await => {
+                let remote = format!(
+                    "& \"{}\" mcp --socket \\\\.\\pipe\\cua-driver",
+                    ops::WINDOWS_CUA_DRIVER
+                );
+                let cmd = tokio::process::Command::new("ssh").configure(|c| {
+                    c.args(ops::ssh_args(&inst, &remote));
+                });
+                Ok(().serve(TokioChildProcess::new(cmd)?).await?)
+            }
             Os::Windows => {
                 let url = format!("http://127.0.0.1:{}/mcp", inst.mcp_port());
                 Ok(
@@ -923,6 +939,21 @@ async fn connect(name: &str) -> Result<RunningService<RoleClient, ()>> {
         .map_err(|_| anyhow!("timed out after 60s"))
         .and_then(|r: Result<_>| r)
         .with_context(|| format!("cannot reach the desktop server in {name}"))
+}
+
+async fn windows_has_cua_driver(inst: &Instance) -> bool {
+    let check = format!(
+        "if (Test-Path \"{}\") {{ exit 0 }} else {{ exit 1 }}",
+        ops::WINDOWS_CUA_DRIVER
+    );
+    tokio::process::Command::new("ssh")
+        .args(ops::ssh_args(inst, &check))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|s| s.success())
 }
 
 /// Characters kept from each end of a long stdout or stderr.

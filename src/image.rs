@@ -343,7 +343,7 @@ pub struct ImageInfo {
     pub built: String,
     #[serde(default)]
     pub agentpc: String,
-    /// The desktop-control server agents drive, e.g. "Windows-MCP 0.8.5".
+    /// The desktop-control server agents drive, e.g. "cua-driver 0.30.1".
     #[serde(default)]
     pub desktop_server: String,
     /// Checksum of the Windows ISO it was built from.
@@ -377,12 +377,13 @@ echo "server=$(~/.local/bin/cua-driver --version 2>/dev/null | awk '{print $NF}'
         // ProductName still says "Windows 10" on Windows 11; the WMI caption doesn't.
         Os::Windows => {
             r#"$v = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+$cua = "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin\cua-driver.exe"
 $mcp = & 'C:\uv\uv.exe' tool list 2>$null | Select-String '^windows-mcp v'
 "caption=$((Get-CimInstance Win32_OperatingSystem).Caption -replace '^Microsoft ', '')"
 "release=$($v.DisplayVersion)"
 "build=$($v.CurrentBuild).$($v.UBR)"
 "arch=$($env:PROCESSOR_ARCHITECTURE.ToLower())"
-"server=$(if ($mcp) { $mcp.Line -replace '^windows-mcp v', '' })""#
+"server=$(if (Test-Path $cua) { & $cua --version } elseif ($mcp) { $mcp.Line -replace '^windows-mcp v', 'Windows-MCP ' })""#
         }
     };
     let out = ssh(inst, script)?;
@@ -423,7 +424,7 @@ $mcp = & 'C:\uv\uv.exe' tool list 2>$null | Select-String '^windows-mcp v'
                 format!("{caption} {} (build {})", get("release"), get("build")),
                 format!("{major}-{}", get("release")),
                 String::new(), // described from the ISO by build
-                format!("Windows-MCP {server}"),
+                server,
             )
         }
     };

@@ -35,8 +35,7 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 - **Checkpoints.** Save a running VM (disk and memory) before a risky step and return to that
   exact state in seconds.
 - **Real desktops.** Windows 11 (ARM) and Ubuntu 24.04 or another release (XFCE), each with a
-  desktop-control server agents can drive: [Windows-MCP](https://github.com/CursorTouch/Windows-MCP)
-  and [cua-driver](https://github.com/trycua/cua).
+  desktop-control server agents can drive: [cua-driver](https://github.com/trycua/cua) on both.
 - **One MCP server for everything.** Agents create, drive, screenshot and delete VMs
   themselves. Works with any MCP client; `agentpc mcp-install` sets up the popular ones.
 - **Shell and screen access.** Run PowerShell or bash over SSH; take PNG screenshots straight
@@ -178,7 +177,7 @@ VMs an MCP session created or started are stopped (never deleted) when the sessi
 
 | Guest | Desktop | Desktop-control server |
 | --- | --- | --- |
-| Windows | Windows 11 (ARM64), 1280x800, Edge | [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) |
+| Windows | Windows 11 (ARM64), 1280x800, Edge | [cua-driver](https://github.com/trycua/cua) (over SSH; Windows-MCP on images built by 0.1.0) |
 | Ubuntu | Ubuntu 24.04 or another release, XFCE on X11, 1280x800, Google Chrome | [cua-driver](https://github.com/trycua/cua) (over SSH) |
 
 [AGENTS.md](AGENTS.md) has usage tips for agents.
@@ -286,7 +285,7 @@ Each image records what it is (`agentpc image info <image>`):
   "base": "Windows 11 25H2 (Home/Pro) ISO, ARM64, en-us",
   "built": "20260927",
   "agentpc": "0.1.0",
-  "desktop_server": "Windows-MCP 0.8.5",
+  "desktop_server": "cua-driver 0.30.1",
   "iso_sha256": "32cde007…"
 }
 ```
@@ -314,7 +313,7 @@ moves to its new ports the next time it starts):
 | Port | Use |
 | --- | --- |
 | `47000 + n` | SSH |
-| `47100 + n` | Windows-MCP (Windows VMs) |
+| `47100 + n` | Windows-MCP (Windows images built by 0.1.0) |
 | `47200 + n` | noVNC WebSocket (for the viewer) |
 | `47300 + n` | VNC |
 | `8100` | Browser viewer, shared by all VMs |
@@ -348,10 +347,10 @@ The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
   compressed qcow2 split into 64 MB parts, downloaded in parallel and checksum-verified.
 - **Windows build.** agentpc writes a small setup disk next to the ISO: an unattended-install
   answer file (adapted from [dockur/windows-arm](https://github.com/dockur/windows-arm)), Red
-  Hat's ARM64 virtio drivers, and a first-logon script that installs OpenSSH and Windows-MCP.
+  Hat's ARM64 virtio drivers, and a first-logon script that installs OpenSSH and cua-driver.
   Windows Setup then runs in QEMU with no clicks.
 - **Ubuntu build.** The official cloud image is provisioned with cloud-init: XFCE on X11,
-  auto-login, and cua-driver (pinned, like Windows-MCP, so tool names match these docs). cloud-init is then disabled so clones don't re-provision.
+  auto-login, and cua-driver (pinned, so tool names match these docs). cloud-init is then disabled so clones don't re-provision.
 - **Agent-ready guests.** Each time a snapshot is captured, a prepare script turns off what
   interrupts unattended work (Windows SmartScreen, updates, first-run and tip pop-ups; Ubuntu's
   background apt jobs) and installs Google Chrome on Ubuntu for cua-driver's browser tools.

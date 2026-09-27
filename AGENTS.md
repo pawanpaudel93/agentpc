@@ -28,9 +28,11 @@ can run `agentpc mcp-install` (or install first: see README.md).
 Work in a loop: look (`take_screenshot` or a snapshot tool) → act (`use_desktop_tool`) → look again to
 verify. Prefer `run_command` for anything a shell can do; use `use_desktop_tool` for GUI-only work.
 
-**Windows** (desktop tools from Windows-MCP): call `Snapshot` first for element labels and
-coordinates. `Click` takes `loc: [x, y]`; `Type` needs `loc` or `label`; `App` with
-`mode: "launch"` opens programs by name; `Shortcut` sends key combos.
+**Windows** (desktop tools from cua-driver): `launch_app` takes a name such as `notepad` and
+returns the `pid` and `window_id`s. `get_window_state(pid, window_id)` returns numbered elements
+and a `snapshot_id`; `click`/`type_text` take `snapshot_id` with `element_index`. Windows images
+built by agentpc 0.1.0 use Windows-MCP instead: call `Snapshot` first, `Click` takes
+`loc: [x, y]`, `Type` needs `loc` or `label`.
 
 **Ubuntu** (desktop tools from cua-driver, XFCE on X11): `get_desktop_state` returns a
 screenshot plus window pid/window_id values to pass to other tools. Keyboard and mouse
@@ -79,7 +81,7 @@ Rules:
 - Rust, single binary `agentpc` (CLI + MCP server). `src/main.rs` is the CLI; modules:
   `instance` (VMs, images, on-disk layout), `qemu`, `ops` (lifecycle),
   `viewer` (browser viewer), `image` (build/snapshot), `registry` (pull/push), `setup` (`doctor`, `mcp-install`, `clean`, `uninstall`), `update` (self-update), `mcp` (the server).
-- Ports derive from the instance slot n: SSH 47000+n, Windows-MCP 47100+n, noVNC websocket
+- Ports derive from the instance slot n: SSH 47000+n, Windows-MCP (0.1.0 images) 47100+n, noVNC websocket
   47200+n, VNC 47300+n; the shared browser viewer is on 8100.
 - Guest assets in `guests/` are embedded in the binary. A Windows build writes them to a
   FAT `setup.img`: `Autounattend.xml` drives Setup, `SetupComplete.cmd` runs after it, and

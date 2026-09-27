@@ -193,13 +193,28 @@ pub fn ssh(inst: &Instance, remote: &str) -> Result<Output> {
         .context("run ssh")
 }
 
+/// Where the cua-driver installer puts the binary on Windows (as the `agent` user).
+pub const WINDOWS_CUA_DRIVER: &str =
+    r"$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin\cua-driver.exe";
+
 /// Desktop session up and its control server answering.
 pub fn ready(inst: &Instance) -> bool {
     match inst.os {
+        // Images built before cua-driver shipped run Windows-MCP over HTTP instead.
         Os::Windows => {
-            ssh(inst, r"Test-Path C:\OEM\done.txt")
-                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("True"))
-                && http_responds(inst.mcp_port())
+            let probe = format!(
+                r#"if (-not (Test-Path C:\OEM\done.txt)) {{ 'wait' }}
+elseif (-not (Test-Path "{WINDOWS_CUA_DRIVER}")) {{ 'http' }}
+elseif ((& "{WINDOWS_CUA_DRIVER}" status 2>&1 | Out-String) -match 'daemon is running') {{ 'ready' }}"#
+            );
+            match ssh(inst, &probe) {
+                Ok(o) => match String::from_utf8_lossy(&o.stdout).trim() {
+                    "ready" => true,
+                    "http" => http_responds(inst.mcp_port()),
+                    _ => false,
+                },
+                Err(_) => false,
+            }
         }
         Os::Ubuntu => ssh(
             inst,
