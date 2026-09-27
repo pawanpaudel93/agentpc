@@ -161,7 +161,7 @@ pick the server up automatically.
 | `checkpoint_vm` / `restore_vm` | Save a VM's disk and memory under a label; go back to it in seconds |
 | `delete_vm` | Delete a VM with its disk and checkpoints |
 | `take_screenshot` | PNG screenshot from the hypervisor |
-| `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu); returns exit code, stdout and stderr |
+| `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu); returns exit code, stdout and stderr. `background: true` starts servers and long jobs that keep running |
 | `upload_file` / `download_file` | Copy files or folders between your Mac and a VM |
 | `forward_port` | Reach a server running in a VM from your Mac |
 | `list_desktop_tools` | List the desktop-control tools inside a VM |
@@ -387,13 +387,16 @@ describes the code layout for contributors and coding agents.
 <details>
 <summary>Releasing (maintainers)</summary>
 
-1. Bump `version` in `Cargo.toml`, commit, then tag and push `vX.Y.Z`. The release workflow
-   builds the binary tarball and the MCP bundle (`agentpc-X.Y.Z.mcpb`), with `.sha256` files
-   and a filled-in `server.json`, and attaches them to the GitHub Release.
+1. On an up-to-date, clean `main`, run `scripts/release.sh X.Y.Z` (needs `gh` logged in,
+   Node for `npx`, and `jq`). It sets the version everywhere, runs the CI checks, builds
+   `dist/` (binary tarball, MCP bundle `agentpc-X.Y.Z.mcpb`, their `.sha256` files and a
+   filled-in `server.json`), then asks before it commits `chore: release vX.Y.Z`, tags
+   `vX.Y.Z`, pushes `main` and the tag, and creates the GitHub Release with those assets.
+   `--dry-run` stops after building `dist/` and reverts the version edits.
 2. Publish the Ubuntu image: `agentpc image build ubuntu`, `oras login ghcr.io`, then
    `agentpc image push ubuntu`. Make the ghcr.io package public once in its package settings.
-3. Publish to the MCP Registry: download the release's `server.json` over the repo copy, then
-   `brew install mcp-publisher`, `mcp-publisher login github`, `mcp-publisher publish`.
+3. Publish to the MCP Registry: copy `dist/server.json` over the repo copy (don't commit it),
+   then `brew install mcp-publisher`, `mcp-publisher login github`, `mcp-publisher publish`.
 
 </details>
 

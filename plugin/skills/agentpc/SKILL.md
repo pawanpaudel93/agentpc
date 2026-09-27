@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` | Save the VM's disk and memory; go back to exactly that state in seconds |
 | `delete_vm(name)` | Delete a VM with its disk and checkpoints |
 | `take_screenshot(name)` | PNG screenshot; works even while booting or hung |
-| `run_command(name, command)` | Shell command: PowerShell on Windows, bash on Ubuntu. Returns `exit code: N` plus stdout and stderr; each is trimmed to its first and last 10,000 characters |
+| `run_command(name, command, background?)` | Shell command: PowerShell on Windows, bash on Ubuntu. Returns `exit code: N` plus stdout and stderr; each is trimmed to its first and last 10,000 characters. `background: true` keeps it running after the call (servers, long jobs) and says where its output goes |
 | `upload_file` / `download_file` | Copy files or folders between this Mac and a VM |
 | `forward_port(name, guest_port)` | Reach a server running in the VM at `127.0.0.1:<port>` on the Mac |
 | `list_desktop_tools(name, tool?)` | List the GUI tools inside a VM, or one tool's full schema |
@@ -55,8 +55,8 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 - `Click` takes `loc: [x, y]`; `Type` needs `loc` or `label`.
 - `App` with `mode: "launch"` opens programs by name; `Shortcut` sends key combinations.
 - `run_command` runs PowerShell as the `agent` administrator. The screen is 1280x800.
-- Processes started over `run_command` end when the command returns; start long-running servers
-  with a scheduled task, and open the Windows firewall for ports you `forward_port`.
+- Processes started over `run_command` end when the command returns: start servers and GUI apps
+  with `background: true`, and open the Windows firewall for ports you `forward_port`.
 - SmartScreen, Windows Update and first-run pop-ups are turned off. Edge is the browser.
 - It's a clean install: no Visual C++ redistributable, no .NET (only .NET Framework 4.8.1),
   no PowerShell 7. A missing `VCRUNTIME140.dll` means the app under test doesn't ship its

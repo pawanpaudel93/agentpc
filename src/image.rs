@@ -75,6 +75,12 @@ const WIN_OEM: [(&str, &[u8]); 2] = [
 ];
 
 pub fn build(image: &Image, iso: Option<PathBuf>) -> Result<()> {
+    let _lock = crate::instance::image_lock()?;
+    build_locked(image, iso)
+}
+
+/// `build`, for a caller already holding the image lock.
+pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     let os = image.os;
     if !image.instances()?.is_empty() {
         bail!("VMs of {image} depend on it; rm them first");
@@ -114,13 +120,19 @@ pub fn build(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     info.built = crate::instance::local_date();
     promote_image(&inst)?;
     write_info(image, &info)?;
-    snapshot(image)
+    snapshot_locked(image)
 }
 
 /// Capture the image's snapshot: boot the image once, let the desktop
 /// settle, then save RAM and flatten the disk as it was at that instant. Clones of it
 /// resume in about a second instead of booting.
 pub fn snapshot(image: &Image) -> Result<()> {
+    let _lock = crate::instance::image_lock()?;
+    snapshot_locked(image)
+}
+
+/// `snapshot`, for a caller already holding the image lock.
+pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
     let os = image.os;
     if !image.exists() {
         bail!("no {image} image; run: agentpc image build {image}");

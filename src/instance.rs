@@ -389,16 +389,39 @@ const IMAGE_FILES: [&str; 6] = [
 /// Held while a VM claims its slot and name, so parallel creates get different ones.
 /// Released when the returned file is dropped.
 pub fn creation_lock() -> Result<std::fs::File> {
+    lock(&instances_dir().join(".lock"), None)
+}
+
+/// Held while an image is built, downloaded or snapshotted: they all run in slot 0 and
+/// write the image's files. A second one waits. Not reentrant: take it once per command.
+pub fn image_lock() -> Result<std::fs::File> {
+    lock(
+        &images_dir().join(".lock"),
+        Some("waiting for another image build or download to finish"),
+    )
+}
+
+fn lock(path: &Path, waiting: Option<&str>) -> Result<std::fs::File> {
     use std::os::fd::AsRawFd;
-    std::fs::create_dir_all(instances_dir())?;
-    let f = std::fs::File::create(instances_dir().join(".lock"))?;
-    // SAFETY: flock(2) on a descriptor we own; LOCK_EX = 2.
-    if unsafe { flock(f.as_raw_fd(), 2) } != 0 {
-        bail!(
-            "lock {}: {}",
-            instances_dir().display(),
-            std::io::Error::last_os_error()
-        );
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let f = std::fs::File::create(path)?;
+    // SAFETY: flock(2) on a descriptor we own.
+    if unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        if let Some(msg) = waiting {
+            crate::log!("{msg}");
+        }
+        // SAFETY: as above.
+        if unsafe { flock(f.as_raw_fd(), LOCK_EX) } != 0 {
+            bail!(
+                "lock {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
     }
     Ok(f)
 }

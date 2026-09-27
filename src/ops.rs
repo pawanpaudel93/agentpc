@@ -299,10 +299,15 @@ pub fn create(
 fn provision_image(image: &Image) -> Result<()> {
     match image.os {
         Os::Ubuntu => {
+            let _lock = crate::instance::image_lock()?;
+            // Another create may have fetched it while this one waited for the lock.
+            if image.exists() {
+                return Ok(());
+            }
             log!("no {image} image yet; downloading it");
-            if let Err(e) = crate::registry::pull(image) {
+            if let Err(e) = crate::registry::pull_locked(image) {
                 log!("download failed ({e:#}); building it locally instead (~3 min)");
-                crate::image::build(image, None)?;
+                crate::image::build_locked(image, None)?;
             }
             Ok(())
         }

@@ -124,6 +124,12 @@ pub fn push(image: &Image) -> Result<()> {
 
 /// Download an image, then capture its RAM snapshot locally.
 pub fn pull(image: &Image) -> Result<()> {
+    let _lock = crate::instance::image_lock()?;
+    pull_locked(image)
+}
+
+/// `pull`, for a caller already holding the image lock.
+pub(crate) fn pull_locked(image: &Image) -> Result<()> {
     if image.os == Os::Windows {
         bail!(
             "Windows images aren't published (Microsoft license); run: agentpc image build {image}"
@@ -133,7 +139,7 @@ pub fn pull(image: &Image) -> Result<()> {
         bail!("VMs of {image} depend on its current copy; rm them first");
     }
     tokio::runtime::Runtime::new()?.block_on(download(image))?;
-    image::snapshot(image)
+    image::snapshot_locked(image)
 }
 
 struct Ref {

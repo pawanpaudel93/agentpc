@@ -111,8 +111,13 @@ struct CheckpointArgs {
 struct ExecArgs {
     name: String,
     command: String,
+    /// Seconds to wait for the command (default 120). Ignored with `background`.
     #[serde(default = "default_timeout")]
     timeout: u64,
+    /// Start the command detached and return at once, for servers and long jobs: it keeps
+    /// running after this call. Returns where its output goes and how to stop it.
+    #[serde(default)]
+    background: bool,
 }
 
 fn default_timeout() -> u64 {
@@ -268,9 +273,14 @@ impl Gateway {
     #[tool(
         description = "Run a shell command in the instance over SSH: PowerShell on windows, bash on ubuntu.\n\
                           Returns the exit code, stdout and stderr; each stream is trimmed to its first and\n\
-                          last 10,000 characters (write big output to a file and download_file it)."
+                          last 10,000 characters (write big output to a file and download_file it).\n\
+                          With background: true the command keeps running after the call (servers, long\n\
+                          jobs); the reply says where its output goes and how to stop it."
     )]
     async fn run_command(&self, Parameters(a): Parameters<ExecArgs>) -> CallToolResult {
+        if a.background {
+            return text(exec_background(&a.name, &a.command).await);
+        }
         text(exec(&a.name, &a.command, a.timeout).await)
     }
 
@@ -518,6 +528,47 @@ async fn exec(name: &str, command: &str, timeout: u64) -> Result<String> {
         bail!("{text}");
     }
     Ok(text)
+}
+
+/// Start `command` detached from the SSH session, which would otherwise take it down when it
+/// ends. On Windows that means a scheduled task in the logged-in session (so GUI apps show).
+/// The command travels base64-encoded, so no quoting can break it.
+async fn exec_background(name: &str, command: &str) -> Result<String> {
+    use base64::Engine;
+    let inst = load(name)?;
+    if !inst.running() {
+        bail!("{name} is stopped; call start_vm first");
+    }
+    let id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(command);
+    let script = match inst.os {
+        // Separate lines: `a && b &` would background the whole list, and that shell would
+        // hold the SSH session open.
+        Os::Ubuntu => format!(
+            "d=~/agentpc-bg; mkdir -p $d && echo {b64} | base64 -d > $d/{id}.sh || exit 1\n\
+             {env} setsid nohup bash $d/{id}.sh > $d/{id}.log 2>&1 < /dev/null &\n\
+             echo \"started in the background (pid $!); output: $HOME/agentpc-bg/{id}.log. \
+             Read it with: tail -n 50 ~/agentpc-bg/{id}.log. Stop it with: kill $!\"",
+            env = ops::UBUNTU_SESSION_ENV
+        ),
+        Os::Windows => format!(
+            r#"$d = "$env:USERPROFILE\agentpc-bg"; New-Item -ItemType Directory -Force $d | Out-Null
+$ps = "$d\{id}.ps1"; $log = "$d\{id}.log"; $task = 'agentpc-bg-{id}'
+[IO.File]::WriteAllText($ps, [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')))
+$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"& '$ps' *> '$log'`""
+$p = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName $task -Action $a -Principal $p -Settings $s -Force | Out-Null
+Start-ScheduledTask -TaskName $task
+"started in the background as scheduled task $task; output: $log. Read it with: Get-Content '$log' -Tail 50. Stop it with: Stop-ScheduledTask $task (and Stop-Process for anything it started)""#
+        ),
+    };
+    let out = exec(name, &script, 60).await?;
+    Ok(out
+        .split_once("--- stdout ---\n")
+        .map_or(out.clone(), |(_, s)| s.trim().to_string()))
 }
 
 /// Keep the first and last `keep` characters of `s`, noting how much was cut.

@@ -28,7 +28,7 @@
     { "name": "restore_vm", "description": "Put a VM back exactly as it was at a checkpoint (resumes in seconds)" },
     { "name": "delete_vm", "description": "Stop and delete an instance with its disk and checkpoints" },
     { "name": "take_screenshot", "description": "Hypervisor screenshot of an instance" },
-    { "name": "run_command", "description": "Run a shell command (PowerShell on Windows, bash on Ubuntu); returns the exit code, stdout and stderr" },
+    { "name": "run_command", "description": "Run a shell command (PowerShell on Windows, bash on Ubuntu); returns the exit code, stdout and stderr, or runs it in the background" },
     { "name": "upload_file", "description": "Copy a file or folder from this Mac into a VM" },
     { "name": "download_file", "description": "Copy a file or folder from a VM to this Mac" },
     { "name": "forward_port", "description": "Reach a server running in a VM from this Mac" },
