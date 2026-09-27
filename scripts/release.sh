@@ -174,6 +174,27 @@ jq --arg v "$VERSION" --arg url "https://github.com/$REPO/releases/download/$TAG
 
 ASSETS="dist/$NAME.tar.gz dist/$NAME.tar.gz.sha256 dist/$MCPB dist/$MCPB.sha256 dist/server.json"
 
+# --- release notes ----------------------------------------------------------
+# gh's --generate-notes lists merged PRs, and this repo commits straight to main, so build
+# the notes from the Conventional Commit subjects since the previous tag instead.
+say "Writing dist/NOTES.md"
+PREV=$(git describe --tags --abbrev=0 2>/dev/null || true)
+RANGE=${PREV:+$PREV..}HEAD
+section() { # section TITLE REGEX: one bullet per matching subject, prefix stripped
+  lines=$(git log --no-merges --format=%s "$RANGE" | grep -E "$2" | grep -v '^chore: release' |
+    sed -E 's/^[a-z]+(\([^)]*\))?!?: /- /') || true
+  [ -z "$lines" ] || printf '### %s\n\n%s\n\n' "$1" "$lines"
+}
+{
+  printf 'Install or upgrade:\n\n```sh\ncurl -fsSL https://raw.githubusercontent.com/%s/main/install.sh | sh\n```\n\n' "$REPO"
+  section "Features" '^feat(\(|!|:)'
+  section "Fixes" '^fix(\(|!|:)'
+  section "Performance" '^perf(\(|!|:)'
+  section "Docs" '^docs(\(|!|:)'
+  section "Other" '^(refactor|build|ci|test|chore)(\(|!|:)'
+  [ -z "$PREV" ] || printf '**Full changelog**: https://github.com/%s/compare/%s...%s\n' "$REPO" "$PREV" "$TAG"
+} >"$DIST/NOTES.md"
+
 # --- publish ---------------------------------------------------------------
 cat <<EOF
 
@@ -181,7 +202,7 @@ Ready to publish $TAG:
   commit  "chore: release $TAG"  ($VERSION_FILES; skipped if unchanged)
   tag     $TAG (annotated)
   push    git push origin main && git push origin $TAG
-  release gh release create $TAG --repo $REPO --generate-notes
+  release gh release create $TAG --repo $REPO --notes-file dist/NOTES.md
           $ASSETS
 EOF
 
@@ -215,8 +236,8 @@ git push origin "$TAG" || die "push of $TAG failed; retry: git push origin $TAG"
 
 say "Creating GitHub Release $TAG"
 # shellcheck disable=SC2086
-gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" --generate-notes $ASSETS ||
-  die "release failed; retry: gh release create $TAG --repo $REPO --verify-tag --title $TAG --generate-notes $ASSETS"
+gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" --notes-file "$DIST/NOTES.md" $ASSETS ||
+  die "release failed; retry: gh release create $TAG --repo $REPO --verify-tag --title $TAG --notes-file dist/NOTES.md $ASSETS"
 
 cat <<EOF
 
