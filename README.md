@@ -343,7 +343,7 @@ The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
   desktop tool call gives up after 120 s, and a viewer that won't start no longer fails a VM
   start. The browser viewer (noVNC) is downloaded against a pinned checksum.
 - **Image distribution.** Ubuntu images are OCI artifacts on GitHub Container Registry: a
-  compressed qcow2 split into 512 MB parts, downloaded in parallel and checksum-verified.
+  compressed qcow2 split into 64 MB parts, downloaded in parallel and checksum-verified.
 - **Windows build.** agentpc writes a small setup disk next to the ISO: an unattended-install
   answer file (adapted from [dockur/windows-arm](https://github.com/dockur/windows-arm)), Red
   Hat's ARM64 virtio drivers, and a first-logon script that installs OpenSSH and Windows-MCP.

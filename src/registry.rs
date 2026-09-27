@@ -24,7 +24,9 @@ const ARTIFACT_TYPE: &str = "application/vnd.agentpc.image.v1";
 const CONFIG_TYPE: &str = "application/vnd.agentpc.image.config.v1+json";
 const PART_TYPE: &str = "application/vnd.agentpc.disk.qcow2.part";
 const VARS_TYPE: &str = "application/vnd.agentpc.efi-vars";
-const PART_SIZE: &str = "512m";
+// Small parts: on a flaky uplink a timeout costs one part, and retries skip parts already pushed.
+const PART_SIZE: &str = "64m";
+const PUSH_ATTEMPTS: u32 = 5;
 const PARALLEL_DOWNLOADS: usize = 6;
 
 /// One package for all images, tagged by image name (`<repo>:ubuntu-24.04`).
@@ -114,11 +116,21 @@ pub fn push(image: &Image) -> Result<()> {
         cmd.arg("--plain-http");
     }
     log!("pushing {} ({} parts)", reference(&tags[0]), parts.len());
-    let st = cmd.status().context("run oras")?;
-    std::fs::remove_dir_all(&work)?;
-    if !st.success() {
-        bail!("oras push failed (log in first: oras login ghcr.io)");
+    // oras skips blobs the registry already has, so a retry only re-sends what failed.
+    let mut attempt = 1;
+    while !cmd.status().context("run oras")?.success() {
+        if attempt == PUSH_ATTEMPTS {
+            bail!(
+                "oras push failed {PUSH_ATTEMPTS} times; the parts are kept in {} \
+                 (check the network, or log in with: oras login {host})",
+                work.display()
+            );
+        }
+        attempt += 1;
+        log!("push failed; retrying ({attempt}/{PUSH_ATTEMPTS})");
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
+    std::fs::remove_dir_all(&work)?;
     log!("pushed {} as :{}", info.version, tags.join(", :"));
     Ok(())
 }
