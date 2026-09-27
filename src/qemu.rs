@@ -79,7 +79,35 @@ pub fn start_resumed(inst: &Instance, state: &Path) -> Result<()> {
 /// Migration flushes the disks, so the disk image matches the saved state.
 pub fn save_state(inst: &Instance, out: &Path) -> Result<()> {
     let mut q = Qmp::connect(inst)?;
+    pause_and_save(inst, &mut q, out)?;
+    let _ = q.execute("quit", None);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while inst.running() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// Like `save_state`, but the VM runs on: `copy_disk` runs while it is still paused, so
+/// the disk it copies matches the saved RAM.
+pub fn checkpoint(
+    inst: &Instance,
+    out: &Path,
+    copy_disk: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let mut q = Qmp::connect(inst)?;
+    let saved = pause_and_save(inst, &mut q, out).and_then(|()| copy_disk());
+    q.execute("cont", None)?;
+    saved
+}
+
+fn pause_and_save(inst: &Instance, q: &mut Qmp, out: &Path) -> Result<()> {
     q.execute("stop", None)?;
+    // QEMU caps migration at 128 MiB/s, meant for networks; a local file needs no cap.
+    q.execute(
+        "migrate-set-parameters",
+        Some(json!({ "max-bandwidth": 1u64 << 40 })),
+    )?;
     q.execute(
         "migrate",
         Some(json!({ "uri": format!("file:{}", out.display()) })),
@@ -88,7 +116,7 @@ pub fn save_state(inst: &Instance, out: &Path) -> Result<()> {
     loop {
         let st = q.execute("query-migrate", None)?;
         match st["status"].as_str().unwrap_or("") {
-            "completed" => break,
+            "completed" => return Ok(()),
             "failed" | "cancelled" => bail!(
                 "saving {} failed: {}",
                 inst.name,
@@ -98,12 +126,6 @@ pub fn save_state(inst: &Instance, out: &Path) -> Result<()> {
             _ => std::thread::sleep(Duration::from_millis(100)),
         }
     }
-    let _ = q.execute("quit", None);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while inst.running() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Ok(())
 }
 
 fn launch(
@@ -115,16 +137,18 @@ fn launch(
     let d = &inst.dir;
     let _ = std::fs::remove_file(inst.qmp_socket());
     let mut fwd = format!("hostfwd=tcp:127.0.0.1:{}-:22", inst.ssh_port());
-    let mut args: Vec<String> = vec![];
+    let (mem, cpus) = inst.size();
+    let mut args: Vec<String> = vec![
+        "-smp".into(),
+        cpus.to_string(),
+        "-m".into(),
+        format!("{mem}G"),
+    ];
     match inst.os {
         Os::Windows => {
             fwd += &format!(",hostfwd=tcp:127.0.0.1:{}-:8000", inst.mcp_port());
             args.extend(
                 [
-                    "-smp",
-                    "4",
-                    "-m",
-                    "8G",
                     "-device",
                     // ramfb's firmware driver tops out at 1024x768; Windows ships a
                     // virtio-gpu driver (viogpudo) from the setup disk.
@@ -150,7 +174,7 @@ fn launch(
             );
         }
         Os::Ubuntu => {
-            args.extend(["-smp", "4", "-m", "4G", "-device", "virtio-gpu-pci"].map(String::from));
+            args.extend(["-device", "virtio-gpu-pci"].map(String::from));
             args.push("-drive".into());
             args.push(format!(
                 "file={},if=virtio,format=qcow2,discard=unmap,cache=writeback",

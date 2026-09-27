@@ -14,8 +14,9 @@ can run `agentpc mcp-install` (or install first: see README.md).
 | `list_vms` | VMs, their state, and the images (with OS version) they come from. Start here. |
 | `create_vm(os, version?, name?)` | New clone: ubuntu ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready. |
 | `start_vm` / `stop_vm` / `reset_vm` / `delete_vm` | Lifecycle. `reset_vm` = back to a clean install. |
+| `checkpoint_vm(name, label)` / `restore_vm(name, label)` | Save disk + memory before a risky step; restore in seconds. |
 | `take_screenshot(name)` | Hypervisor screenshot; works even while booting or hung. |
-| `run_command(name, command)` | Shell over SSH: PowerShell on windows, bash on ubuntu. |
+| `run_command(name, command)` | Shell over SSH: PowerShell on windows, bash on ubuntu. Returns exit code, stdout, stderr (long output trimmed). |
 | `upload_file` / `download_file` | Copy files or folders between the Mac and a VM. |
 | `forward_port(name, guest_port)` | Reach a server in the VM at `127.0.0.1:<port>` on the Mac. |
 | `list_desktop_tools(name, tool?)` | Desktop-control tools in that VM, or one tool's full schema. |

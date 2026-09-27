@@ -30,7 +30,8 @@ const INSTRUCTIONS: &str = "\
 Controls disposable Windows and Ubuntu desktop VMs on this Mac.
 
 Typical flow: list_vms -> create_vm (or start_vm) -> take_screenshot -> list_desktop_tools ->
-use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance to a clean state.
+use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance to a clean state;
+checkpoint_vm/restore_vm save and return to any point in seconds (disk and memory).
 Windows desktop tools come from Windows-MCP (call Snapshot first; Click/Type need a loc
 [x, y] or label). Ubuntu desktop tools come from cua-driver (keyboard/mouse input needs
 \"delivery_mode\": \"foreground\"). run_command runs PowerShell on Windows and bash on Ubuntu.
@@ -92,6 +93,18 @@ struct CreateArgs {
     /// installed Windows 11 image if 25H2 isn't built.
     version: Option<String>,
     name: Option<String>,
+    /// Memory in GB (default 8 on Windows, 4 on Ubuntu). A non-default size boots cold
+    /// (~25 s Windows, ~15 s Ubuntu) instead of resuming the image's snapshot.
+    memory_gb: Option<u32>,
+    /// CPUs (default 4). A non-default count boots cold, like memory_gb.
+    cpus: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CheckpointArgs {
+    name: String,
+    /// Letters, digits, `.`, `-` and `_`, e.g. "deps-installed".
+    label: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -160,6 +173,7 @@ impl Gateway {
                     json!({
                         "name": i.name, "os": i.os, "image": i.image.to_string(), "state": if i.running() { "running" } else { "stopped" },
                         "slot": i.slot, "viewer": viewer::url(i), "ssh_port": i.ssh_port(),
+                        "checkpoints": ops::checkpoints(i),
                     })
                 })
                 .collect();
@@ -197,7 +211,12 @@ impl Gateway {
                     Some(v) => format!("{os}-{v}"),
                     None => os.to_string(),
                 };
-                ops::create(&Image::resolve(&name)?, a.name.as_deref())
+                ops::create(
+                    &Image::resolve(&name)?,
+                    a.name.as_deref(),
+                    a.memory_gb,
+                    a.cpus,
+                )
             })
             .await,
         )
@@ -226,6 +245,36 @@ impl Gateway {
     }
 
     #[tool(
+        description = "Save the instance's disk and memory under a label (replacing an older one of that\n\
+                          name). A running VM pauses for a few seconds and carries on. Use before a risky\n\
+                          step; restore_vm returns to it in seconds."
+    )]
+    async fn checkpoint_vm(&self, Parameters(a): Parameters<CheckpointArgs>) -> CallToolResult {
+        text(
+            async {
+                let inst = load(&a.name)?;
+                blocking(move || ops::checkpoint(&inst, &a.label)).await
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Put the instance back exactly as it was at a checkpoint and start it (resumes in\n\
+                          seconds). Port forwards must be set up again."
+    )]
+    async fn restore_vm(&self, Parameters(a): Parameters<CheckpointArgs>) -> CallToolResult {
+        self.drop_session(&a.name);
+        text(
+            async {
+                let inst = load(&a.name)?;
+                blocking(move || ops::restore(&inst, &a.label)).await
+            }
+            .await,
+        )
+    }
+
+    #[tool(
         description = "Screenshot the instance's display from the hypervisor. Works at any time, even while\n\
                           booting or when the desktop server is unresponsive."
     )]
@@ -244,7 +293,8 @@ impl Gateway {
 
     #[tool(
         description = "Run a shell command in the instance over SSH: PowerShell on windows, bash on ubuntu.\n\
-                          Returns combined stdout and stderr."
+                          Returns the exit code, stdout and stderr; each stream is trimmed to its first and\n\
+                          last 10,000 characters (write big output to a file and download_file it)."
     )]
     async fn run_command(&self, Parameters(a): Parameters<ExecArgs>) -> CallToolResult {
         text(exec(&a.name, &a.command, a.timeout).await)
@@ -466,6 +516,9 @@ async fn connect(name: &str) -> Result<RunningService<RoleClient, ()>> {
         .with_context(|| format!("cannot reach the desktop server in {name}"))
 }
 
+/// Characters kept from each end of a long stdout or stderr.
+const OUTPUT_KEEP: usize = 10_000;
+
 async fn exec(name: &str, command: &str, timeout: u64) -> Result<String> {
     let inst = load(name)?;
     let out = tokio::process::Command::new("ssh")
@@ -477,23 +530,34 @@ async fn exec(name: &str, command: &str, timeout: u64) -> Result<String> {
         .await
         .map_err(|_| anyhow!("command timed out after {timeout}s"))?
         .context("run ssh")?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let text = text.trim();
-    if !out.status.success() {
-        bail!(
-            "{}",
-            if text.is_empty() {
-                format!("command failed ({})", out.status)
-            } else {
-                text.to_string()
-            }
-        );
+    // ssh exits 255 when it can't connect; the command's own code otherwise.
+    let code = out.status.code().unwrap_or(-1);
+    let mut text = format!("exit code: {code}");
+    for (label, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+        let s = String::from_utf8_lossy(bytes);
+        let s = s.trim_end();
+        if !s.is_empty() {
+            text += &format!("\n--- {label} ---\n{}", clip(s, OUTPUT_KEEP));
+        }
     }
-    Ok(text.to_string())
+    if code != 0 {
+        bail!("{text}");
+    }
+    Ok(text)
+}
+
+/// Keep the first and last `keep` characters of `s`, noting how much was cut.
+fn clip(s: &str, keep: usize) -> String {
+    let n = s.chars().count();
+    if n <= 2 * keep {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(keep).collect();
+    let tail: String = s.chars().skip(n - keep).collect();
+    format!(
+        "{head}\n[... {} characters omitted ...]\n{tail}",
+        n - 2 * keep
+    )
 }
 
 fn load(name: &str) -> Result<Instance> {
@@ -516,5 +580,24 @@ fn reply(r: Result<Vec<ContentBlock>>) -> CallToolResult {
     match r {
         Ok(content) => CallToolResult::success(content),
         Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn clips_long_output_keeping_both_ends() {
+        assert_eq!(super::clip("short", 10), "short");
+        let long: String = (0..100)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let c = super::clip(&long, 10);
+        assert!(
+            c.starts_with(&long[..10]) && c.ends_with(&long[90..]),
+            "{c}"
+        );
+        assert!(c.contains("[... 80 characters omitted ...]"), "{c}");
+        // Multi-byte characters are counted, not split.
+        assert_eq!(super::clip(&"é".repeat(30), 10).matches('é').count(), 20);
     }
 }

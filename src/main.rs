@@ -42,6 +42,12 @@ enum Cmd {
         /// ubuntu, windows, or a version: ubuntu-22.04, windows-11-23h2 (see image build --help)
         image: String,
         name: Option<String>,
+        /// Memory in GB (default 8 Windows, 4 Ubuntu); a non-default size cold-boots
+        #[arg(long)]
+        memory: Option<u32>,
+        /// CPUs (default 4); a non-default count cold-boots
+        #[arg(long)]
+        cpus: Option<u32>,
     },
     /// List VMs and images
     List,
@@ -55,6 +61,16 @@ enum Cmd {
     Reset { name: String },
     /// Delete a VM and its disk
     Rm { name: String },
+    /// Save a VM's disk and memory under a label (a running VM pauses for a few seconds)
+    Checkpoint {
+        name: String,
+        label: String,
+        /// Delete the checkpoint instead
+        #[arg(long)]
+        delete: bool,
+    },
+    /// Put a VM back exactly as it was at a checkpoint (resumes in seconds)
+    Restore { name: String, label: String },
     /// Shell into a VM, or run a command (PowerShell on Windows, bash on Ubuntu)
     Ssh {
         name: String,
@@ -129,13 +145,36 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::Create { image, name } => out(ops::create(&Image::resolve(&image)?, name.as_deref())),
+        Cmd::Create {
+            image,
+            name,
+            memory,
+            cpus,
+        } => out(ops::create(
+            &Image::resolve(&image)?,
+            name.as_deref(),
+            memory,
+            cpus,
+        )),
         Cmd::List => out(ops::list_table()),
         Cmd::Info { name } => out(Ok(ops::info(&Instance::load(&name)?))),
         Cmd::Start { name } => out(ops::boot(&Instance::load(&name)?)),
         Cmd::Stop { name } => out(ops::stop(&Instance::load(&name)?)),
         Cmd::Reset { name } => out(ops::reset(&Instance::load(&name)?)),
         Cmd::Rm { name } => out(ops::delete(&Instance::load(&name)?)),
+        Cmd::Checkpoint {
+            name,
+            label,
+            delete,
+        } => {
+            let inst = Instance::load(&name)?;
+            out(if delete {
+                ops::delete_checkpoint(&inst, &label)
+            } else {
+                ops::checkpoint(&inst, &label)
+            })
+        }
+        Cmd::Restore { name, label } => out(ops::restore(&Instance::load(&name)?, &label)),
         Cmd::Ssh { name, command } => {
             let inst = Instance::load(&name)?;
             let remote = command.join(" ");

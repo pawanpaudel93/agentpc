@@ -49,6 +49,15 @@ impl Os {
         }
     }
 
+    /// Memory (GB) and CPUs a VM gets unless created with others. Image snapshots are
+    /// captured at this size, and a VM of another size can't resume them.
+    pub fn default_size(self) -> (u32, u32) {
+        match self {
+            Os::Windows => (8, 4),
+            Os::Ubuntu => (4, 4),
+        }
+    }
+
     /// Seconds a cold boot may take before the desktop and its control server answer.
     pub fn boot_timeout(self) -> u64 {
         match self {
@@ -277,6 +286,35 @@ impl Instance {
         Ok(out)
     }
 
+    /// Memory (GB) and CPUs, from `agentpc create --memory/--cpus` or the OS default.
+    pub fn size(&self) -> (u32, u32) {
+        let (mem, cpus) = self.os.default_size();
+        let read = |f: &str, d: u32| {
+            read_trimmed(&self.dir.join(f))
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        (read("memory", mem), read("cpus", cpus))
+    }
+
+    /// Record a non-default size (defaults leave no file, so older VMs keep theirs).
+    pub fn set_size(&self, memory: Option<u32>, cpus: Option<u32>) -> Result<()> {
+        if let Some(m) = memory {
+            if !(2..=64).contains(&m) {
+                bail!("memory must be 2-64 GB");
+            }
+            std::fs::write(self.dir.join("memory"), m.to_string())?;
+        }
+        if let Some(c) = cpus {
+            if !(1..=16).contains(&c) {
+                bail!("cpus must be 1-16");
+            }
+            std::fs::write(self.dir.join("cpus"), c.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn free_slot() -> Result<u16> {
         let used: Vec<u16> = Self::list()?.iter().map(|i| i.slot).collect();
         (1..=50)
@@ -348,6 +386,23 @@ const IMAGE_FILES: [&str; 6] = [
     ".snapshot.state",
 ];
 
+/// Held while a VM claims its slot and name, so parallel creates get different ones.
+/// Released when the returned file is dropped.
+pub fn creation_lock() -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(instances_dir())?;
+    let f = std::fs::File::create(instances_dir().join(".lock"))?;
+    // SAFETY: flock(2) on a descriptor we own; LOCK_EX = 2.
+    if unsafe { flock(f.as_raw_fd(), 2) } != 0 {
+        bail!(
+            "lock {}: {}",
+            instances_dir().display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(f)
+}
+
 /// Rename images from before their names carried the full version, and repoint their clones:
 /// `ubuntu.qcow2` → `ubuntu-24.04.qcow2`, and `windows.qcow2` or `windows-11.qcow2` →
 /// `windows-11-<release>.qcow2`. The release comes from the image's recorded info. Waits
@@ -416,6 +471,7 @@ unsafe extern "C" {
     #[link_name = "kill"]
     fn libc_kill(pid: i32, sig: i32) -> i32;
     fn getuid() -> u32;
+    fn flock(fd: i32, op: i32) -> i32;
     fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
 }
 

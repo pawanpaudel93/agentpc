@@ -27,9 +27,10 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 | `create_vm(os, version?, name?)` | New VM (`ubuntu` or `windows`, optionally a version such as `22.04`); returns when the desktop is ready |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down |
 | `reset_vm(name)` | Discard all changes: back to a clean install |
+| `checkpoint_vm(name, label)` / `restore_vm(name, label)` | Save the VM's disk and memory; go back to exactly that state in seconds |
 | `delete_vm(name)` | Delete a VM |
 | `take_screenshot(name)` | PNG screenshot; works even while booting or hung |
-| `run_command(name, command)` | Shell command: PowerShell on Windows, bash on Ubuntu |
+| `run_command(name, command)` | Shell command: PowerShell on Windows, bash on Ubuntu. Returns `exit code: N` plus stdout and stderr; each is trimmed to its first and last 10,000 characters |
 | `upload_file` / `download_file` | Copy files or folders between this Mac and a VM |
 | `forward_port(name, guest_port)` | Reach a server running in the VM at `127.0.0.1:<port>` on the Mac |
 | `list_desktop_tools(name, tool?)` | List the GUI tools inside a VM, or one tool's full schema |
@@ -40,10 +41,13 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 1. `list_vms`; reuse a running VM of the right OS and version, or `create_vm` one.
 2. Prefer `run_command` for anything a shell can do. It's faster and more reliable than the GUI.
    Use `upload_file` to bring in what you need to test (an installer, a script, a build).
-3. For GUI work, loop: look (`take_screenshot` or a UI-snapshot tool), act (`use_desktop_tool`), then
+3. Before a risky or slow-to-redo step (an installer, a config change), `checkpoint_vm` so
+   `restore_vm` can undo it in seconds instead of rebuilding from `reset_vm`. Port forwards
+   must be set up again after a restore.
+4. For GUI work, loop: look (`take_screenshot` or a UI-snapshot tool), act (`use_desktop_tool`), then
    look again to verify.
-4. Call `list_desktop_tools` once per VM to learn the exact tool names and arguments.
-5. When finished, `delete_vm` VMs you created, unless the user wants to keep them.
+5. Call `list_desktop_tools` once per VM to learn the exact tool names and arguments.
+6. When finished, `delete_vm` VMs you created, unless the user wants to keep them.
 
 ## Windows (desktop tools from Windows-MCP)
 
@@ -73,6 +77,10 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 ## Rules
 
 - VMs are disposable: `reset_vm` a broken one instead of repairing it.
+- For a heavy build, `create_vm` accepts `memory_gb` and `cpus`; a non-default size boots
+  cold (~25 s Windows, ~15 s Ubuntu) instead of resuming in seconds.
+- Output that needs more than 10,000 characters from each end: write it to a file in the VM
+  and `download_file` it.
 - Don't create VMs you won't use. Each running VM uses 4 GB (Ubuntu) or 8 GB (Windows) of RAM.
 - The first `create_vm ubuntu` downloads the Ubuntu image (~1.2 GB). Another Ubuntu release
   (`version: "22.04"`, `"26.04"`, ...) is fetched or built the same way (~3 min).

@@ -24,7 +24,8 @@ $env:Path += ";$uv;$uv\bin"
 
 # Windows-MCP first, so the desktop is drivable before the slow OpenSSH download.
 Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
-& "$uv\uv.exe" tool install windows-mcp --python 3.13
+# Pinned: the skill and docs describe this version's tools. Bump deliberately.
+& "$uv\uv.exe" tool install windows-mcp==0.8.5 --python 3.13
 
 # Must run in the logged-on user's interactive session (a service in Session 0
 # cannot see the desktop); elevated so it can drive admin windows despite UIPI.

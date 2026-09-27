@@ -31,6 +31,8 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 
 - **Instant VMs.** New VMs resume from a saved snapshot of a running desktop: ready in
   ~1 s (Ubuntu) or ~4 s (Windows). `reset` returns a VM to a clean state just as fast.
+- **Checkpoints.** Save a running VM (disk and memory) before a risky step and return to that
+  exact state in seconds.
 - **Real desktops.** Windows 11 (ARM) and Ubuntu 24.04 or another release (XFCE), each with a
   desktop-control server agents can drive: [Windows-MCP](https://github.com/CursorTouch/Windows-MCP)
   and [cua-driver](https://github.com/trycua/cua).
@@ -155,9 +157,10 @@ pick the server up automatically.
 | `create_vm` | Create a VM (optionally of a given version) and wait until its desktop is ready |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down cleanly |
 | `reset_vm` | Discard all changes: back to a fresh copy of the image |
+| `checkpoint_vm` / `restore_vm` | Save a VM's disk and memory under a label; go back to it in seconds |
 | `delete_vm` | Delete a VM and its disk |
 | `take_screenshot` | PNG screenshot from the hypervisor |
-| `run_command` | Run a command: PowerShell on Windows, bash on Ubuntu |
+| `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu); returns exit code, stdout and stderr |
 | `upload_file` / `download_file` | Copy files or folders between your Mac and a VM |
 | `forward_port` | Reach a server running in a VM from your Mac |
 | `list_desktop_tools` | List the desktop-control tools inside a VM |
@@ -176,13 +179,15 @@ pick the server up automatically.
 
 | Command | Description |
 | --- | --- |
-| `agentpc create <image> [name]` | Create a VM from `ubuntu`, `windows` or a version such as `ubuntu-22.04`; fetches Ubuntu images if missing |
+| `agentpc create <image> [name] [--memory GB] [--cpus N]` | Create a VM from `ubuntu`, `windows` or a version such as `ubuntu-22.04`; fetches Ubuntu images if missing. A non-default size boots cold instead of resuming |
 | `agentpc list` | VMs and images |
 | `agentpc info <name>` | Viewer URL, SSH and VNC details |
 | `agentpc start <name>` | Boot a stopped VM |
 | `agentpc stop <name>` | Shut a VM down cleanly (its disk is kept) |
 | `agentpc reset <name>` | Discard all changes: back to a fresh copy of the image |
 | `agentpc rm <name>` | Delete a VM and its disk |
+| `agentpc checkpoint <name> <label> [--delete]` | Save a VM's disk and memory (a running VM pauses ~5 s), or delete a checkpoint |
+| `agentpc restore <name> <label>` | Put a VM back exactly as it was at a checkpoint (resumes in seconds) |
 | `agentpc ssh <name> [command]` | Run a command, or open a shell with no command |
 | `agentpc screenshot <name> [file]` | Save a PNG screenshot |
 | `agentpc cp <src> <dst>` | Copy files; the VM side is `<name>:<path>`, e.g. `agentpc cp app.msi windows-1:Downloads/` |
@@ -304,6 +309,11 @@ The guest login is `agent` / `agent`.
   until the desktop and its control server are running, and saves the VM's memory. New VMs
   resume from that saved state instead of booting (~1 s / ~4 s instead of ~14 s / ~25 s). A
   `start` after `stop` is a normal boot; `reset` resumes a fresh copy again.
+- **Checkpoints.** A checkpoint pauses the VM for a few seconds, writes its memory to a file
+  and clones its disk (an APFS copy-on-write clone, so it costs nothing until the VM writes
+  more). Restoring resumes from them like a new VM does. Each checkpoint of a running VM
+  takes disk space about equal to the memory in use (3–4 GB for Windows); `agentpc checkpoint
+  <name> <label> --delete` removes one, and deleting the VM removes all of them.
 - **Snapshots stay local.** A memory snapshot depends on the Mac's chip and QEMU version, so
   only the disk is published; the snapshot is recaptured after each pull (about a minute).
 - **Image distribution.** Ubuntu images are OCI artifacts on GitHub Container Registry: a
@@ -313,7 +323,7 @@ The guest login is `agent` / `agent`.
   Hat's ARM64 virtio drivers, and a first-logon script that installs OpenSSH and Windows-MCP.
   Windows Setup then runs in QEMU with no clicks.
 - **Ubuntu build.** The official cloud image is provisioned with cloud-init: XFCE on X11,
-  auto-login, and cua-driver. cloud-init is then disabled so clones don't re-provision.
+  auto-login, and cua-driver (pinned, like Windows-MCP, so tool names match these docs). cloud-init is then disabled so clones don't re-provision.
 - **Agent-ready guests.** Each time a snapshot is captured, a prepare script turns off what
   interrupts unattended work (Windows SmartScreen, updates, first-run and tip pop-ups; Ubuntu's
   background apt jobs) and installs Google Chrome on Ubuntu for cua-driver's browser tools.

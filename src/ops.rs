@@ -1,6 +1,6 @@
 //! Instance lifecycle shared by the CLI and the MCP gateway.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
@@ -186,7 +186,8 @@ pub fn wait_ready(inst: &Instance, timeout: Duration) -> Result<Duration> {
 /// can move.
 pub fn clone_disk(inst: &Instance) -> Result<()> {
     let image = &inst.image;
-    let live = image.has_snapshot();
+    // A RAM snapshot only restores into a VM of the size it was captured at.
+    let live = image.has_snapshot() && inst.size() == inst.os.default_size();
     let (base, vars) = if live {
         (image.snapshot_disk(), image.snapshot_vars())
     } else {
@@ -243,21 +244,33 @@ pub fn run(cmd: &str, args: &[&str]) -> Result<()> {
 }
 
 pub fn info(inst: &Instance) -> String {
+    let cps = checkpoints(inst);
+    let cps = if cps.is_empty() {
+        String::new()
+    } else {
+        format!("\n  checkpoints: {}", cps.join(", "))
+    };
     format!(
-        "{} ({}): viewer {}\n  ssh: agentpc ssh {}    vnc: vnc://127.0.0.1:{}    login: agent/agent",
+        "{} ({}): viewer {}\n  ssh: agentpc ssh {}    vnc: vnc://127.0.0.1:{}    login: agent/agent{cps}",
         inst.name,
-        inst.os,
+        inst.image,
         viewer::url(inst),
         inst.name,
         5900 + inst.vnc_display()
     )
 }
 
-pub fn create(image: &Image, name: Option<&str>) -> Result<String> {
+pub fn create(
+    image: &Image,
+    name: Option<&str>,
+    memory: Option<u32>,
+    cpus: Option<u32>,
+) -> Result<String> {
     let os = image.os;
     if !image.exists() {
         provision_image(image)?;
     }
+    let lock = crate::instance::creation_lock()?;
     let slot = Instance::free_slot()?;
     let name = match name {
         Some(n) => n.to_string(),
@@ -273,7 +286,12 @@ pub fn create(image: &Image, name: Option<&str>) -> Result<String> {
         bail!("instance '{name}' exists");
     }
     let inst = Instance::create(&name, image, slot)?;
-    clone_disk(&inst)?;
+    drop(lock);
+    let made = inst.set_size(memory, cpus).and_then(|()| clone_disk(&inst));
+    if let Err(e) = made {
+        let _ = std::fs::remove_dir_all(&inst.dir);
+        return Err(e);
+    }
     boot(&inst)
 }
 
@@ -297,22 +315,30 @@ fn provision_image(image: &Image) -> Result<()> {
 
 /// Start a stopped instance and wait until it's usable.
 pub fn boot(inst: &Instance) -> Result<String> {
+    // Only a clone's first boot can resume: afterwards its disk has moved on from the
+    // saved RAM, so later starts are cold boots.
+    let mut state = None;
+    if !inst.running() && inst.resume_marker().exists() {
+        let _ = std::fs::remove_file(inst.resume_marker());
+        state = Some(inst.image.snapshot_state()).filter(|p| p.is_file());
+    }
+    boot_from(inst, state.as_deref())
+}
+
+/// Start an instance (resuming `state` if given) and wait until it's usable.
+fn boot_from(inst: &Instance, state: Option<&Path>) -> Result<String> {
     let mut resumed = false;
     if !inst.running() {
-        // Only a clone's first boot can resume: afterwards its disk has moved on
-        // from the saved RAM, so later starts are cold boots.
-        if inst.resume_marker().exists() && inst.image.has_snapshot() {
-            let _ = std::fs::remove_file(inst.resume_marker());
-            match qemu::start_resumed(inst, &inst.image.snapshot_state()) {
+        match state {
+            Some(state) => match qemu::start_resumed(inst, state) {
                 Ok(()) => resumed = true,
                 Err(e) => {
                     log!("{}: resume failed ({e:#}); booting instead", inst.name);
                     qemu::quit(inst);
                     qemu::start(inst, &[])?;
                 }
-            }
-        } else {
-            qemu::start(inst, &[])?;
+            },
+            None => qemu::start(inst, &[])?,
         }
     }
     viewer::ensure_running()?;
@@ -322,6 +348,106 @@ pub fn boot(inst: &Instance) -> Result<String> {
     }
     log!("{} ready in {:.1}s", inst.name, took.as_secs_f32());
     Ok(info(inst))
+}
+
+fn checkpoint_dir(inst: &Instance, label: &str) -> Result<PathBuf> {
+    if label.is_empty()
+        || label.starts_with('.')
+        || !label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        bail!("invalid checkpoint label '{label}' (letters, digits, . - _)");
+    }
+    Ok(inst.dir.join("checkpoints").join(label))
+}
+
+/// Checkpoint labels of an instance, oldest first.
+pub fn checkpoints(inst: &Instance) -> Vec<String> {
+    let mut found: Vec<(std::time::SystemTime, String)> =
+        std::fs::read_dir(inst.dir.join("checkpoints"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().join("disk.qcow2").is_file())
+            .map(|e| {
+                let t = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                (t, e.file_name().to_string_lossy().into_owned())
+            })
+            .collect();
+    found.sort();
+    found.into_iter().map(|(_, n)| n).collect()
+}
+
+/// Save the instance's disk and, if it's running, its RAM under `label` (replacing an
+/// older checkpoint of that name). A running VM pauses for a few seconds and carries on.
+/// Disk copies are APFS clones, so they take no space until the VM writes more.
+pub fn checkpoint(inst: &Instance, label: &str) -> Result<String> {
+    let dir = checkpoint_dir(inst, label)?;
+    let tmp = dir.with_extension("partial");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)?;
+    let copy = || -> Result<()> {
+        std::fs::copy(inst.disk(), tmp.join("disk.qcow2"))?;
+        std::fs::copy(inst.vars(), tmp.join("vars.fd"))?;
+        Ok(())
+    };
+    let saved = if inst.running() {
+        qemu::checkpoint(inst, &tmp.join("state"), copy)
+    } else {
+        copy()
+    };
+    if let Err(e) = saved {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::rename(&tmp, &dir)?;
+    let kind = if dir.join("state").is_file() {
+        "disk and memory"
+    } else {
+        "disk"
+    };
+    Ok(format!(
+        "checkpoint {label} of {} saved ({kind})",
+        inst.name
+    ))
+}
+
+/// Put the instance back exactly as it was at checkpoint `label` and start it: it resumes
+/// in seconds if the checkpoint has its memory, else it boots. Port forwards are lost.
+pub fn restore(inst: &Instance, label: &str) -> Result<String> {
+    let dir = checkpoint_dir(inst, label)?;
+    if !dir.join("disk.qcow2").is_file() {
+        let have = checkpoints(inst);
+        bail!(
+            "{} has no checkpoint '{label}'{}",
+            inst.name,
+            if have.is_empty() {
+                String::new()
+            } else {
+                format!(" (it has: {})", have.join(", "))
+            }
+        );
+    }
+    qemu::quit(inst);
+    std::fs::copy(dir.join("disk.qcow2"), inst.disk())?;
+    std::fs::copy(dir.join("vars.fd"), inst.vars())?;
+    let _ = std::fs::remove_file(inst.resume_marker());
+    let state = Some(dir.join("state")).filter(|p| p.is_file());
+    boot_from(inst, state.as_deref())
+}
+
+pub fn delete_checkpoint(inst: &Instance, label: &str) -> Result<String> {
+    let dir = checkpoint_dir(inst, label)?;
+    if !dir.is_dir() {
+        bail!("{} has no checkpoint '{label}'", inst.name);
+    }
+    std::fs::remove_dir_all(&dir)?;
+    Ok(format!("deleted checkpoint {label} of {}", inst.name))
 }
 
 /// A resumed Windows guest keeps the clock it had when the snapshot was taken

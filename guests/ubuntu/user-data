@@ -44,7 +44,8 @@ runcmd:
   - systemctl set-default graphical.target
   # xfce4 pulls in light-locker, which would lock the agent out of the session.
   - apt-get purge -y light-locker
-  - su - agent -c '/bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"'
+  # Pinned: the skill and docs describe this version's tools. Bump deliberately.
+  - su - agent -c 'CUA_DRIVER_RS_VERSION=0.29.1 /bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"'
   - touch /var/lib/cloud/agent-ready
   # VMs cloned from the image boot without a seed; stop cloud-init treating them as
   # new instances and re-running this whole file.
