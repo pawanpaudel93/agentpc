@@ -33,7 +33,7 @@ const INSTRUCTIONS: &str = "\
 Controls instant, resettable Windows and Ubuntu desktop VMs on this Mac. Treat VMs as
 throwaway sandboxes.
 
-Flow: list_vms -> create_vm (or reuse/start_vm) -> take_screenshot -> list_desktop_tools ->
+Flow: list_vms -> create_vm (or start_vm on one you created) -> take_screenshot -> list_desktop_tools ->
 use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance to a clean
 install; checkpoint_vm/restore_vm save and return to any point in seconds (disk and memory) --
 checkpoint before a risky or slow-to-redo step. run_command runs PowerShell on Windows and bash
@@ -55,9 +55,8 @@ Rules:
 - Reach a server in the VM from the Mac with forward_port (works even for servers bound to the
   guest's own 127.0.0.1); it returns a 127.0.0.1:<port> address and lasts until the VM stops.
   list_forwards / remove_forward manage them. From inside the guest, 10.0.2.2 reaches this Mac.
-- Windows servers only accept outside connections if they bind 0.0.0.0 (not 127.0.0.1) or you
-  forward_port them; open the Windows firewall for the guest port. Don't start a Windows image
-  build yourself -- if no Windows image exists, ask the user to build one (~12 min).
+- Don't start a Windows image build yourself -- if no Windows image exists, ask the user to
+  build one (~12 min).
 - Output from run_command is trimmed to the first and last 10,000 characters per stream; write big
   output to a file in the VM and download_file it.
 - Don't put real credentials or secrets into a VM; VMs are reachable from anything on this Mac.
@@ -920,7 +919,8 @@ async fn exec(name: &str, command: &str, timeout: u64, desktop_env: bool) -> Res
     // (xdotool, GUI apps); the background path sets it itself, so it opts out.
     let command = match (inst.os, desktop_env) {
         (Os::Ubuntu, true) => format!("export {}; {command}", ops::UBUNTU_SESSION_ENV),
-        _ => command.to_string(),
+        (Os::Ubuntu, false) => command.to_string(),
+        (Os::Windows, _) => ops::windows_command(command),
     };
     let mut child = tokio::process::Command::new("ssh")
         .args(ops::ssh_args(&inst, &command))
@@ -1006,7 +1006,8 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
         Os::Windows => format!(
             r#"$d = "$env:USERPROFILE\agentpc-bg"; New-Item -ItemType Directory -Force $d | Out-Null
 $ps = "$d\{id}.ps1"; $log = "$d\{id}.log"; $exit = "$d\{id}.exit"; $task = 'agentpc-bg-{id}'
-[IO.File]::WriteAllText($ps, [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')))
+# A BOM, or Windows PowerShell 5.1 reads the script as ANSI.
+[IO.File]::WriteAllText($ps, [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')), (New-Object Text.UTF8Encoding $true))
 $inner = "& '$ps' *>&1 | Out-File -Encoding utf8 '$log'; `$c = `$LASTEXITCODE; if (`$null -eq `$c) {{ `$c = 0 }}; Set-Content -Encoding utf8 '$exit' `$c"
 $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"$inner`""
 $p = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest

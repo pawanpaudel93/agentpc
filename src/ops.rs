@@ -260,6 +260,7 @@ pub fn clone_disk(inst: &Instance) -> Result<()> {
     };
     let base_name = base.file_name().unwrap().to_string_lossy();
     let _ = std::fs::remove_file(inst.disk());
+    let _ = std::fs::remove_file(inst.dir.join("tz"));
     run(
         "qemu-img",
         &[
@@ -629,20 +630,56 @@ fn sync_clock(inst: &Instance) {
 }
 
 /// Set the guest's time zone to the Mac's (from `/etc/localtime`). Best-effort: unknown
-/// zones or an offline guest are ignored.
+/// zones or an offline guest are ignored. The zone last applied is recorded in the instance
+/// dir so a resume skips it (the Windows lookup compiles a helper and costs ~1.5 s); a fresh
+/// disk clears the record.
 fn sync_timezone(inst: &Instance) {
     let Some(tz) = crate::instance::mac_timezone() else {
         return;
     };
+    let marker = inst.dir.join("tz");
+    if std::fs::read_to_string(&marker).is_ok_and(|t| t == tz) {
+        return;
+    }
     let cmd = match inst.os {
-        Os::Ubuntu => format!("sudo timedatectl set-timezone {tz} >/dev/null 2>&1 || true"),
-        // On Win11 (ICU) FindSystemTimeZoneById accepts an IANA id and yields the Windows id.
-        Os::Windows => format!(
-            "$ErrorActionPreference='SilentlyContinue'; \
-             try {{ $tz=[TimeZoneInfo]::FindSystemTimeZoneById('{tz}'); tzutil /s $tz.Id }} catch {{}}"
-        ),
+        Os::Ubuntu => format!("sudo timedatectl set-timezone {tz}"),
+        // Windows PowerShell 5.1 (.NET Framework) can't map IANA ids, but Windows ships ICU.
+        Os::Windows => windows_command(&format!(
+            r#"Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices; using System.Text;
+public static class AgentpcIcu {{
+  [DllImport("icu.dll", CharSet = CharSet.Unicode)]
+  static extern int ucal_getWindowsTimeZoneID(string id, int len, StringBuilder w, int cap, ref int st);
+  public static string Win(string iana) {{
+    var sb = new StringBuilder(128); int st = 0;
+    int n = ucal_getWindowsTimeZoneID(iana, iana.Length, sb, sb.Capacity, ref st);
+    return (st > 0 || n <= 0) ? null : sb.ToString(0, n);
+  }}
+}}
+"@
+$w = [AgentpcIcu]::Win('{tz}')
+if (-not $w) {{ exit 1 }}
+tzutil /s $w"#
+        )),
     };
-    let _ = ssh(inst, &cmd);
+    if ssh(inst, &cmd).is_ok_and(|o| o.status.success()) {
+        let _ = std::fs::write(&marker, &tz);
+    }
+}
+
+/// Wrap a PowerShell command for the guest's SSH shell (Windows PowerShell 5.1), which decodes
+/// the command line and its own output with the OEM code page and mangles non-ASCII text. The
+/// script travels as base64 UTF-8 and runs dot-sourced, and the exit code keeps `-Command`
+/// semantics: an explicit `exit N`, else 1 if the last statement failed.
+pub fn windows_command(script: &str) -> String {
+    use base64::Engine;
+    let b64 =
+        base64::engine::general_purpose::STANDARD.encode(format!("{script}\n$__agentpc_ok = $?"));
+    format!(
+        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+         . ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')))); \
+         if (-not $__agentpc_ok) {{ exit 1 }}"
+    )
 }
 
 thread_local! {
