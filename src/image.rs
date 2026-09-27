@@ -125,7 +125,7 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
 
 /// Capture the image's snapshot: boot the image once, let the desktop
 /// settle, then save RAM and flatten the disk as it was at that instant. Clones of it
-/// resume in about a second instead of booting.
+/// resume in seconds instead of booting.
 pub fn snapshot(image: &Image) -> Result<()> {
     let _lock = crate::instance::image_lock()?;
     snapshot_locked(image)

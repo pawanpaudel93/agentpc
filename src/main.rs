@@ -1,4 +1,4 @@
-//! agentpc: disposable Windows 11 / Ubuntu desktop VMs for AI agents on Apple Silicon.
+//! agentpc: instant, resettable Windows and Ubuntu desktop VMs for AI agents on Apple Silicon Macs.
 
 mod image;
 mod instance;
@@ -30,7 +30,7 @@ macro_rules! log {
 #[command(
     name = "agentpc",
     version,
-    about = "Disposable Windows and Ubuntu desktops for AI agents"
+    about = "Instant, resettable Windows and Ubuntu desktops for AI agents"
 )]
 struct Cli {
     #[command(subcommand)]

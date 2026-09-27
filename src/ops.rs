@@ -182,7 +182,7 @@ pub fn wait_ready(inst: &Instance, timeout: Duration) -> Result<Duration> {
 }
 
 /// Copy-on-write clone of the image, preferring its snapshot disk so the first
-/// boot resumes in about a second. The backing path is relative so `$AGENTPC_HOME`
+/// boot resumes in seconds. The backing path is relative so `$AGENTPC_HOME`
 /// can move.
 pub fn clone_disk(inst: &Instance) -> Result<()> {
     let image = &inst.image;

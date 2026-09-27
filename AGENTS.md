@@ -1,6 +1,6 @@
 # agentpc — instructions for coding agents
 
-This repo runs disposable Windows and Ubuntu desktop VMs on an Apple Silicon Mac and
+This repo runs instant, resettable Windows and Ubuntu desktop VMs on an Apple Silicon Mac and
 exposes them to you through one MCP server, `agentpc` (`agentpc mcp`). It is
 preconfigured for Claude Code (`.mcp.json`), Codex (`.codex/config.toml`), Gemini CLI
 (`.gemini/settings.json`), Cursor (`.cursor/mcp.json`) and VS Code (`.vscode/mcp.json`),

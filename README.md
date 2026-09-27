@@ -4,10 +4,10 @@
 ![Platform: macOS on Apple Silicon](https://img.shields.io/badge/platform-macOS%20%7C%20Apple%20Silicon-lightgrey)
 ![MCP server](https://img.shields.io/badge/MCP-server-8A2BE2)
 
-**Disposable Windows 11 and Linux (Ubuntu) desktops for AI agents, on your Mac.**
+**Instant, resettable Windows and Ubuntu desktops for AI agents, on your Mac.**
 
 agentpc gives AI agents (Claude Code, Claude Desktop, Codex, Cursor, Gemini CLI, VS Code, or
-any MCP client) real desktop computers to work in: create a VM in about a second, let the agent click,
+any MCP client) real desktop computers to work in: create a VM in seconds, let the agent click,
 type, take screenshots and run commands, then reset it to a clean state. It is a single Rust
 binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents over MCP.
 

@@ -1,6 +1,6 @@
 {
   "name": "agentpc",
-  "description": "Disposable Windows and Ubuntu desktops for AI agents on Apple Silicon Macs",
+  "description": "Instant, resettable Windows and Ubuntu desktops for AI agents on Apple Silicon Macs",
   "owner": {
     "name": "Pawan Paudel",
     "url": "https://github.com/pawanpaudel93"

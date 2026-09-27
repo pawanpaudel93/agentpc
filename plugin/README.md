@@ -1,7 +1,7 @@
 # agentpc plugin for Claude
 
-Gives Claude disposable Windows and Ubuntu desktops on your Mac. Claude can create a VM
-in about a second, click, type, take screenshots and run commands in it, then reset it to a
+Gives Claude instant, resettable Windows and Ubuntu desktops on your Mac. Claude can create a VM
+in seconds, click, type, take screenshots and run commands in it, then reset it to a
 clean install.
 
 The plugin bundles:

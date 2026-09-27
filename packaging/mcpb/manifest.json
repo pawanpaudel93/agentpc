@@ -3,7 +3,7 @@
   "name": "agentpc",
   "display_name": "agentpc",
   "version": "0.0.0",
-  "description": "Disposable Windows and Ubuntu desktop VMs on Apple Silicon Macs for AI agents.",
+  "description": "Instant, resettable Windows and Ubuntu desktop VMs for AI agents on Apple Silicon Macs.",
   "long_description": "Create, screenshot, drive and reset local Windows 11 (ARM64) and Ubuntu (any release) desktop VMs over MCP. Requires QEMU from Homebrew (brew install qemu). Ubuntu images download on first use; Windows needs a one-time `agentpc image build windows`, which downloads the ISO from Microsoft.",
   "author": { "name": "Pawan Paudel", "url": "https://github.com/pawanpaudel93" },
   "license": "MIT",

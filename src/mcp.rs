@@ -30,7 +30,7 @@ use crate::instance::{Image, Instance, Os};
 use crate::{ops, qemu};
 
 const INSTRUCTIONS: &str = "\
-Controls disposable Windows and Ubuntu desktop VMs on this Mac.
+Controls instant, resettable Windows and Ubuntu desktop VMs on this Mac.
 
 Typical flow: list_vms -> create_vm (or start_vm) -> take_screenshot -> list_desktop_tools ->
 use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance to a clean state;

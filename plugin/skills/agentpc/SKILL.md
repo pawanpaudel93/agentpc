@@ -1,9 +1,9 @@
 ---
 name: agentpc
-description: Use agentpc to get a disposable Windows or Ubuntu desktop VM on the user's Mac. Use it when a task needs a real, clean Windows or Linux machine, such as testing an installer, script or app on a fresh OS, reproducing a platform-specific bug, operating a GUI application, or taking screenshots of a desktop, and when the user mentions agentpc or asks for a Windows or Ubuntu VM.
+description: Use agentpc to get an instant, resettable Windows or Ubuntu desktop VM on the user's Mac. Use it when a task needs a real, clean Windows or Linux machine, such as testing an installer, script or app on a fresh OS, reproducing a platform-specific bug, operating a GUI application, or taking screenshots of a desktop, and when the user mentions agentpc or asks for a Windows or Ubuntu VM.
 ---
 
-# agentpc: disposable desktops
+# agentpc: instant, resettable desktops
 
 agentpc runs Windows 11 and Ubuntu (24.04 by default, or another release)
 VMs locally and exposes them through the `agentpc` MCP server. A new VM is ready in about 1 s
