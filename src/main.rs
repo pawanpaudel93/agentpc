@@ -11,7 +11,7 @@ mod viewer;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use instance::{Image, Instance};
@@ -134,10 +134,16 @@ enum Cmd {
     Forward {
         /// VM name
         name: String,
-        /// Port a server listens on inside the VM
-        guest_port: u16,
+        /// Port a server listens on inside the VM (omit with --list/--rm)
+        guest_port: Option<u16>,
         /// Port on this Mac (default: a free one)
         host_port: Option<u16>,
+        /// List this VM's active forwards instead of adding one
+        #[arg(long)]
+        list: bool,
+        /// Stop forwarding this host port
+        #[arg(long, value_name = "HOST_PORT")]
+        rm: Option<u16>,
     },
     /// Save a PNG screenshot
     Screenshot {
@@ -303,7 +309,20 @@ fn run(cli: Cli) -> Result<()> {
             name,
             guest_port,
             host_port,
-        } => out(ops::forward(&Instance::load(&name)?, guest_port, host_port)),
+            list,
+            rm,
+        } => {
+            let inst = Instance::load(&name)?;
+            if list {
+                out(Ok(ops::forwards_text(&inst)))
+            } else if let Some(port) = rm {
+                out(ops::remove_forward(&inst, port))
+            } else {
+                let guest_port =
+                    guest_port.context("guest_port is required (or use --list / --rm)")?;
+                out(ops::forward(&inst, guest_port, host_port))
+            }
+        }
         Cmd::Screenshot { name, out: path } => {
             let inst = Instance::load(&name)?;
             let path = path.unwrap_or_else(|| inst.dir.join("screen.png"));

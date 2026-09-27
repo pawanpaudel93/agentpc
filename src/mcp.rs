@@ -3,7 +3,7 @@
 //! through one session kept open per instance, so element references returned by one
 //! call stay valid in the next.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::AsFd;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -30,25 +30,47 @@ use crate::instance::{Image, Instance, Os};
 use crate::{ops, qemu};
 
 const INSTRUCTIONS: &str = "\
-Controls instant, resettable Windows and Ubuntu desktop VMs on this Mac.
+Controls instant, resettable Windows and Ubuntu desktop VMs on this Mac. Treat VMs as
+throwaway sandboxes.
 
-Typical flow: list_vms -> create_vm (or start_vm) -> take_screenshot -> list_desktop_tools ->
-use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance to a clean state;
-checkpoint_vm/restore_vm save and return to any point in seconds (disk and memory).
-Windows desktop tools come from Windows-MCP (call Snapshot first; Click/Type need a loc
-[x, y] or label). Ubuntu desktop tools come from cua-driver (keyboard/mouse input needs
-\"delivery_mode\": \"foreground\"). run_command runs PowerShell on Windows and bash on Ubuntu.
-create_vm takes an optional version (Ubuntu release like \"22.04\"; Windows \"11-25h2\",
-\"11-24h2\" or \"11-23h2\"); list_vms shows which images exist.
+Flow: list_vms -> create_vm (or reuse/start_vm) -> take_screenshot -> list_desktop_tools ->
+use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance to a clean
+install; checkpoint_vm/restore_vm save and return to any point in seconds (disk and memory) --
+checkpoint before a risky or slow-to-redo step. run_command runs PowerShell on Windows and bash
+on Ubuntu; the guest login is agent/agent. create_vm takes an optional version (Ubuntu release
+like \"22.04\"; Windows \"11-25h2\", \"11-24h2\", \"11-23h2\"); list_vms shows which images exist.
+The first create of an image can take minutes (download/build); after that it's seconds.
+
+Desktop tools: Windows come from Windows-MCP (call Snapshot first; Click/Type need a loc [x, y]
+or label). Ubuntu come from cua-driver (keyboard/mouse input needs \"delivery_mode\":
+\"foreground\").
+
+Rules:
+- Ownership: create your OWN uniquely named VM and work in it. Never reset/delete/restore a VM you
+  did not create (list_vms shows each VM's owner) unless the user asks. Delete the VMs you created
+  when you're done, unless the user wants them kept. VMs you started may be stopped automatically
+  when this session ends.
+- Long jobs and servers: use run_command with background: true (it keeps running after the call
+  and returns a job id); poll it with job_status. Foreground run_command times out (default 120 s).
+- Reach a server in the VM from the Mac with forward_port (works even for servers bound to the
+  guest's own 127.0.0.1); it returns a 127.0.0.1:<port> address and lasts until the VM stops.
+  list_forwards / remove_forward manage them. From inside the guest, 10.0.2.2 reaches this Mac.
+- Windows servers only accept outside connections if they bind 0.0.0.0 (not 127.0.0.1) or you
+  forward_port them; open the Windows firewall for the guest port. Don't start a Windows image
+  build yourself -- if no Windows image exists, ask the user to build one (~12 min).
+- Output from run_command is trimmed to the first and last 10,000 characters per stream; write big
+  output to a file in the VM and download_file it.
+- Don't put real credentials or secrets into a VM; VMs are reachable from anything on this Mac.
 ";
 
 pub async fn serve() -> Result<()> {
     let out = protocol_stdout()?;
-    Gateway::default()
-        .serve((tokio::io::stdin(), out))
-        .await?
-        .waiting()
-        .await?;
+    let gateway = Gateway::new();
+    let running = gateway.clone().serve((tokio::io::stdin(), out)).await?;
+    running.waiting().await?;
+    // Client disconnected / stdin EOF: stop the VMs this process left running so they don't
+    // pile up. CLI-started VMs aren't in `owned`, so they're untouched.
+    gateway.shutdown().await;
     Ok(())
 }
 
@@ -70,9 +92,74 @@ type Client = Arc<RunningService<RoleClient, ()>>;
 /// Per-instance slot, locked while connecting so concurrent calls share one session.
 type Slot = Arc<tokio::sync::Mutex<Option<Client>>>;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Gateway {
     sessions: Arc<Mutex<HashMap<String, Slot>>>,
+    /// VMs this server process created or started, for auto-stop on exit.
+    owned: Arc<Mutex<HashSet<String>>>,
+    /// Identifies this server process, so a VM's owner tag is unique per session.
+    session_id: Arc<str>,
+}
+
+impl Gateway {
+    fn new() -> Self {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        Self {
+            sessions: Default::default(),
+            owned: Default::default(),
+            session_id: format!("{pid:x}{nanos:x}").into(),
+        }
+    }
+
+    /// Owner tag stored on VMs created this session: the MCP client's name plus a per-process id.
+    fn owner_tag(&self, ctx: &RequestContext<RoleServer>) -> String {
+        let client = ctx
+            .peer
+            .peer_info()
+            .map(|i| i.client_info.name.clone())
+            .unwrap_or_else(|| "mcp".into());
+        format!("{client} [{}]", self.session_id)
+    }
+
+    /// Best-effort, bounded shutdown: gracefully stop the VMs this session left running, unless
+    /// AGENTPC_KEEP_RUNNING=1. Force-quit any that don't stop in time so the process can exit.
+    async fn shutdown(&self) {
+        if std::env::var_os("AGENTPC_KEEP_RUNNING").is_some_and(|v| v == "1") {
+            return;
+        }
+        let names: Vec<String> = self.owned.lock().unwrap().iter().cloned().collect();
+        let running: Vec<Instance> = names
+            .into_iter()
+            .filter_map(|n| load(&n).ok())
+            .filter(|i| i.running())
+            .collect();
+        if running.is_empty() {
+            return;
+        }
+        crate::log!(
+            "MCP server exiting; stopping {} VM(s) it started",
+            running.len()
+        );
+        let stops = running.iter().cloned().map(|inst| {
+            blocking(move || {
+                // Tear down this VM's port forwards before it stops, so no stale tunnel or
+                // pid file is left behind.
+                ops::stop_forwards(&inst);
+                ops::stop(&inst)
+            })
+        });
+        let _ =
+            tokio::time::timeout(Duration::from_secs(45), futures::future::join_all(stops)).await;
+        for inst in &running {
+            if inst.running() {
+                qemu::quit(inst);
+            }
+        }
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -98,8 +185,10 @@ struct CreateArgs {
     name: Option<String>,
     /// Memory in GB (default 8 on Windows, 4 on Ubuntu). A non-default size boots cold
     /// (~25 s Windows, ~15 s Ubuntu) instead of resuming the image's snapshot.
+    #[schemars(range(min = 2, max = 64))]
     memory_gb: Option<u32>,
     /// CPUs (default 4). A non-default count boots cold, like memory_gb.
+    #[schemars(range(min = 1, max = 16))]
     cpus: Option<u32>,
     /// Cut the VM off from the internet and this Mac; run_command, files, the desktop tools
     /// and forward_port still work. For testing offline behaviour or untrusted software.
@@ -172,11 +261,63 @@ struct DesktopArgs {
     arguments: Option<JsonObject>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct ScreenshotArgs {
+    name: String,
+    /// Also write the PNG to this path on this Mac (absolute, or relative to the server's
+    /// working directory).
+    save_to: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RemoveForwardArgs {
+    name: String,
+    /// The 127.0.0.1 host port to stop forwarding.
+    host_port: u16,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct JobArgs {
+    name: String,
+    /// Job id returned by a `background: true` run_command.
+    id: u64,
+    /// Lines of the log to return from the end (default 50).
+    #[serde(default = "default_tail")]
+    tail_lines: usize,
+}
+
+fn default_tail() -> usize {
+    50
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(inline)]
+enum LogKind {
+    Qemu,
+    Serial,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct LogArgs {
+    name: String,
+    /// Which log: the hypervisor's `qemu` log or the guest's `serial` console.
+    which: LogKind,
+    /// Lines to return from the end (default 100).
+    #[serde(default = "default_log_tail")]
+    tail_lines: usize,
+}
+
+fn default_log_tail() -> usize {
+    100
+}
+
 #[tool_router]
 impl Gateway {
     #[tool(
-        description = "List VM instances (name, image, state, size, checkpoints, viewer URL) and which images\n\
-                          exist.",
+        description = "List VM instances (name, image, state, size, checkpoints, owner, viewer URL) and which\n\
+                          images exist. Each VM shows its owner; only reset/delete/restore a VM you created,\n\
+                          unless the user asks otherwise.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_vms(&self) -> CallToolResult {
@@ -184,12 +325,13 @@ impl Gateway {
     }
 
     #[tool(
-        description = "Create and boot a new instance cloned from its image (~1 s ubuntu, ~4 s windows).\n\
-                          Returns once the desktop and its control server are ready.",
+        description = "Create and boot a new instance cloned from its image, and return once its desktop and\n\
+                          control server are ready. Usually seconds; the FIRST create of an image can take\n\
+                          minutes while it is downloaded or built. Give it your own unique name.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
-            open_world_hint = false
+            open_world_hint = true
         )
     )]
     async fn create_vm(
@@ -201,22 +343,40 @@ impl Gateway {
             OsArg::Windows => Os::Windows,
             OsArg::Ubuntu => Os::Ubuntu,
         };
-        text(
-            with_progress(&ctx, move || {
-                let name = match a.version {
-                    Some(v) => format!("{os}-{v}"),
-                    None => os.to_string(),
-                };
-                ops::create(
-                    &Image::resolve(&name)?,
-                    a.name.as_deref(),
-                    a.memory_gb,
-                    a.cpus,
-                    a.offline,
-                )
-            })
-            .await,
-        )
+        let owner = self.owner_tag(&ctx);
+        // Idempotent retry: a create re-sent after a client timeout finds its own VM already
+        // there and returns it, rather than erroring or making a second one.
+        if let Some(name) = &a.name
+            && let Ok(inst) = load(name)
+            && ops::owner(&inst).as_deref() == Some(owner.as_str())
+        {
+            self.owned.lock().unwrap().insert(name.clone());
+            return text(Ok(ops::info(&inst)));
+        }
+        let res = with_progress(&ctx, move || {
+            let name = match a.version {
+                Some(v) => format!("{os}-{v}"),
+                None => os.to_string(),
+            };
+            ops::create(
+                &Image::resolve(&name)?,
+                a.name.as_deref(),
+                a.memory_gb,
+                a.cpus,
+                a.offline,
+            )
+        })
+        .await;
+        // Record who owns it and track it for auto-stop. `info` starts with the VM's name.
+        if let Ok(info) = &res
+            && let Some(name) = info.split_whitespace().next()
+        {
+            if let Ok(inst) = load(name) {
+                let _ = ops::set_owner(&inst, &owner);
+            }
+            self.owned.lock().unwrap().insert(name.to_string());
+        }
+        text(res)
     }
 
     #[tool(
@@ -233,7 +393,11 @@ impl Gateway {
         Parameters(a): Parameters<NameArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        text(self.lifecycle(&a.name, ops::boot, &ctx).await)
+        let r = self.lifecycle(&a.name, ops::boot, &ctx).await;
+        if r.is_ok() {
+            self.owned.lock().unwrap().insert(a.name.clone());
+        }
+        text(r)
     }
 
     #[tool(
@@ -291,7 +455,8 @@ impl Gateway {
                           step; restore_vm returns to it in seconds.",
         annotations(
             read_only_hint = false,
-            destructive_hint = false,
+            // Overwrites any checkpoint already stored under this label.
+            destructive_hint = true,
             open_world_hint = false
         )
     )]
@@ -338,10 +503,19 @@ impl Gateway {
                           booting or when the desktop server is unresponsive.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
-    async fn take_screenshot(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
+    async fn take_screenshot(&self, Parameters(a): Parameters<ScreenshotArgs>) -> CallToolResult {
         let png = async {
             let inst = load(&a.name)?;
-            blocking(move || qemu::screenshot(&inst, &inst.dir.join("screen.png"))).await
+            let save_to = a.save_to.as_deref().map(std::path::absolute).transpose()?;
+            blocking(move || {
+                let png = qemu::screenshot(&inst, &inst.dir.join("screen.png"))?;
+                if let Some(dst) = save_to {
+                    std::fs::write(&dst, &png)
+                        .with_context(|| format!("write {}", dst.display()))?;
+                }
+                Ok(png)
+            })
+            .await
         };
         reply(png.await.map(|png| {
             // A PNG's width and height sit at bytes 16..24 of its IHDR chunk.
@@ -370,8 +544,11 @@ impl Gateway {
         description = "Run a shell command in the instance over SSH: PowerShell on windows, bash on ubuntu.\n\
                           Returns the exit code, stdout and stderr; each stream is trimmed to its first and\n\
                           last 10,000 characters (write big output to a file and download_file it).\n\
-                          With background: true the command keeps running after the call (servers, long\n\
-                          jobs); the reply says where its output goes and how to stop it.",
+                          Foreground runs are killed at `timeout` seconds (default 120) with their partial\n\
+                          output returned; for servers or anything slow, pass background: true -- it keeps\n\
+                          running after the call, returns a job id, and you poll it with job_status. A GUI\n\
+                          installer run in the foreground should be waited on (e.g. PowerShell\n\
+                          `Start-Process -Wait -PassThru`) or it returns before the install finishes.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -382,7 +559,7 @@ impl Gateway {
         if a.background {
             return text(exec_background(&a.name, &a.command).await);
         }
-        text(exec(&a.name, &a.command, a.timeout).await)
+        text(exec(&a.name, &a.command, a.timeout, true).await)
     }
 
     #[tool(
@@ -534,6 +711,87 @@ impl Gateway {
             Err(e) => text(Err(e)),
         }
     }
+
+    #[tool(
+        description = "Check on a background job started by run_command (background: true), by the id it\n\
+                          returned: whether it is still running or has exited (with its code), plus the tail\n\
+                          of its log.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn job_status(&self, Parameters(a): Parameters<JobArgs>) -> CallToolResult {
+        text(job_status(&a.name, a.id, a.tail_lines).await)
+    }
+
+    #[tool(
+        description = "Delete a checkpoint by label, freeing its disk and memory snapshot. The VM is not\n\
+                          affected.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn delete_checkpoint(&self, Parameters(a): Parameters<CheckpointArgs>) -> CallToolResult {
+        text(
+            async {
+                let inst = load(&a.name)?;
+                blocking(move || ops::delete_checkpoint(&inst, &a.label)).await
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "List the active port forwards for a VM: each host port on 127.0.0.1, the guest port it\n\
+                          reaches, and whether its tunnel is still alive.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn list_forwards(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
+        text(
+            async {
+                let inst = load(&a.name)?;
+                blocking(move || Ok(ops::forwards_text(&inst))).await
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Stop forwarding a host port set up by forward_port; other forwards keep running.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn remove_forward(&self, Parameters(a): Parameters<RemoveForwardArgs>) -> CallToolResult {
+        text(
+            async {
+                let inst = load(&a.name)?;
+                blocking(move || ops::remove_forward(&inst, a.host_port)).await
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Read the tail of a VM's log: the hypervisor's `qemu` log (boot/device errors) or the\n\
+                          guest's `serial` console. Useful when a VM won't boot or the desktop is unreachable.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn read_vm_log(&self, Parameters(a): Parameters<LogArgs>) -> CallToolResult {
+        let which = match a.which {
+            LogKind::Qemu => "qemu",
+            LogKind::Serial => "serial",
+        };
+        text(
+            async {
+                let inst = load(&a.name)?;
+                blocking(move || ops::read_log(&inst, which, a.tail_lines)).await
+            }
+            .await,
+        )
+    }
 }
 
 #[tool_handler]
@@ -586,13 +844,28 @@ impl Gateway {
         F: Future<Output = Result<T, ServiceError>>,
     {
         for attempt in 1..=2 {
-            match f(self.session(name).await?).await {
-                Ok(v) => return Ok(v),
-                Err(ServiceError::McpError(e)) => bail!("{what} failed in {name}: {}", e.message),
-                Err(e) => {
+            let client = self.session(name).await?;
+            // A hung desktop tool must not wedge the call forever; treat a stall like a
+            // transport failure so we reconnect once, then give up.
+            let call = tokio::time::timeout(DESKTOP_CALL_TIMEOUT, f(client)).await;
+            match call {
+                Ok(Ok(v)) => return Ok(v),
+                Ok(Err(ServiceError::McpError(e))) => {
+                    bail!("{what} failed in {name}: {}", e.message)
+                }
+                Ok(Err(e)) => {
                     self.drop_session(name);
                     if attempt == 2 {
                         bail!("{what} failed in {name}: {e}");
+                    }
+                }
+                Err(_) => {
+                    self.drop_session(name);
+                    if attempt == 2 {
+                        bail!(
+                            "{what} timed out after {}s in {name}",
+                            DESKTOP_CALL_TIMEOUT.as_secs()
+                        );
                     }
                 }
             }
@@ -634,28 +907,71 @@ async fn connect(name: &str) -> Result<RunningService<RoleClient, ()>> {
 /// Characters kept from each end of a long stdout or stderr.
 const OUTPUT_KEEP: usize = 10_000;
 
-async fn exec(name: &str, command: &str, timeout: u64) -> Result<String> {
+/// A single desktop-control tool call may take a while (typing, waits) but must not hang forever.
+const DESKTOP_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+async fn exec(name: &str, command: &str, timeout: u64, desktop_env: bool) -> Result<String> {
+    use tokio::io::AsyncReadExt;
     let inst = load(name)?;
-    let out = tokio::process::Command::new("ssh")
-        .args(ops::ssh_args(&inst, command))
+    if !inst.running() {
+        bail!("VM {name} is not running; start_vm first");
+    }
+    // A foreground bash command needs the logged-in desktop session's env to reach the display
+    // (xdotool, GUI apps); the background path sets it itself, so it opts out.
+    let command = match (inst.os, desktop_env) {
+        (Os::Ubuntu, true) => format!("export {}; {command}", ops::UBUNTU_SESSION_ENV),
+        _ => command.to_string(),
+    };
+    let mut child = tokio::process::Command::new("ssh")
+        .args(ops::ssh_args(&inst, &command))
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(Duration::from_secs(timeout), out)
-        .await
-        .map_err(|_| anyhow!("command timed out after {timeout}s"))?
+        .spawn()
         .context("run ssh")?;
+    // Drain both pipes concurrently so a timeout kill still yields whatever the command printed.
+    let mut so = child.stdout.take().unwrap();
+    let mut se = child.stderr.take().unwrap();
+    let read_out = tokio::spawn(async move {
+        let mut b = Vec::new();
+        let _ = so.read_to_end(&mut b).await;
+        b
+    });
+    let read_err = tokio::spawn(async move {
+        let mut b = Vec::new();
+        let _ = se.read_to_end(&mut b).await;
+        b
+    });
+    let status = tokio::time::timeout(Duration::from_secs(timeout), child.wait()).await;
+    let timed_out = status.is_err();
+    if timed_out {
+        let _ = child.kill().await;
+    }
+    let stdout = read_out.await.unwrap_or_default();
+    let stderr = read_err.await.unwrap_or_default();
     // ssh exits 255 when it can't connect; the command's own code otherwise.
-    let code = out.status.code().unwrap_or(-1);
-    let mut text = format!("exit code: {code}");
-    for (label, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+    let code = match &status {
+        Ok(Ok(s)) => s.code().unwrap_or(-1),
+        _ => -1,
+    };
+    let head = if timed_out {
+        format!(
+            "timed out after {timeout}s; the command was killed. \
+             Use background: true for long jobs.\n(partial output below)"
+        )
+    } else {
+        format!("exit code: {code}")
+    };
+    let mut text = head;
+    for (label, bytes) in [("stdout", &stdout), ("stderr", &stderr)] {
         let s = String::from_utf8_lossy(bytes);
         let s = s.trim_end();
         if !s.is_empty() {
             text += &format!("\n--- {label} ---\n{}", clip(s, OUTPUT_KEEP));
         }
     }
-    if code != 0 {
+    if timed_out || code != 0 {
         bail!("{text}");
     }
     Ok(text)
@@ -668,7 +984,7 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
     use base64::Engine;
     let inst = load(name)?;
     if !inst.running() {
-        bail!("{name} is stopped; call start_vm first");
+        bail!("VM {name} is not running; start_vm first");
     }
     let id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -676,30 +992,62 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
     let b64 = base64::engine::general_purpose::STANDARD.encode(command);
     let script = match inst.os {
         // Separate lines: `a && b &` would background the whole list, and that shell would
-        // hold the SSH session open.
+        // hold the SSH session open. The wrapper records the exit code in <id>.exit so
+        // job_status can report it after the job ends.
         Os::Ubuntu => format!(
             "d=~/agentpc-bg; mkdir -p $d && echo {b64} | base64 -d > $d/{id}.sh || exit 1\n\
-             {env} setsid nohup bash $d/{id}.sh > $d/{id}.log 2>&1 < /dev/null &\n\
-             echo \"started in the background (pid $!); output: $HOME/agentpc-bg/{id}.log. \
-             Read it with: tail -n 50 ~/agentpc-bg/{id}.log. Stop it with: kill $!\"",
+             {env} setsid nohup bash -c 'bash \"$0\"; echo $? > \"$1\"' \
+             $d/{id}.sh $d/{id}.exit > $d/{id}.log 2>&1 < /dev/null &\n\
+             echo \"started in the background (id {id}, pid $!). \
+             Poll it with job_status name={name} id={id}. \
+             Output: $HOME/agentpc-bg/{id}.log. Stop it with: kill $!\"",
             env = ops::UBUNTU_SESSION_ENV
         ),
         Os::Windows => format!(
             r#"$d = "$env:USERPROFILE\agentpc-bg"; New-Item -ItemType Directory -Force $d | Out-Null
-$ps = "$d\{id}.ps1"; $log = "$d\{id}.log"; $task = 'agentpc-bg-{id}'
+$ps = "$d\{id}.ps1"; $log = "$d\{id}.log"; $exit = "$d\{id}.exit"; $task = 'agentpc-bg-{id}'
 [IO.File]::WriteAllText($ps, [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')))
-$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"& '$ps' *> '$log'`""
+$inner = "& '$ps' *>&1 | Out-File -Encoding utf8 '$log'; `$c = `$LASTEXITCODE; if (`$null -eq `$c) {{ `$c = 0 }}; Set-Content -Encoding utf8 '$exit' `$c"
+$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"$inner`""
 $p = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
 $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $task -Action $a -Principal $p -Settings $s -Force | Out-Null
 Start-ScheduledTask -TaskName $task
-"started in the background as scheduled task $task; output: $log. Read it with: Get-Content '$log' -Tail 50. Stop it with: Stop-ScheduledTask $task (and Stop-Process for anything it started)""#
+"started in the background as scheduled task $task (id {id}). Poll it with job_status name={name} id={id}. Output: $log. Stop it with: Stop-ScheduledTask $task (and Stop-Process for anything it started)""#
         ),
     };
-    let out = exec(name, &script, 60).await?;
+    let out = exec(name, &script, 60, false).await?;
     Ok(out
         .split_once("--- stdout ---\n")
         .map_or(out.clone(), |(_, s)| s.trim().to_string()))
+}
+
+/// Report a background job's state from its log and exit-code file (see exec_background):
+/// running while no <id>.exit exists yet, otherwise exited with that code, plus a log tail.
+async fn job_status(name: &str, id: u64, tail_lines: usize) -> Result<String> {
+    let inst = load(name)?;
+    if !inst.running() {
+        bail!("VM {name} is not running; start_vm first");
+    }
+    let script = match inst.os {
+        Os::Ubuntu => format!(
+            "d=~/agentpc-bg\n\
+             if [ ! -f $d/{id}.log ]; then echo 'STATE: no such job'; exit 0; fi\n\
+             if [ -f $d/{id}.exit ]; then echo \"STATE: exited $(cat $d/{id}.exit)\"; \
+             else echo 'STATE: running'; fi\n\
+             echo '--- log tail ---'; tail -n {tail_lines} $d/{id}.log",
+        ),
+        Os::Windows => format!(
+            r#"$d = "$env:USERPROFILE\agentpc-bg"; $log = "$d\{id}.log"; $exit = "$d\{id}.exit"
+if (-not (Test-Path $log)) {{ 'STATE: no such job'; exit 0 }}
+if (Test-Path $exit) {{ "STATE: exited $((Get-Content $exit -Raw).Trim())" }} else {{ 'STATE: running' }}
+'--- log tail ---'; if (Test-Path $log) {{ Get-Content $log -Tail {tail_lines} }}"#
+        ),
+    };
+    let out = exec(name, &script, 30, false).await?;
+    Ok(out
+        .split_once("--- stdout ---\n")
+        .map_or_else(|| out.clone(), |(_, s)| s.trim().to_string()))
 }
 
 /// Keep the first and last `keep` characters of `s`, noting how much was cut.
