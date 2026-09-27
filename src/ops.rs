@@ -470,6 +470,21 @@ fn sync_clock(inst: &Instance) {
     }
 }
 
+pub fn stop_all() -> Result<String> {
+    let running: Vec<Instance> = Instance::list()?
+        .into_iter()
+        .filter(|i| i.running())
+        .collect();
+    if running.is_empty() {
+        return Ok("no VMs are running".into());
+    }
+    let mut out = Vec::new();
+    for inst in running {
+        out.push(stop(&inst)?);
+    }
+    Ok(out.join("\n"))
+}
+
 pub fn stop(inst: &Instance) -> Result<String> {
     qemu::stop(inst)?;
     viewer::stop_if_idle();

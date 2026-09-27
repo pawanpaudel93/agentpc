@@ -55,8 +55,13 @@ enum Cmd {
     Info { name: String },
     /// Boot a stopped VM
     Start { name: String },
-    /// Shut a VM down cleanly (its disk is kept)
-    Stop { name: String },
+    /// Shut a VM down cleanly (its disk is kept), or every running VM with --all
+    Stop {
+        name: Option<String>,
+        /// Stop every running VM
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+    },
     /// Discard all changes: back to a fresh copy of the image
     Reset { name: String },
     /// Delete a VM and its disk
@@ -94,6 +99,23 @@ enum Cmd {
     Mcp,
     /// Register the MCP server with installed agents (claude, claude-desktop, codex, cursor, gemini, vscode)
     McpInstall { clients: Vec<String> },
+    /// Remove the MCP server from agents (all when none given)
+    McpUninstall { clients: Vec<String> },
+    /// Free disk space: downloaded ISOs and cloud images, and leftovers of interrupted work
+    Clean {
+        /// Only show what would be deleted
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove agentpc: stops VMs, unregisters agents, deletes ~/.agentpc and this binary
+    Uninstall {
+        /// Keep images, VMs and keys in ~/.agentpc
+        #[arg(long)]
+        keep_data: bool,
+        /// Don't ask for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
     /// Check prerequisites
     Doctor,
     #[command(name = "__viewer", hide = true)]
@@ -159,7 +181,11 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::List => out(ops::list_table()),
         Cmd::Info { name } => out(Ok(ops::info(&Instance::load(&name)?))),
         Cmd::Start { name } => out(ops::boot(&Instance::load(&name)?)),
-        Cmd::Stop { name } => out(ops::stop(&Instance::load(&name)?)),
+        Cmd::Stop { name, all } => match (name, all) {
+            (Some(name), false) => out(ops::stop(&Instance::load(&name)?)),
+            (None, true) => out(ops::stop_all()),
+            _ => anyhow::bail!("name a VM, or pass --all"),
+        },
         Cmd::Reset { name } => out(ops::reset(&Instance::load(&name)?)),
         Cmd::Rm { name } => out(ops::delete(&Instance::load(&name)?)),
         Cmd::Checkpoint {
@@ -211,6 +237,9 @@ fn run(cli: Cli) -> Result<()> {
         },
         Cmd::Mcp => tokio::runtime::Runtime::new()?.block_on(mcp::serve()),
         Cmd::McpInstall { clients } => setup::mcp_install(&clients),
+        Cmd::McpUninstall { clients } => setup::mcp_uninstall(&clients),
+        Cmd::Clean { dry_run } => out(setup::clean(dry_run)),
+        Cmd::Uninstall { keep_data, yes } => setup::uninstall(keep_data, yes),
         Cmd::Doctor => {
             if !setup::doctor()? {
                 std::process::exit(1);

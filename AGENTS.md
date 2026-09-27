@@ -54,7 +54,7 @@ Rules:
   `ci:` or `chore:`, then a short imperative subject; add a brief bullet body only if needed.
 - Rust, single binary `agentpc` (CLI + MCP server). `src/main.rs` is the CLI; modules:
   `instance` (VMs, images, on-disk layout), `qemu`, `ops` (lifecycle),
-  `viewer` (browser viewer), `image` (build/snapshot), `registry` (pull/push), `setup` (`doctor`, `mcp-install`), `mcp` (the server).
+  `viewer` (browser viewer), `image` (build/snapshot), `registry` (pull/push), `setup` (`doctor`, `mcp-install`, `clean`, `uninstall`), `mcp` (the server).
 - Ports derive from the instance slot n: SSH 2200+n, Windows-MCP 8000+n, VNC 5910+n,
   VNC websocket 5700+n; the shared browser viewer is on 8100.
 - Guest assets in `guests/` are embedded in the binary. A Windows build writes them to a

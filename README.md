@@ -23,6 +23,7 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 - [Configuration](#configuration)
 - [How it works](#how-it-works)
 - [Troubleshooting](#troubleshooting)
+- [Uninstalling](#uninstalling)
 - [Security](#security)
 - [Development](#development)
 - [License](#license)
@@ -183,7 +184,7 @@ pick the server up automatically.
 | `agentpc list` | VMs and images |
 | `agentpc info <name>` | Viewer URL, SSH and VNC details |
 | `agentpc start <name>` | Boot a stopped VM |
-| `agentpc stop <name>` | Shut a VM down cleanly (its disk is kept) |
+| `agentpc stop <name>` / `--all` | Shut a VM (or every running VM) down cleanly; disks are kept |
 | `agentpc reset <name>` | Discard all changes: back to a fresh copy of the image |
 | `agentpc rm <name>` | Delete a VM and its disk |
 | `agentpc checkpoint <name> <label> [--delete]` | Save a VM's disk and memory (a running VM pauses ~5 s), or delete a checkpoint |
@@ -211,7 +212,10 @@ pick the server up automatically.
 | --- | --- |
 | `agentpc mcp` | Run the MCP server on stdio (what agents launch) |
 | `agentpc mcp-install [clients…]` | Register the MCP server with agents |
+| `agentpc mcp-uninstall [clients…]` | Remove it from agents again |
 | `agentpc doctor` | Check prerequisites |
+| `agentpc clean [--dry-run]` | Free disk space: downloaded ISOs and cloud images, and leftovers of interrupted builds or checkpoints. Never touches images or VMs; lists images no VM uses |
+| `agentpc uninstall [--keep-data] [--yes]` | Remove agentpc (see [Uninstalling](#uninstalling)) |
 
 ## Images
 
@@ -338,6 +342,21 @@ The guest login is `agent` / `agent`.
 - **A VM is in a bad state:** `agentpc reset <name>`.
 - **`image build`/`pull`/`rm` refuses:** VMs still depend on that image; `agentpc rm` them
   first.
+
+## Uninstalling
+
+```sh
+agentpc uninstall            # asks first; --yes skips the prompt
+```
+
+This stops all VMs, removes the MCP server from every agent `mcp-install` registered it with,
+deletes `~/.agentpc` (images, VMs, checkpoints and keys; `--keep-data` keeps them) and the
+`agentpc` binary. It leaves shared things alone and lists them: the PATH line the installer
+added (`~/.local/bin` is used by other tools too), QEMU (`brew uninstall qemu` if nothing else
+needs it) and the Claude plugin (`/plugin uninstall agentpc@agentpc`).
+
+To only reclaim disk space, `agentpc clean` deletes what can be downloaded again, and
+`agentpc image rm <image>` deletes an image you no longer use.
 
 ## Security
 
