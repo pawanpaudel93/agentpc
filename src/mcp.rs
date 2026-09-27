@@ -51,10 +51,10 @@ Rules:
   when you're done, unless the user wants them kept. VMs you started may be stopped automatically
   when this session ends.
 - Long jobs and servers: use run_command with background: true (it keeps running after the call
-  and returns a job id); poll it with job_status. Foreground run_command times out (default 120 s).
+  and returns a job id); poll it with get_job_status. Foreground run_command times out (default 120 s).
 - Reach a server in the VM from the Mac with forward_port (works even for servers bound to the
   guest's own 127.0.0.1); it returns a 127.0.0.1:<port> address and lasts until the VM stops.
-  list_forwards / remove_forward manage them. From inside the guest, 10.0.2.2 reaches this Mac.
+  list_forwards / delete_forward manage them. From inside the guest, 10.0.2.2 reaches this Mac.
 - Don't start a Windows image build yourself -- if no Windows image exists, ask the user to
   build one (~12 min).
 - Output from run_command is trimmed to the first and last 10,000 characters per stream; write big
@@ -314,6 +314,7 @@ fn default_log_tail() -> usize {
 #[tool_router]
 impl Gateway {
     #[tool(
+        title = "List VMs",
         description = "List VM instances (name, image, state, size, checkpoints, owner, viewer URL) and which\n\
                           images exist. Each VM shows its owner; only reset/delete/restore a VM you created,\n\
                           unless the user asks otherwise.",
@@ -324,6 +325,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Create VM",
         description = "Create and boot a new instance cloned from its image, and return once its desktop and\n\
                           control server are ready. Usually seconds; the FIRST create of an image can take\n\
                           minutes while it is downloaded or built. Give it your own unique name.",
@@ -379,6 +381,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Start VM",
         description = "Boot a stopped instance and wait until its desktop is ready.",
         annotations(
             read_only_hint = false,
@@ -400,6 +403,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Stop VM",
         description = "Shut an instance down cleanly (its disk is kept).",
         annotations(
             read_only_hint = false,
@@ -417,6 +421,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Reset VM",
         description = "Discard all changes: restore the instance to a fresh copy of its image and boot it.",
         annotations(
             read_only_hint = false,
@@ -433,6 +438,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Delete VM",
         description = "Stop an instance and delete it with its disk and checkpoints.",
         annotations(
             read_only_hint = false,
@@ -449,6 +455,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Checkpoint VM",
         description = "Save the instance's disk and memory under a label (replacing an older one of that\n\
                           name). A running VM pauses for a few seconds and carries on. Use before a risky\n\
                           step; restore_vm returns to it in seconds.",
@@ -474,6 +481,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Restore VM",
         description = "Put the instance back exactly as it was at a checkpoint and start it (resumes in\n\
                           seconds). Port forwards must be set up again.",
         annotations(
@@ -498,6 +506,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Take screenshot",
         description = "Screenshot the instance's display from the hypervisor. Works at any time, even while\n\
                           booting or when the desktop server is unresponsive.",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -540,12 +549,13 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Run command",
         description = "Run a shell command in the instance over SSH: PowerShell on windows, bash on ubuntu.\n\
                           Returns the exit code, stdout and stderr; each stream is trimmed to its first and\n\
                           last 10,000 characters (write big output to a file and download_file it).\n\
                           Foreground runs are killed at `timeout` seconds (default 120) with their partial\n\
                           output returned; for servers or anything slow, pass background: true -- it keeps\n\
-                          running after the call, returns a job id, and you poll it with job_status. A GUI\n\
+                          running after the call, returns a job id, and you poll it with get_job_status. A GUI\n\
                           installer run in the foreground should be waited on (e.g. PowerShell\n\
                           `Start-Process -Wait -PassThru`) or it returns before the install finishes.",
         annotations(
@@ -562,6 +572,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Upload file",
         description = "Copy a file or directory from this Mac into a VM (scp).",
         annotations(
             read_only_hint = false,
@@ -581,6 +592,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Download file",
         description = "Copy a file or directory from a VM to this Mac (scp).",
         annotations(
             read_only_hint = false,
@@ -600,6 +612,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Forward port",
         description = "Make a server running inside a VM reachable from this Mac: forwards a port on\n\
                           127.0.0.1 to the guest port until the VM stops. Returns the host address.",
         annotations(
@@ -619,6 +632,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "List desktop tools",
         description = "List the desktop-control tools available in an instance (name + summary), or the full\n\
                           input schema of one tool when `tool` is given. Call them with `use_desktop_tool`.",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -659,6 +673,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Use desktop tool",
         description = "Call a desktop-control tool inside an instance (see list_desktop_tools for names and schemas).\n\
                           Screenshots and other content are returned as-is.",
         annotations(
@@ -712,6 +727,8 @@ impl Gateway {
     }
 
     #[tool(
+        name = "get_job_status",
+        title = "Get job status",
         description = "Check on a background job started by run_command (background: true), by the id it\n\
                           returned: whether it is still running or has exited (with its code), plus the tail\n\
                           of its log.",
@@ -722,6 +739,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Delete checkpoint",
         description = "Delete a checkpoint by label, freeing its disk and memory snapshot. The VM is not\n\
                           affected.",
         annotations(
@@ -741,6 +759,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "List port forwards",
         description = "List the active port forwards for a VM: each host port on 127.0.0.1, the guest port it\n\
                           reaches, and whether its tunnel is still alive.",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -756,6 +775,8 @@ impl Gateway {
     }
 
     #[tool(
+        name = "delete_forward",
+        title = "Delete port forward",
         description = "Stop forwarding a host port set up by forward_port; other forwards keep running.",
         annotations(
             read_only_hint = false,
@@ -763,7 +784,7 @@ impl Gateway {
             open_world_hint = false
         )
     )]
-    async fn remove_forward(&self, Parameters(a): Parameters<RemoveForwardArgs>) -> CallToolResult {
+    async fn delete_forward(&self, Parameters(a): Parameters<RemoveForwardArgs>) -> CallToolResult {
         text(
             async {
                 let inst = load(&a.name)?;
@@ -774,6 +795,7 @@ impl Gateway {
     }
 
     #[tool(
+        title = "Read VM log",
         description = "Read the tail of a VM's log: the hypervisor's `qemu` log (boot/device errors) or the\n\
                           guest's `serial` console. Useful when a VM won't boot or the desktop is unreachable.",
         annotations(read_only_hint = true, open_world_hint = false)
@@ -993,13 +1015,13 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
     let script = match inst.os {
         // Separate lines: `a && b &` would background the whole list, and that shell would
         // hold the SSH session open. The wrapper records the exit code in <id>.exit so
-        // job_status can report it after the job ends.
+        // get_job_status can report it after the job ends.
         Os::Ubuntu => format!(
             "d=~/agentpc-bg; mkdir -p $d && echo {b64} | base64 -d > $d/{id}.sh || exit 1\n\
              {env} setsid nohup bash -c 'bash \"$0\"; echo $? > \"$1\"' \
              $d/{id}.sh $d/{id}.exit > $d/{id}.log 2>&1 < /dev/null &\n\
              echo \"started in the background (id {id}, pid $!). \
-             Poll it with job_status name={name} id={id}. \
+             Poll it with get_job_status name={name} id={id}. \
              Output: $HOME/agentpc-bg/{id}.log. Stop it with: kill $!\"",
             env = ops::UBUNTU_SESSION_ENV
         ),
@@ -1014,7 +1036,7 @@ $p = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -Ru
 $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $task -Action $a -Principal $p -Settings $s -Force | Out-Null
 Start-ScheduledTask -TaskName $task
-"started in the background as scheduled task $task (id {id}). Poll it with job_status name={name} id={id}. Output: $log. Stop it with: Stop-ScheduledTask $task (and Stop-Process for anything it started)""#
+"started in the background as scheduled task $task (id {id}). Poll it with get_job_status name={name} id={id}. Output: $log. Stop it with: Stop-ScheduledTask $task (and Stop-Process for anything it started)""#
         ),
     };
     let out = exec(name, &script, 60, false).await?;

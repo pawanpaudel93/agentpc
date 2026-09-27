@@ -30,11 +30,11 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save the VM's disk and memory; go back to that state in seconds; or drop one checkpoint |
 | `delete_vm(name)` | Delete a VM with its disk and checkpoints |
 | `take_screenshot(name, save_to?)` | PNG screenshot; works even while booting or hung. `save_to` also writes it to a Mac path |
-| `run_command(name, command, timeout?, background?)` | Shell command: PowerShell on Windows, bash on Ubuntu. Returns `exit code: N` plus stdout and stderr, each trimmed to its first and last 10,000 characters. Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` (servers, long jobs) returns a job id to poll with `job_status` |
-| `job_status(name, id, tail_lines?)` | Background job's state (running, or exited with its code) plus its log tail |
+| `run_command(name, command, timeout?, background?)` | Shell command: PowerShell on Windows, bash on Ubuntu. Returns `exit code: N` plus stdout and stderr, each trimmed to its first and last 10,000 characters. Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` (servers, long jobs) returns a job id to poll with `get_job_status` |
+| `get_job_status(name, id, tail_lines?)` | Background job's state (running, or exited with its code) plus its log tail |
 | `upload_file` / `download_file` | Copy files or folders between this Mac and a VM |
 | `forward_port(name, guest_port, host_port?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). SSH tunnel: reaches a server on the guest's own `127.0.0.1`; lasts until the VM stops |
-| `list_forwards(name)` / `remove_forward(name, host_port)` | List a VM's forwards / stop one |
+| `list_forwards(name)` / `delete_forward(name, host_port)` | List a VM's forwards / stop one |
 | `read_vm_log(name, which, tail_lines?)` | Tail a VM's `qemu` or `serial` log when it won't boot or the desktop is unreachable |
 | `list_desktop_tools(name, tool?)` | List the GUI tools inside a VM, or one tool's full schema |
 | `use_desktop_tool(name, tool, arguments)` | Call a GUI tool: click, type, launch apps, read the UI tree |

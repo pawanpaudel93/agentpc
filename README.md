@@ -163,11 +163,11 @@ pick the server up automatically.
 | `delete_checkpoint` | Delete one checkpoint by label; the VM is untouched |
 | `delete_vm` | Delete a VM with its disk and checkpoints |
 | `take_screenshot` | PNG screenshot from the hypervisor; `save_to` also writes it to a path on your Mac |
-| `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu); returns exit code, stdout and stderr. A foreground run is killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id for `job_status` |
-| `job_status` | Check a background job by its id: still running or exited (with its code), plus the tail of its log |
+| `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu); returns exit code, stdout and stderr. A foreground run is killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id for `get_job_status` |
+| `get_job_status` | Check a background job by its id: still running or exited (with its code), plus the tail of its log |
 | `upload_file` / `download_file` | Copy files or folders between your Mac and a VM |
 | `forward_port` | Reach a server running in a VM from your Mac (SSH tunnel; works even for servers bound to the guest's own `127.0.0.1`) |
-| `list_forwards` / `remove_forward` | List a VM's active port forwards / stop one by its host port |
+| `list_forwards` / `delete_forward` | List a VM's active port forwards / stop one by its host port |
 | `read_vm_log` | Read the tail of a VM's `qemu` or `serial` log, for when a VM won't boot or the desktop is unreachable |
 | `list_desktop_tools` | List the desktop-control tools inside a VM |
 | `use_desktop_tool` | Call one of them: click, type, launch apps, read the UI tree, … |
@@ -373,7 +373,7 @@ Mac's network (a VPN or proxy configured on the Mac applies to a VM's outbound t
 - **Reach a server in a VM from the Mac:** `agentpc forward <name> <guest-port> [host-port]`
   (MCP: `forward_port`), then connect to `127.0.0.1:<host-port>`. It tunnels over SSH, so it
   reaches a server bound to the guest's own `127.0.0.1` and the Windows firewall doesn't apply.
-  A forward lasts until the VM stops or you remove it (`--rm <host-port>` / `remove_forward`);
+  A forward lasts until the VM stops or you remove it (`--rm <host-port>` / `delete_forward`);
   `--list` (MCP: `list_forwards`) shows a VM's forwards.
 - **Reach the Mac from a guest:** `10.0.2.2` is the Mac host — the NAT maps it to the Mac's
   loopback, so a dev server listening on `127.0.0.1` or `0.0.0.0` is reachable at

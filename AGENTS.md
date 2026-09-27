@@ -16,11 +16,11 @@ can run `agentpc mcp-install` (or install first: see README.md).
 | `start_vm` / `stop_vm` / `reset_vm` / `delete_vm` | Lifecycle. `reset_vm` = back to a clean install. |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save disk + memory before a risky step; restore in seconds; or drop one checkpoint. |
 | `take_screenshot(name, save_to?)` | Hypervisor screenshot; works even while booting or hung. `save_to` also writes the PNG to a Mac path. |
-| `run_command(name, command, timeout?, background?)` | Shell over SSH: PowerShell on windows, bash on ubuntu. Returns exit code, stdout, stderr (long output trimmed). Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id you poll with `job_status`. |
-| `job_status(name, id, tail_lines?)` | State of a background job (running, or exited with its code) plus its log tail. |
+| `run_command(name, command, timeout?, background?)` | Shell over SSH: PowerShell on windows, bash on ubuntu. Returns exit code, stdout, stderr (long output trimmed). Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id you poll with `get_job_status`. |
+| `get_job_status(name, id, tail_lines?)` | State of a background job (running, or exited with its code) plus its log tail. |
 | `upload_file` / `download_file` | Copy files or folders between the Mac and a VM. |
 | `forward_port(name, guest_port, host_port?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). SSH tunnel: reaches a server on the guest's own `127.0.0.1`; lasts until the VM stops. |
-| `list_forwards(name)` / `remove_forward(name, host_port)` | List a VM's forwards / stop one. |
+| `list_forwards(name)` / `delete_forward(name, host_port)` | List a VM's forwards / stop one. |
 | `read_vm_log(name, which, tail_lines?)` | Tail a VM's `qemu` or `serial` log when it won't boot or the desktop is unreachable. |
 | `list_desktop_tools(name, tool?)` | Desktop-control tools in that VM, or one tool's full schema. |
 | `use_desktop_tool(name, tool, arguments)` | Call one of those tools (click, type, launch, snapshot…). |
