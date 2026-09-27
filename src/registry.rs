@@ -106,6 +106,9 @@ pub fn push(image: &Image) -> Result<()> {
     let mut cmd = Command::new(oras);
     cmd.current_dir(&work)
         .args(["push", &target, "--artifact-type", ARTIFACT_TYPE]);
+    // GitHub shows a ghcr package on the repo page only when the manifest names its source.
+    cmd.arg("--annotation")
+        .arg("org.opencontainers.image.source=https://github.com/pawanpaudel93/agentpc");
     cmd.arg("--config")
         .arg(format!("config.json:{CONFIG_TYPE}"));
     for p in &parts {
