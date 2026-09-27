@@ -84,7 +84,6 @@ if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; the
 fi
 
 CURRENT=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-[ "$CURRENT" != "$VERSION" ] || die "Cargo.toml is already at $VERSION."
 
 # Until the release commit exists, put the version files back on any exit.
 BUNDLE=$(mktemp -d "${TMPDIR:-/tmp}/agentpc-release.XXXXXX")
@@ -98,7 +97,12 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 # --- version ---------------------------------------------------------------
-say "Setting version $CURRENT -> $VERSION"
+# Releasing the version already in Cargo.toml (e.g. the first release) skips the bump.
+if [ "$CURRENT" = "$VERSION" ]; then
+  say "Version files already at $VERSION"
+else
+  say "Setting version $CURRENT -> $VERSION"
+fi
 OLD_RE=$(printf '%s' "$CURRENT" | sed 's/\./\\./g')
 # subst FILE SED_EXPR: edit FILE in place (portable across BSD/GNU sed).
 subst() {
@@ -174,7 +178,7 @@ ASSETS="dist/$NAME.tar.gz dist/$NAME.tar.gz.sha256 dist/$MCPB dist/$MCPB.sha256 
 cat <<EOF
 
 Ready to publish $TAG:
-  commit  "chore: release $TAG"  ($VERSION_FILES)
+  commit  "chore: release $TAG"  ($VERSION_FILES; skipped if unchanged)
   tag     $TAG (annotated)
   push    git push origin main && git push origin $TAG
   release gh release create $TAG --repo $REPO --generate-notes
@@ -201,7 +205,7 @@ fi
 say "Committing and tagging $TAG"
 # shellcheck disable=SC2086
 git add -- $VERSION_FILES
-git commit --quiet -m "chore: release $TAG"
+git diff --cached --quiet || git commit --quiet -m "chore: release $TAG"
 RESTORE=0
 git tag -a "$TAG" -m "$TAG"
 
