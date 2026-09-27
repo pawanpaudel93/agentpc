@@ -64,7 +64,17 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
   `ctrl+l`), scroll, drag and right-click often need `"delivery_mode": "foreground"`; a reply
   that says "not verified" or "retry with foreground" means use it.
 - If `get_window_state` returns no elements, look for another window of the same app (e.g.
-  Notepad's first-run tip, "PopupHost") and dismiss it first.
+  Notepad's first-run tip, "PopupHost") and dismiss it first. Browser page content appears a
+  few seconds after load; read again if it's missing.
+- Modern apps (Notepad, Settings) ignore raw shortcuts like `ctrl+s`: use `invoke_menu` with a
+  path such as `["File", "Save as"]`, or click the menu items.
+- Dialogs, menus and pop-ups are separate windows: `list_windows` again to find them.
+  Classic file dialogs don't take `set_value`: click the "File name" field, then `type_text`
+  in the foreground. Several buttons can share a name (e.g. "Open"); pick the plain button,
+  not the dropdown.
+- The taskbar, Start menu and desktop aren't listed windows: use `click` with
+  `"scope": "desktop"` and screen coordinates (`"button": "right"` for the desktop menu).
+  `foreground_unavailable` can come back even when the click worked; check with a screenshot.
 - Windows images built by agentpc 0.1.0 use Windows-MCP instead (`list_desktop_tools` shows
   which): call `Snapshot` first; `Click` takes `loc: [x, y]`; `Type` needs `loc` or `label`.
 - `run_command` runs PowerShell as the `agent` administrator. The screen is 1280x800.
