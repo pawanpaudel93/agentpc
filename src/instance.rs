@@ -670,18 +670,20 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// `/tmp/agentpc-<uid>`, created 0700 and owned by us. A pre-existing path that is a
-/// symlink, owned by someone else, or group/world-writable could let another user hijack
-/// the QMP socket, so we fall back to `$AGENTPC_HOME/run` rather than trust it.
+/// `/tmp/agentpc-<uid>`, kept 0700. It's short enough for macOS's 104-byte socket paths. A
+/// pre-existing path that is a symlink, owned by someone else, or group/world-writable could
+/// let another user hijack the QMP socket, so we fall back to `$AGENTPC_HOME/run` rather than
+/// trust it.
 fn runtime_dir() -> PathBuf {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     // SAFETY: getuid(2) has no preconditions.
     let uid = unsafe { getuid() };
     let dir = PathBuf::from(format!("/tmp/agentpc-{uid}"));
     let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
     let trusted = std::fs::symlink_metadata(&dir)
-        .is_ok_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0);
+        .is_ok_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o022 == 0);
     if trusted {
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         return dir;
     }
     let fallback = home().join("run");

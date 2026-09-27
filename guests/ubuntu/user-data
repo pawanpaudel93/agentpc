@@ -40,7 +40,31 @@ write_files:
         Option "OffTime" "0"
       EndSection
 
+  # Images are shared, so SSH trusts whichever Mac boots them: agentpc passes its public key
+  # as an SMBIOS OEM string (-smbios type=11) and this installs it at every boot.
+  - path: /usr/local/sbin/agentpc-ssh-key
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      key=$(dmidecode -t 11 2>/dev/null | sed -n 's/^.*agentpc-ssh-key=//p' | head -n 1)
+      [ -n "$key" ] || exit 0
+      install -d -m 700 -o agent -g agent /home/agent/.ssh
+      printf '%s\n' "$key" > /home/agent/.ssh/authorized_keys
+      chown agent:agent /home/agent/.ssh/authorized_keys
+      chmod 600 /home/agent/.ssh/authorized_keys
+  - path: /etc/systemd/system/agentpc-ssh-key.service
+    content: |
+      [Unit]
+      Description=Install the agentpc host's SSH key
+      Before=ssh.service
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/agentpc-ssh-key
+      [Install]
+      WantedBy=multi-user.target
+
 runcmd:
+  - systemctl enable agentpc-ssh-key.service
   - systemctl set-default graphical.target
   # xfce4 pulls in light-locker, which would lock the agent out of the session.
   - apt-get purge -y light-locker

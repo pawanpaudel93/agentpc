@@ -420,7 +420,13 @@ fn provision_image(image: &Image) -> Result<()> {
             }
             log!("no {image} image yet; downloading it");
             if let Err(e) = crate::registry::pull_locked(image) {
-                log!("download failed ({e:#}); building it locally instead (~3 min)");
+                // A failed snapshot leaves a downloaded but unusable image; rebuild it too.
+                let what = if image.exists() {
+                    "setting up the downloaded image"
+                } else {
+                    "download"
+                };
+                log!("{what} failed ({e:#}); building it locally instead (~3 min)");
                 crate::image::build_locked(image, None)?;
             }
             Ok(())

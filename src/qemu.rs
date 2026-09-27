@@ -235,6 +235,16 @@ fn launch(
             );
         }
         Os::Ubuntu => {
+            // Images are shared (ghcr), so the guest can't have this Mac's key baked in; it
+            // reads it from this SMBIOS OEM string at boot (agentpc-ssh-key.service).
+            crate::image::ensure_ssh_key()?;
+            let key = std::fs::read_to_string(crate::image::public_key())
+                .context("read SSH public key")?;
+            args.push("-smbios".into());
+            args.push(format!(
+                "type=11,value=agentpc-ssh-key={}",
+                key.trim().replace(',', ",,")
+            ));
             args.extend(["-device", "virtio-gpu-pci"].map(String::from));
             args.push("-drive".into());
             args.push(format!(

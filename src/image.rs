@@ -593,7 +593,7 @@ pub fn remove(image: &Image) -> Result<String> {
     Ok(format!("removed {image}"))
 }
 
-fn ensure_ssh_key() -> Result<()> {
+pub(crate) fn ensure_ssh_key() -> Result<()> {
     let key = ssh_key();
     if key.exists() {
         return Ok(());
@@ -614,7 +614,7 @@ fn ensure_ssh_key() -> Result<()> {
     )
 }
 
-fn public_key() -> PathBuf {
+pub(crate) fn public_key() -> PathBuf {
     ssh_key().with_extension("pub")
 }
 
