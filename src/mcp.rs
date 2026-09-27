@@ -45,7 +45,7 @@ The first create of an image can take minutes (download/build); after that it's 
 Desktop tools come from cua-driver on both OSes: launch_app returns a pid and window_ids;
 get_window_state(pid, window_id) returns numbered elements and a snapshot_id to pass with
 element_index to click/type_text. On Ubuntu, keyboard/mouse input needs \"delivery_mode\":
-\"foreground\". Windows images built by agentpc 0.1.0 use Windows-MCP instead (call Snapshot
+\"foreground\"; on Windows, typing into the focused field, scroll, drag and right-click often do. Windows images built by agentpc 0.1.0 use Windows-MCP instead (call Snapshot
 first; Click/Type need a loc [x, y] or label); list_desktop_tools shows which.
 
 Rules:
@@ -908,7 +908,7 @@ async fn connect(name: &str) -> Result<RunningService<RoleClient, ()>> {
             // The `serve` daemon runs in the logged-in desktop session; SSH is Session 0,
             // where plain `mcp` refuses to start, so name the daemon's pipe explicitly.
             // Images built before cua-driver shipped still run Windows-MCP over HTTP.
-            Os::Windows if windows_has_cua_driver(&inst).await => {
+            Os::Windows if windows_cua_driver(&inst).await? => {
                 let remote = format!(
                     "& \"{}\" mcp --socket \\\\.\\pipe\\cua-driver",
                     ops::WINDOWS_CUA_DRIVER
@@ -941,19 +941,33 @@ async fn connect(name: &str) -> Result<RunningService<RoleClient, ()>> {
         .with_context(|| format!("cannot reach the desktop server in {name}"))
 }
 
-async fn windows_has_cua_driver(inst: &Instance) -> bool {
-    let check = format!(
-        "if (Test-Path \"{}\") {{ exit 0 }} else {{ exit 1 }}",
+/// Whether the VM has cua-driver, starting its daemon first if it isn't running (its
+/// logon task doesn't restart it after a crash or kill).
+async fn windows_cua_driver(inst: &Instance) -> Result<bool> {
+    let script = format!(
+        r#"$c = "{}"
+if (-not (Test-Path $c)) {{ exit 3 }}
+function up {{ (& $c status 2>&1 | Out-String) -match 'daemon is running' }}
+if (-not (up)) {{ & $c autostart kick *> $null; foreach ($i in 1..15) {{ Start-Sleep 1; if (up) {{ break }} }} }}
+exit 0"#,
         ops::WINDOWS_CUA_DRIVER
     );
-    tokio::process::Command::new("ssh")
-        .args(ops::ssh_args(inst, &check))
+    let out = tokio::process::Command::new("ssh")
+        .args(ops::ssh_args(inst, &script))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .await
-        .is_ok_and(|s| s.success())
+        .context("run ssh")?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(3) => Ok(false),
+        _ => bail!(
+            "ssh to {} failed: {}",
+            inst.name,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
 }
 
 /// Characters kept from each end of a long stdout or stderr.

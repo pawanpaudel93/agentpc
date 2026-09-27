@@ -30,7 +30,8 @@ verify. Prefer `run_command` for anything a shell can do; use `use_desktop_tool`
 
 **Windows** (desktop tools from cua-driver): `launch_app` takes a name such as `notepad` and
 returns the `pid` and `window_id`s. `get_window_state(pid, window_id)` returns numbered elements
-and a `snapshot_id`; `click`/`type_text` take `snapshot_id` with `element_index`. Windows images
+and a `snapshot_id`; `click`/`type_text` take `snapshot_id` with `element_index`. Typing into the
+focused field, scroll, drag and right-click often need `"delivery_mode": "foreground"`. Windows images
 built by agentpc 0.1.0 use Windows-MCP instead: call `Snapshot` first, `Click` takes
 `loc: [x, y]`, `Type` needs `loc` or `label`.
 

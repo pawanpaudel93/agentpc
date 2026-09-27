@@ -2,7 +2,7 @@
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -197,33 +197,67 @@ pub fn ssh(inst: &Instance, remote: &str) -> Result<Output> {
 pub const WINDOWS_CUA_DRIVER: &str =
     r"$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin\cua-driver.exe";
 
-/// Desktop session up and its control server answering.
-pub fn ready(inst: &Instance) -> bool {
+/// Desktop session up and its control server answering. Errs when it never will be.
+pub fn ready(inst: &Instance) -> Result<bool> {
     match inst.os {
         // Images built before cua-driver shipped run Windows-MCP over HTTP instead.
         Os::Windows => {
             let probe = format!(
                 r#"if (-not (Test-Path C:\OEM\done.txt)) {{ 'wait' }}
-elseif (-not (Test-Path "{WINDOWS_CUA_DRIVER}")) {{ 'http' }}
-elseif ((& "{WINDOWS_CUA_DRIVER}" status 2>&1 | Out-String) -match 'daemon is running') {{ 'ready' }}"#
+elseif (Test-Path "{WINDOWS_CUA_DRIVER}") {{ if ((& "{WINDOWS_CUA_DRIVER}" status 2>&1 | Out-String) -match 'daemon is running') {{ 'ready' }} }}
+elseif (Test-Path C:\uv\bin\windows-mcp.exe) {{ 'http' }}
+else {{ 'missing' }}"#
             );
-            match ssh(inst, &probe) {
-                Ok(o) => match String::from_utf8_lossy(&o.stdout).trim() {
-                    "ready" => true,
-                    "http" => http_responds(inst.mcp_port()),
+            let out = ssh_within(inst, &probe, Duration::from_secs(20));
+            Ok(
+                match out
+                    .as_ref()
+                    .map(|o| String::from_utf8_lossy(&o.stdout))
+                    .as_deref()
+                    .map(str::trim)
+                {
+                    Some("ready") => true,
+                    Some("http") => http_responds(inst.mcp_port()),
+                    Some("missing") => bail!(
+                        "{}: setup finished but installed no desktop-control server \
+                     (see C:\\OEM\\setup.log in the guest)",
+                        inst.name
+                    ),
                     _ => false,
                 },
-                Err(_) => false,
-            }
+            )
         }
-        Os::Ubuntu => ssh(
+        Os::Ubuntu => Ok(ssh(
             inst,
             &format!(
                 "test -f /var/lib/cloud/agent-ready && pgrep -x xfce4-session >/dev/null && \
                  {UBUNTU_SESSION_ENV} ~/.local/bin/cua-driver --version"
             ),
         )
-        .is_ok_and(|o| o.status.success()),
+        .is_ok_and(|o| o.status.success())),
+    }
+}
+
+/// `ssh` that gives up after `limit`: a wedged guest command would otherwise block forever.
+fn ssh_within(inst: &Instance, remote: &str, limit: Duration) -> Option<Output> {
+    let mut child = Command::new("ssh")
+        .args(ssh_args(inst, remote))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(100)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
     }
 }
 
@@ -245,7 +279,7 @@ fn http_responds(port: u16) -> bool {
 
 pub fn wait_ready(inst: &Instance, timeout: Duration) -> Result<Duration> {
     let start = Instant::now();
-    while !ready(inst) {
+    while !ready(inst)? {
         if !inst.running() {
             bail!(
                 "{}: qemu exited (see {})",

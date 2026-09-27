@@ -60,6 +60,9 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 - `get_window_state(pid, window_id)` returns numbered elements and a `snapshot_id`;
   `click` and `type_text` take that `snapshot_id` with an `element_index`.
 - `get_desktop_state` returns a screenshot of the whole screen.
+- Input goes to the app in the background. Keys typed into whatever has focus (e.g. after
+  `ctrl+l`), scroll, drag and right-click often need `"delivery_mode": "foreground"`; a reply
+  that says "not verified" or "retry with foreground" means use it.
 - If `get_window_state` returns no elements, look for another window of the same app (e.g.
   Notepad's first-run tip, "PopupHost") and dismiss it first.
 - Windows images built by agentpc 0.1.0 use Windows-MCP instead (`list_desktop_tools` shows
