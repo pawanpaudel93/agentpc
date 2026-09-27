@@ -23,12 +23,12 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 
 | Tool | Use |
 | --- | --- |
-| `list_vms` | VMs, their state, and the available images with OS versions. Start here. |
+| `list_vms` | VMs (state, size, checkpoints) and the available images with OS versions. Start here. |
 | `create_vm(os, version?, name?)` | New VM (`ubuntu` or `windows`, optionally a version such as `22.04`); returns when the desktop is ready |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down |
 | `reset_vm(name)` | Discard all changes: back to a clean install |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` | Save the VM's disk and memory; go back to exactly that state in seconds |
-| `delete_vm(name)` | Delete a VM |
+| `delete_vm(name)` | Delete a VM with its disk and checkpoints |
 | `take_screenshot(name)` | PNG screenshot; works even while booting or hung |
 | `run_command(name, command)` | Shell command: PowerShell on Windows, bash on Ubuntu. Returns `exit code: N` plus stdout and stderr; each is trimmed to its first and last 10,000 characters |
 | `upload_file` / `download_file` | Copy files or folders between this Mac and a VM |

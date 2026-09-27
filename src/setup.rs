@@ -1,4 +1,4 @@
-//! Agent registration and prerequisite checks.
+//! Agent registration, prerequisite checks, cleanup and uninstall.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

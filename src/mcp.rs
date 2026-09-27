@@ -21,10 +21,10 @@ use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioC
 use rmcp::{RoleClient, ServerHandler, ServiceError, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::instance::{Image, Instance, Os};
-use crate::{ops, qemu, viewer};
+use crate::{ops, qemu};
 
 const INSTRUCTIONS: &str = "\
 Controls disposable Windows and Ubuntu desktop VMs on this Mac.
@@ -163,37 +163,11 @@ struct DesktopArgs {
 #[tool_router]
 impl Gateway {
     #[tool(
-        description = "List VM instances (name, image, state, viewer URL) and which images exist."
+        description = "List VM instances (name, image, state, size, checkpoints, viewer URL) and which images\n\
+                          exist."
     )]
     async fn list_vms(&self) -> CallToolResult {
-        text(blocking(|| {
-            let instances: Vec<_> = Instance::list()?
-                .iter()
-                .map(|i| {
-                    json!({
-                        "name": i.name, "os": i.os, "image": i.image.to_string(), "state": if i.running() { "running" } else { "stopped" },
-                        "slot": i.slot, "viewer": viewer::url(i), "ssh_port": i.ssh_port(),
-                        "checkpoints": ops::checkpoints(i),
-                    })
-                })
-                .collect();
-            let images: Vec<Value> = Image::all()
-                .into_iter()
-                .map(|image| {
-                    let info = crate::image::read_info(&image);
-                    json!({
-                        "image": image.to_string(),
-                        "os": image.os,
-                        "version": info.as_ref().map(|i| i.version.clone()),
-                        "based_on": info.as_ref().map(|i| i.base.clone()),
-                        "desktop_server": info.as_ref().map(|i| i.desktop_server.clone()),
-                        "fast_start": image.has_snapshot(),
-                    })
-                })
-                .collect();
-            Ok(serde_json::to_string_pretty(&json!({"instances": instances, "images": images}))?)
-        })
-        .await)
+        text(blocking(ops::list_json).await)
     }
 
     #[tool(
@@ -239,7 +213,7 @@ impl Gateway {
         text(self.lifecycle(&a.name, ops::reset).await)
     }
 
-    #[tool(description = "Stop an instance and delete it with its disk.")]
+    #[tool(description = "Stop an instance and delete it with its disk and checkpoints.")]
     async fn delete_vm(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
         text(self.lifecycle(&a.name, ops::delete).await)
     }

@@ -41,6 +41,7 @@ enum Cmd {
     Create {
         /// ubuntu, windows, or a version: ubuntu-22.04, windows-11-23h2 (see image build --help)
         image: String,
+        /// VM name (default: <os>-<n>)
         name: Option<String>,
         /// Memory in GB (default 8 Windows, 4 Ubuntu); a non-default size cold-boots
         #[arg(long)]
@@ -50,61 +51,115 @@ enum Cmd {
         cpus: Option<u32>,
     },
     /// List VMs and images
-    List,
-    /// Viewer URL, SSH and VNC details
-    Info { name: String },
-    /// Boot a stopped VM
-    Start { name: String },
-    /// Shut a VM down cleanly (its disk is kept), or every running VM with --all
+    #[command(visible_alias = "ls")]
+    List {
+        /// Print JSON (the same data as the MCP list_vms tool)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Viewer URL, SSH and VNC details, and checkpoints
+    Info {
+        /// VM name
+        name: String,
+    },
+    /// Boot stopped VMs
+    Start {
+        /// VM names
+        #[arg(required_unless_present = "all")]
+        names: Vec<String>,
+        /// Start every stopped VM
+        #[arg(long, conflicts_with = "names")]
+        all: bool,
+    },
+    /// Shut VMs down cleanly (their disks are kept)
     Stop {
-        name: Option<String>,
+        /// VM names
+        #[arg(required_unless_present = "all")]
+        names: Vec<String>,
         /// Stop every running VM
-        #[arg(long, conflicts_with = "name")]
+        #[arg(long, conflicts_with = "names")]
         all: bool,
     },
     /// Discard all changes: back to a fresh copy of the image
-    Reset { name: String },
-    /// Delete a VM and its disk
-    Rm { name: String },
+    Reset {
+        /// VM names
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Delete VMs, their disks and checkpoints
+    #[command(visible_alias = "delete")]
+    Rm {
+        /// VM names
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
     /// Save a VM's disk and memory under a label (a running VM pauses for a few seconds)
     Checkpoint {
+        /// VM name
         name: String,
+        /// Checkpoint name: letters, digits, . - _
         label: String,
         /// Delete the checkpoint instead
-        #[arg(long)]
+        #[arg(short, long)]
         delete: bool,
     },
     /// Put a VM back exactly as it was at a checkpoint (resumes in seconds)
-    Restore { name: String, label: String },
+    Restore {
+        /// VM name
+        name: String,
+        /// Checkpoint name (agentpc info <name> lists them)
+        label: String,
+    },
     /// Shell into a VM, or run a command (PowerShell on Windows, bash on Ubuntu)
     Ssh {
+        /// VM name
         name: String,
+        /// Command to run; an interactive shell if omitted
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
     /// Copy files between this Mac and a VM: `agentpc cp ./app.msi windows-1:Downloads/`
-    Cp { src: String, dst: String },
+    Cp {
+        /// Source: a path on this Mac, or <vm>:<path>
+        src: String,
+        /// Destination: a path on this Mac, or <vm>:<path>
+        dst: String,
+    },
     /// Forward 127.0.0.1:<host_port> to a port inside a running VM (free port if omitted)
     Forward {
+        /// VM name
         name: String,
+        /// Port a server listens on inside the VM
         guest_port: u16,
+        /// Port on this Mac (default: a free one)
         host_port: Option<u16>,
     },
     /// Save a PNG screenshot
-    Screenshot { name: String, out: Option<PathBuf> },
+    Screenshot {
+        /// VM name
+        name: String,
+        /// Output file (default: <vm dir>/screen.png)
+        out: Option<PathBuf>,
+    },
     /// Manage images (the installed OS every VM is cloned from)
     #[command(subcommand)]
     Image(ImageCmd),
     /// Run the MCP server on stdio (what agents launch)
     Mcp,
-    /// Register the MCP server with installed agents (claude, claude-desktop, codex, cursor, gemini, vscode)
-    McpInstall { clients: Vec<String> },
-    /// Remove the MCP server from agents (all when none given)
-    McpUninstall { clients: Vec<String> },
+    /// Register the MCP server with installed agents
+    McpInstall {
+        /// claude, claude-desktop, codex, cursor, gemini, vscode (default: every one installed)
+        clients: Vec<String>,
+    },
+    /// Remove the MCP server from agents
+    McpUninstall {
+        /// claude, claude-desktop, codex, cursor, gemini, vscode (default: all)
+        clients: Vec<String>,
+    },
     /// Free disk space: downloaded ISOs and cloud images, and leftovers of interrupted work
     Clean {
         /// Only show what would be deleted
-        #[arg(long)]
+        #[arg(short = 'n', long)]
         dry_run: bool,
     },
     /// Remove agentpc: stops VMs, unregisters agents, deletes ~/.agentpc and this binary
@@ -113,11 +168,16 @@ enum Cmd {
         #[arg(long)]
         keep_data: bool,
         /// Don't ask for confirmation
-        #[arg(long)]
+        #[arg(short, long)]
         yes: bool,
     },
     /// Check prerequisites
     Doctor,
+    /// Print a shell completion script: agentpc completions zsh > ~/.zfunc/_agentpc
+    Completions {
+        /// bash, zsh, fish, elvish or powershell
+        shell: clap_complete::Shell,
+    },
     #[command(name = "__viewer", hide = true)]
     Viewer,
 }
@@ -134,6 +194,7 @@ Images are <os>-<version>; a bare os means the default version.
 ISOs are checksum-verified. --iso installs your own: it must match a release name above,
 or use any other name (windows-custom).")]
     Build {
+        /// Image to build, e.g. ubuntu, ubuntu-22.04, windows, windows-11-24h2
         image: String,
         /// Windows ARM64 ISO to install from (default: $WIN_ISO, an earlier download,
         /// a Home/Pro ISO of that release in ~/Downloads, else download it)
@@ -141,17 +202,35 @@ or use any other name (windows-custom).")]
         iso: Option<PathBuf>,
     },
     /// Download a published image, e.g. ubuntu-22.04 (Ubuntu only; Windows can't be redistributed)
-    Pull { image: String },
+    Pull {
+        /// Image, e.g. ubuntu or ubuntu-22.04
+        image: String,
+    },
     /// Publish a local image to the registry (maintainers; needs `oras login`)
-    Push { image: String },
+    Push {
+        /// Image, e.g. ubuntu-24.04
+        image: String,
+    },
     /// List local images
+    #[command(visible_alias = "list")]
     Ls,
     /// Everything recorded about an image: OS version, edition, build, source, tool versions
-    Info { image: String },
-    /// Delete a local image
-    Rm { image: String },
+    Info {
+        /// Image, e.g. ubuntu-24.04 or windows
+        image: String,
+    },
+    /// Delete local images
+    #[command(visible_alias = "delete")]
+    Rm {
+        /// Images, e.g. windows-11-24h2
+        #[arg(required = true)]
+        images: Vec<String>,
+    },
     /// Recapture the RAM snapshot new VMs resume from (build and pull do this)
-    Snapshot { image: String },
+    Snapshot {
+        /// Image, e.g. ubuntu-24.04
+        image: String,
+    },
 }
 
 fn main() {
@@ -178,16 +257,16 @@ fn run(cli: Cli) -> Result<()> {
             memory,
             cpus,
         )),
-        Cmd::List => out(ops::list_table()),
+        Cmd::List { json } => out(if json {
+            ops::list_json()
+        } else {
+            ops::list_table()
+        }),
         Cmd::Info { name } => out(Ok(ops::info(&Instance::load(&name)?))),
-        Cmd::Start { name } => out(ops::boot(&Instance::load(&name)?)),
-        Cmd::Stop { name, all } => match (name, all) {
-            (Some(name), false) => out(ops::stop(&Instance::load(&name)?)),
-            (None, true) => out(ops::stop_all()),
-            _ => anyhow::bail!("name a VM, or pass --all"),
-        },
-        Cmd::Reset { name } => out(ops::reset(&Instance::load(&name)?)),
-        Cmd::Rm { name } => out(ops::delete(&Instance::load(&name)?)),
+        Cmd::Start { names, all } => for_each_vm(&names, all.then_some(false), ops::boot),
+        Cmd::Stop { names, all } => for_each_vm(&names, all.then_some(true), ops::stop),
+        Cmd::Reset { names } => for_each_vm(&names, None, ops::reset),
+        Cmd::Rm { names } => for_each_vm(&names, None, ops::delete),
         Cmd::Checkpoint {
             name,
             label,
@@ -232,7 +311,10 @@ fn run(cli: Cli) -> Result<()> {
             ImageCmd::Push { image: i } => registry::push(&i.parse()?),
             ImageCmd::Ls => out(image::list()),
             ImageCmd::Info { image: i } => out(image::describe(&Image::resolve(&i)?)),
-            ImageCmd::Rm { image: i } => out(image::remove(&i.parse()?)),
+            ImageCmd::Rm { images } => {
+                let images: Vec<Image> = images.iter().map(|i| i.parse()).collect::<Result<_>>()?;
+                each(images, |i| image::remove(&i))
+            }
             ImageCmd::Snapshot { image: i } => image::snapshot(&i.parse::<Image>()?),
         },
         Cmd::Mcp => tokio::runtime::Runtime::new()?.block_on(mcp::serve()),
@@ -244,6 +326,16 @@ fn run(cli: Cli) -> Result<()> {
             if !setup::doctor()? {
                 std::process::exit(1);
             }
+            Ok(())
+        }
+        Cmd::Completions { shell } => {
+            use clap::CommandFactory;
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "agentpc",
+                &mut std::io::stdout(),
+            );
             Ok(())
         }
         Cmd::Viewer => viewer::serve(),
@@ -284,6 +376,47 @@ fn copy(src: &str, dst: &str) -> Result<String> {
             "exactly one side must be <vm>:<path>, e.g. agentpc cp ./file ubuntu-1:/tmp/"
         ),
     }
+}
+
+/// Run `op` on the named VMs, or with `all = Some(running)` on every VM in that state.
+/// Names are checked before anything runs; one failure doesn't stop the rest.
+fn for_each_vm(
+    names: &[String],
+    all: Option<bool>,
+    op: fn(&Instance) -> Result<String>,
+) -> Result<()> {
+    let targets: Vec<Instance> = match all {
+        Some(running) => Instance::list()?
+            .into_iter()
+            .filter(|i| i.running() == running)
+            .collect(),
+        None => names
+            .iter()
+            .map(|n| Instance::load(n))
+            .collect::<Result<_>>()?,
+    };
+    if targets.is_empty() {
+        println!("no VMs to act on");
+        return Ok(());
+    }
+    each(targets, |i| op(&i))
+}
+
+fn each<T>(items: Vec<T>, op: impl Fn(T) -> Result<String>) -> Result<()> {
+    let mut failed = 0;
+    for item in items {
+        match op(item) {
+            Ok(s) => println!("{}", s.trim_end()),
+            Err(e) => {
+                log!("FAIL: {e:#}");
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} of them failed");
+    }
+    Ok(())
 }
 
 fn out(r: Result<String>) -> Result<()> {

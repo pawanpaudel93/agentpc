@@ -154,12 +154,12 @@ pick the server up automatically.
 
 | Tool | Description |
 | --- | --- |
-| `list_vms` | VMs, their state, and the available images with their OS versions |
+| `list_vms` | VMs (state, size, checkpoints) and the available images with their OS versions |
 | `create_vm` | Create a VM (optionally of a given version) and wait until its desktop is ready |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down cleanly |
 | `reset_vm` | Discard all changes: back to a fresh copy of the image |
 | `checkpoint_vm` / `restore_vm` | Save a VM's disk and memory under a label; go back to it in seconds |
-| `delete_vm` | Delete a VM and its disk |
+| `delete_vm` | Delete a VM with its disk and checkpoints |
 | `take_screenshot` | PNG screenshot from the hypervisor |
 | `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu); returns exit code, stdout and stderr |
 | `upload_file` / `download_file` | Copy files or folders between your Mac and a VM |
@@ -178,16 +178,20 @@ pick the server up automatically.
 
 ### VMs
 
+Commands that act on VMs take several names (`agentpc stop a b`), check them all before
+doing anything, and carry on past a failure (exit status 1 if any failed). Every command has
+`--help`.
+
 | Command | Description |
 | --- | --- |
 | `agentpc create <image> [name] [--memory GB] [--cpus N]` | Create a VM from `ubuntu`, `windows` or a version such as `ubuntu-22.04`; fetches Ubuntu images if missing. A non-default size boots cold instead of resuming |
-| `agentpc list` | VMs and images |
-| `agentpc info <name>` | Viewer URL, SSH and VNC details |
-| `agentpc start <name>` | Boot a stopped VM |
-| `agentpc stop <name>` / `--all` | Shut a VM (or every running VM) down cleanly; disks are kept |
-| `agentpc reset <name>` | Discard all changes: back to a fresh copy of the image |
-| `agentpc rm <name>` | Delete a VM and its disk |
-| `agentpc checkpoint <name> <label> [--delete]` | Save a VM's disk and memory (a running VM pauses ~5 s), or delete a checkpoint |
+| `agentpc list [--json]` (`ls`) | VMs and images; `--json` gives the same data as the MCP `list_vms` tool |
+| `agentpc info <name>` | Viewer URL, SSH and VNC details, and checkpoints |
+| `agentpc start <name>… \| --all` | Boot stopped VMs |
+| `agentpc stop <name>… \| --all` | Shut VMs down cleanly; disks are kept |
+| `agentpc reset <name>…` | Discard all changes: back to a fresh copy of the image |
+| `agentpc rm <name>…` (`delete`) | Delete VMs with their disks and checkpoints |
+| `agentpc checkpoint <name> <label> [-d]` | Save a VM's disk and memory (a running VM pauses ~5 s), or delete a checkpoint |
 | `agentpc restore <name> <label>` | Put a VM back exactly as it was at a checkpoint (resumes in seconds) |
 | `agentpc ssh <name> [command]` | Run a command, or open a shell with no command |
 | `agentpc screenshot <name> [file]` | Save a PNG screenshot |
@@ -200,9 +204,9 @@ pick the server up automatically.
 | --- | --- |
 | `agentpc image pull <image>` | Download a published Ubuntu image, e.g. `ubuntu` or `ubuntu-22.04` |
 | `agentpc image build <image> [--iso <path>]` | Build an image locally (Ubuntu ~3 min, Windows ~12 min + ISO download) |
-| `agentpc image ls` | List local images with their OS versions |
+| `agentpc image ls` (`list`) | List local images with their OS versions |
 | `agentpc image info <image>` | Version, source, build date and desktop server of an image |
-| `agentpc image rm <image>` | Delete a local image |
+| `agentpc image rm <image>…` (`delete`) | Delete local images |
 | `agentpc image snapshot <image>` | Recapture the snapshot VMs resume from (build and pull do this) |
 | `agentpc image push <image>` | Maintainers: publish an Ubuntu image to ghcr.io |
 
@@ -214,8 +218,9 @@ pick the server up automatically.
 | `agentpc mcp-install [clients…]` | Register the MCP server with agents |
 | `agentpc mcp-uninstall [clients…]` | Remove it from agents again |
 | `agentpc doctor` | Check prerequisites |
-| `agentpc clean [--dry-run]` | Free disk space: downloaded ISOs and cloud images, and leftovers of interrupted builds or checkpoints. Never touches images or VMs; lists images no VM uses |
-| `agentpc uninstall [--keep-data] [--yes]` | Remove agentpc (see [Uninstalling](#uninstalling)) |
+| `agentpc clean [-n]` | Free disk space: downloaded ISOs and cloud images, and leftovers of interrupted builds or checkpoints. Never touches images or VMs; lists images no VM uses |
+| `agentpc uninstall [--keep-data] [-y]` | Remove agentpc (see [Uninstalling](#uninstalling)) |
+| `agentpc completions <shell>` | Print tab completion for bash, zsh or fish, e.g. `agentpc completions zsh > ~/.zfunc/_agentpc` |
 
 ## Images
 
@@ -346,7 +351,7 @@ The guest login is `agent` / `agent`.
 ## Uninstalling
 
 ```sh
-agentpc uninstall            # asks first; --yes skips the prompt
+agentpc uninstall            # asks first; -y skips the prompt
 ```
 
 This stops all VMs, removes the MCP server from every agent `mcp-install` registered it with,

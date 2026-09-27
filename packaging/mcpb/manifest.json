@@ -19,14 +19,14 @@
     }
   },
   "tools": [
-    { "name": "list_vms", "description": "VMs, their state, and which images exist" },
+    { "name": "list_vms", "description": "VMs (state, size, checkpoints) and which images exist" },
     { "name": "create_vm", "description": "Create a VM, optionally of a given OS version; ready in ~1 s (Ubuntu) or ~4 s (Windows)" },
     { "name": "start_vm", "description": "Start an instance" },
     { "name": "stop_vm", "description": "Stop an instance" },
     { "name": "reset_vm", "description": "Discard all changes: back to a fresh copy of the image" },
     { "name": "checkpoint_vm", "description": "Save a VM's disk and memory under a label" },
     { "name": "restore_vm", "description": "Put a VM back exactly as it was at a checkpoint (resumes in seconds)" },
-    { "name": "delete_vm", "description": "Stop and delete an instance" },
+    { "name": "delete_vm", "description": "Stop and delete an instance with its disk and checkpoints" },
     { "name": "take_screenshot", "description": "Hypervisor screenshot of an instance" },
     { "name": "run_command", "description": "Run a shell command (PowerShell on Windows, bash on Ubuntu); returns the exit code, stdout and stderr" },
     { "name": "upload_file", "description": "Copy a file or folder from this Mac into a VM" },

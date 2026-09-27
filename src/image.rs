@@ -1,4 +1,4 @@
-//! Images: install an OS once into a build VM (`_build-<os>`, slot 0), freeze its disk
+//! Images: install an OS once into a build VM (`_build-<image>`, slot 0), freeze its disk
 //! as a read-only image that `create` clones, and capture its RAM snapshot.
 
 use std::path::{Path, PathBuf};
@@ -252,7 +252,7 @@ fn prepare_guest(inst: &Instance) -> Result<()> {
     Ok(())
 }
 
-/// What an image contains. Kept next to it as `<os>.json` and published as its OCI config.
+/// What an image contains. Kept next to it as `<image>.json` and published as its OCI config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImageInfo {
     pub os: String,

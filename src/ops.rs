@@ -470,21 +470,6 @@ fn sync_clock(inst: &Instance) {
     }
 }
 
-pub fn stop_all() -> Result<String> {
-    let running: Vec<Instance> = Instance::list()?
-        .into_iter()
-        .filter(|i| i.running())
-        .collect();
-    if running.is_empty() {
-        return Ok("no VMs are running".into());
-    }
-    let mut out = Vec::new();
-    for inst in running {
-        out.push(stop(&inst)?);
-    }
-    Ok(out.join("\n"))
-}
-
 pub fn stop(inst: &Instance) -> Result<String> {
     qemu::stop(inst)?;
     viewer::stop_if_idle();
@@ -503,6 +488,46 @@ pub fn delete(inst: &Instance) -> Result<String> {
     std::fs::remove_dir_all(&inst.dir)?;
     viewer::stop_if_idle();
     Ok(format!("removed {}", inst.name))
+}
+
+/// VMs and images as JSON: `agentpc list --json` and the MCP `list_vms` tool.
+pub fn list_json() -> Result<String> {
+    use serde_json::json;
+    let instances: Vec<_> = Instance::list()?
+        .iter()
+        .map(|i| {
+            let (memory_gb, cpus) = i.size();
+            json!({
+                "name": i.name,
+                "os": i.os,
+                "image": i.image.to_string(),
+                "state": if i.running() { "running" } else { "stopped" },
+                "slot": i.slot,
+                "memory_gb": memory_gb,
+                "cpus": cpus,
+                "viewer": viewer::url(i),
+                "ssh_port": i.ssh_port(),
+                "checkpoints": checkpoints(i),
+            })
+        })
+        .collect();
+    let images: Vec<_> = Image::all()
+        .into_iter()
+        .map(|image| {
+            let info = crate::image::read_info(&image);
+            json!({
+                "image": image.to_string(),
+                "os": image.os,
+                "version": info.as_ref().map(|i| i.version.clone()),
+                "based_on": info.as_ref().map(|i| i.base.clone()),
+                "desktop_server": info.as_ref().map(|i| i.desktop_server.clone()),
+                "fast_start": image.has_snapshot(),
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string_pretty(
+        &json!({"instances": instances, "images": images}),
+    )?)
 }
 
 pub fn list_table() -> Result<String> {
