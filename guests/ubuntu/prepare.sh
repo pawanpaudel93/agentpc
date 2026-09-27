@@ -17,7 +17,7 @@ if ! command -v google-chrome >/dev/null 2>&1; then
     apt-get -o DPkg::Lock::Timeout=300 install -y -q /tmp/chrome.deb >/dev/null
     rm -f /tmp/chrome.deb
 fi
-# VMs are disposable: no background browser updates.
+# VMs are throwaway: no background browser updates.
 rm -f /etc/apt/sources.list.d/google-chrome.list
 apt-mark hold google-chrome-stable >/dev/null
 

@@ -454,7 +454,7 @@ To only reclaim disk space, `agentpc clean` deletes what can be downloaded again
 - The MCP tools carry annotations: `list_vms`, `take_screenshot` and `list_desktop_tools` are
   read-only, and tools that discard or overwrite state (including `download_file`, which writes
   to your Mac) are marked destructive, so clients can auto-approve or confirm accordingly.
-- Treat VMs as disposable sandboxes, not as a place for secrets.
+- Treat VMs as throwaway sandboxes, not as a place for secrets.
 
 ## Development
 

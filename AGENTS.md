@@ -57,7 +57,7 @@ Guest tips:
 
 Rules:
 
-- Instances are disposable; create your own uniquely named VM per task and `reset_vm` it
+- Instances are resettable; create your own uniquely named VM per task and `reset_vm` it
   instead of repairing a broken one. Don't reset, stop, restore or delete a VM you didn't
   create unless the user asks.
 - Don't create instances you won't use, and `delete_vm` your instances when done.

@@ -104,7 +104,7 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 ## Rules
 
 - Act only on VMs you created. Never `reset_vm`, `stop_vm`, `restore_vm` or `delete_vm` a VM
-  you didn't create unless the user asks. VMs are disposable: `reset_vm` your own broken one
+  you didn't create unless the user asks. VMs are resettable: `reset_vm` your own broken one
   instead of repairing it, and `delete_vm` it when done.
 - To test untrusted software or offline behaviour, `create_vm` with `offline: true`: no internet
   and no access to the Mac, while `run_command`, files, desktop tools and `forward_port` work.
