@@ -125,7 +125,8 @@ teaches Claude when and how to use the VMs:
 ```
 
 The plugin runs the installed `agentpc` binary, so install that first
-(see [Installation](#installation)).
+(see [Installation](#installation)). When the plugin is installed it already registers the MCP
+server for Claude Code, so `agentpc mcp-install` skips Claude Code to avoid a duplicate.
 
 ### Other agents
 
@@ -154,18 +155,25 @@ pick the server up automatically.
 
 | Tool | Description |
 | --- | --- |
-| `list_vms` | VMs (state, size, checkpoints) and the available images with their OS versions |
-| `create_vm` | Create a VM (optionally of a given version, size, or offline) and wait until its desktop is ready |
+| `list_vms` | VMs (owner, state, size, checkpoints, viewer) and the available images with their OS versions |
+| `create_vm` | Create a VM (optionally of a given version, size, or offline) and wait until its desktop is ready. Retrying it in the same session returns the VM already created |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down cleanly |
 | `reset_vm` | Discard all changes: back to a fresh copy of the image |
 | `checkpoint_vm` / `restore_vm` | Save a VM's disk and memory under a label; go back to it in seconds |
+| `delete_checkpoint` | Delete one checkpoint by label; the VM is untouched |
 | `delete_vm` | Delete a VM with its disk and checkpoints |
-| `take_screenshot` | PNG screenshot from the hypervisor |
-| `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu); returns exit code, stdout and stderr. `background: true` starts servers and long jobs that keep running |
+| `take_screenshot` | PNG screenshot from the hypervisor; `save_to` also writes it to a path on your Mac |
+| `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu); returns exit code, stdout and stderr. A foreground run is killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id for `job_status` |
+| `job_status` | Check a background job by its id: still running or exited (with its code), plus the tail of its log |
 | `upload_file` / `download_file` | Copy files or folders between your Mac and a VM |
-| `forward_port` | Reach a server running in a VM from your Mac |
+| `forward_port` | Reach a server running in a VM from your Mac (SSH tunnel; works even for servers bound to the guest's own `127.0.0.1`) |
+| `list_forwards` / `remove_forward` | List a VM's active port forwards / stop one by its host port |
+| `read_vm_log` | Read the tail of a VM's `qemu` or `serial` log, for when a VM won't boot or the desktop is unreachable |
 | `list_desktop_tools` | List the desktop-control tools inside a VM |
 | `use_desktop_tool` | Call one of them: click, type, launch apps, read the UI tree, … |
+
+VMs an MCP session created or started are stopped (never deleted) when the session ends, unless
+`AGENTPC_KEEP_RUNNING=1`.
 
 | Guest | Desktop | Desktop-control server |
 | --- | --- | --- |
@@ -184,9 +192,9 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 
 | Command | Description |
 | --- | --- |
-| `agentpc create <image> [name] [--memory GB] [--cpus N] [--offline]` | Create a VM from `ubuntu`, `windows` or a version such as `ubuntu-22.04`; fetches Ubuntu images if missing. A non-default size boots cold instead of resuming. `--offline`: no internet or access to this Mac |
+| `agentpc create <image> [name] [--memory GB] [--cpus N] [--offline]` | Create a VM from `ubuntu`, `windows` or a version such as `ubuntu-22.04`; fetches Ubuntu images if missing. `--memory` is 2–64 GB, `--cpus` 1–16; a non-default size boots cold instead of resuming. `--offline`: no internet or access to this Mac |
 | `agentpc list [--json]` (`ls`) | VMs and images; `--json` gives the same data as the MCP `list_vms` tool |
-| `agentpc info <name>` | Viewer URL, SSH and VNC details, and checkpoints |
+| `agentpc info <name>` | Viewer URL (with the VNC password), SSH and VNC details, and checkpoints |
 | `agentpc start <name>… \| --all` | Boot stopped VMs |
 | `agentpc stop <name>… \| --all` | Shut VMs down cleanly; disks are kept |
 | `agentpc reset <name>…` | Discard all changes: back to a fresh copy of the image |
@@ -196,7 +204,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 | `agentpc ssh <name> [command]` | Run a command, or open a shell with no command |
 | `agentpc screenshot <name> [file]` | Save a PNG screenshot |
 | `agentpc cp <src> <dst>` | Copy files; the VM side is `<name>:<path>`, e.g. `agentpc cp app.msi windows-1:Downloads/` |
-| `agentpc forward <name> <guest-port> [host-port]` | Forward `127.0.0.1:<host-port>` to a port in a running VM |
+| `agentpc forward <name> <guest-port> [host-port]` | Forward `127.0.0.1:<host-port>` to a port in a running VM (over SSH). `--list` shows a VM's forwards; `--rm <host-port>` stops one |
 
 ### Image commands
 
@@ -215,7 +223,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 | Command | Description |
 | --- | --- |
 | `agentpc mcp` | Run the MCP server on stdio (what agents launch) |
-| `agentpc mcp-install [clients…]` | Register the MCP server with agents |
+| `agentpc mcp-install [clients…]` | Register the MCP server with agents (skips Claude Code when the plugin is installed; raises Codex's MCP timeouts so slow builds and boots don't trip it) |
 | `agentpc mcp-uninstall [clients…]` | Remove it from agents again |
 | `agentpc doctor` | Check prerequisites |
 | `agentpc clean [-n]` | Free disk space: downloaded ISOs and cloud images, and leftovers of interrupted builds or checkpoints. Never touches images or VMs; lists images no VM uses |
@@ -298,17 +306,19 @@ name. Only Ubuntu is published (Windows images can't be redistributed):
 | `AGENTPC_IMAGE_REPO` | `ghcr.io/pawanpaudel93/agentpc` | Package for `image pull`/`push` (tagged by image name) |
 | `WIN_ISO` | an earlier download, a matching ISO in `~/Downloads`, else a download | Windows ISO used by `image build windows-…` without `--iso` |
 
-Each VM gets its own ports on `127.0.0.1`, derived from its slot number `n`:
+Each VM gets its own ports on `127.0.0.1`, derived from its slot number `n` (an existing VM
+moves to its new ports the next time it starts):
 
 | Port | Use |
 | --- | --- |
-| `2200 + n` | SSH |
-| `8000 + n` | Windows-MCP (Windows VMs) |
-| `5910 + n` | VNC |
-| `5700 + n` | VNC over WebSocket (for the viewer) |
+| `47000 + n` | SSH |
+| `47100 + n` | Windows-MCP (Windows VMs) |
+| `47200 + n` | noVNC WebSocket (for the viewer) |
+| `47300 + n` | VNC |
 | `8100` | Browser viewer, shared by all VMs |
 
-The guest login is `agent` / `agent`.
+The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
+[Security](#security)).
 
 ## How it works
 
@@ -324,7 +334,14 @@ The guest login is `agent` / `agent`.
   takes disk space about equal to the memory in use (3–4 GB for Windows); `agentpc checkpoint
   <name> <label> --delete` removes one, and deleting the VM removes all of them.
 - **Snapshots stay local.** A memory snapshot depends on the Mac's chip and QEMU version, so
-  only the disk is published; the snapshot is recaptured after each pull (about a minute).
+  only the disk is published; the snapshot is recaptured after each pull (about a minute). Each
+  snapshot records the QEMU machine type, so it still resumes after a QEMU upgrade.
+- **Robustness.** `create` checks free disk and RAM up front and `checkpoint` checks disk;
+  restore is atomic (a failed one leaves the VM as it was) and resumes a VM that was left paused;
+  operations on one VM are serialized, and a stale pid file from a crash is detected rather than
+  trusted. The guest clock follows the Mac's time zone. SSH keepalives hold long calls open, a
+  desktop tool call gives up after 120 s, and a viewer that won't start no longer fails a VM
+  start. The browser viewer (noVNC) is downloaded against a pinned checksum.
 - **Image distribution.** Ubuntu images are OCI artifacts on GitHub Container Registry: a
   compressed qcow2 split into 512 MB parts, downloaded in parallel and checksum-verified.
 - **Windows build.** agentpc writes a small setup disk next to the ISO: an unattended-install
@@ -354,7 +371,10 @@ Each VM sits behind QEMU's user-mode NAT, so VMs are isolated from each other bu
 Mac's network (a VPN or proxy configured on the Mac applies to a VM's outbound traffic).
 
 - **Reach a server in a VM from the Mac:** `agentpc forward <name> <guest-port> [host-port]`
-  (MCP: `forward_port`), then connect to `127.0.0.1:<host-port>`.
+  (MCP: `forward_port`), then connect to `127.0.0.1:<host-port>`. It tunnels over SSH, so it
+  reaches a server bound to the guest's own `127.0.0.1` and the Windows firewall doesn't apply.
+  A forward lasts until the VM stops or you remove it (`--rm <host-port>` / `remove_forward`);
+  `--list` (MCP: `list_forwards`) shows a VM's forwards.
 - **Reach the Mac from a guest:** `10.0.2.2` is the Mac host — the NAT maps it to the Mac's
   loopback, so a dev server listening on `127.0.0.1` or `0.0.0.0` is reachable at
   `10.0.2.2:<port>` from inside the VM.
@@ -421,6 +441,10 @@ To only reclaim disk space, `agentpc clean` deletes what can be downloaded again
 - Everything listens on `127.0.0.1` only.
 - The desktop-control servers inside the VMs are unauthenticated; any process on your Mac can
   reach them.
+- Each VM has its own VNC password (`vnc-pass`, mode 0600, in its instance dir). The viewer URL
+  from `agentpc info <name>` carries it (`&password=…`) so the browser viewer connects without a
+  prompt; a native VNC client (`vnc://127.0.0.1:<port>`) asks for it — copy it from that URL or
+  read `~/.agentpc/instances/<name>/vnc-pass`.
 - Guests use the fixed login `agent` / `agent`.
 - To keep agents unblocked, Windows VMs have UAC prompts, SmartScreen and Windows Update turned
   off. Don't use them for anything that needs those protections.

@@ -11,14 +11,17 @@ can run `agentpc mcp-install` (or install first: see README.md).
 
 | Tool | Use |
 | --- | --- |
-| `list_vms` | VMs (state, size, checkpoints) and the images (with OS version) they come from. Start here. |
-| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New clone: ubuntu ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready. `offline` cuts off the internet. |
+| `list_vms` | VMs (owner, state, size, checkpoints, viewer) and the images (with OS version) they come from. Start here. |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New clone: ubuntu ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready; retrying in the same session returns the VM it already made. `memory_gb` 2–64, `cpus` 1–16. `offline` cuts off the internet. |
 | `start_vm` / `stop_vm` / `reset_vm` / `delete_vm` | Lifecycle. `reset_vm` = back to a clean install. |
-| `checkpoint_vm(name, label)` / `restore_vm(name, label)` | Save disk + memory before a risky step; restore in seconds. |
-| `take_screenshot(name)` | Hypervisor screenshot; works even while booting or hung. |
-| `run_command(name, command, background?)` | Shell over SSH: PowerShell on windows, bash on ubuntu. Returns exit code, stdout, stderr (long output trimmed); `background: true` for servers and long jobs. |
+| `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save disk + memory before a risky step; restore in seconds; or drop one checkpoint. |
+| `take_screenshot(name, save_to?)` | Hypervisor screenshot; works even while booting or hung. `save_to` also writes the PNG to a Mac path. |
+| `run_command(name, command, timeout?, background?)` | Shell over SSH: PowerShell on windows, bash on ubuntu. Returns exit code, stdout, stderr (long output trimmed). Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id you poll with `job_status`. |
+| `job_status(name, id, tail_lines?)` | State of a background job (running, or exited with its code) plus its log tail. |
 | `upload_file` / `download_file` | Copy files or folders between the Mac and a VM. |
-| `forward_port(name, guest_port, host_port?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). |
+| `forward_port(name, guest_port, host_port?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). SSH tunnel: reaches a server on the guest's own `127.0.0.1`; lasts until the VM stops. |
+| `list_forwards(name)` / `remove_forward(name, host_port)` | List a VM's forwards / stop one. |
+| `read_vm_log(name, which, tail_lines?)` | Tail a VM's `qemu` or `serial` log when it won't boot or the desktop is unreachable. |
 | `list_desktop_tools(name, tool?)` | Desktop-control tools in that VM, or one tool's full schema. |
 | `use_desktop_tool(name, tool, arguments)` | Call one of those tools (click, type, launch, snapshot…). |
 
@@ -66,6 +69,8 @@ Rules:
   If `list_vms` shows no windows image, ask the user to run that. Don't start a build
   yourself unless asked.
 - The login for both guests is `agent` / `agent`. Everything binds to 127.0.0.1.
+- VMs you create or start over MCP are stopped (never deleted) when the session ends, unless
+  `AGENTPC_KEEP_RUNNING=1`.
 
 ## Working on this repo
 
@@ -74,8 +79,8 @@ Rules:
 - Rust, single binary `agentpc` (CLI + MCP server). `src/main.rs` is the CLI; modules:
   `instance` (VMs, images, on-disk layout), `qemu`, `ops` (lifecycle),
   `viewer` (browser viewer), `image` (build/snapshot), `registry` (pull/push), `setup` (`doctor`, `mcp-install`, `clean`, `uninstall`), `mcp` (the server).
-- Ports derive from the instance slot n: SSH 2200+n, Windows-MCP 8000+n, VNC 5910+n,
-  VNC websocket 5700+n; the shared browser viewer is on 8100.
+- Ports derive from the instance slot n: SSH 47000+n, Windows-MCP 47100+n, noVNC websocket
+  47200+n, VNC 47300+n; the shared browser viewer is on 8100.
 - Guest assets in `guests/` are embedded in the binary. A Windows build writes them to a
   FAT `setup.img`: `Autounattend.xml` drives Setup, `SetupComplete.cmd` runs after it, and
   `oem/setup.ps1` runs at first logon; `guests/ubuntu/user-data` is the Ubuntu cloud-init.

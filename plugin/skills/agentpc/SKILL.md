@@ -27,12 +27,15 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 | `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New VM (`ubuntu` or `windows`, optionally a version such as `22.04`); returns when the desktop is ready. `offline: true` cuts it off from the internet and this Mac |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down |
 | `reset_vm(name)` | Discard all changes: back to a clean install |
-| `checkpoint_vm(name, label)` / `restore_vm(name, label)` | Save the VM's disk and memory; go back to exactly that state in seconds |
+| `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save the VM's disk and memory; go back to that state in seconds; or drop one checkpoint |
 | `delete_vm(name)` | Delete a VM with its disk and checkpoints |
-| `take_screenshot(name)` | PNG screenshot; works even while booting or hung |
-| `run_command(name, command, background?)` | Shell command: PowerShell on Windows, bash on Ubuntu. Returns `exit code: N` plus stdout and stderr; each is trimmed to its first and last 10,000 characters. `background: true` keeps it running after the call (servers, long jobs) and says where its output goes |
+| `take_screenshot(name, save_to?)` | PNG screenshot; works even while booting or hung. `save_to` also writes it to a Mac path |
+| `run_command(name, command, timeout?, background?)` | Shell command: PowerShell on Windows, bash on Ubuntu. Returns `exit code: N` plus stdout and stderr, each trimmed to its first and last 10,000 characters. Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` (servers, long jobs) returns a job id to poll with `job_status` |
+| `job_status(name, id, tail_lines?)` | Background job's state (running, or exited with its code) plus its log tail |
 | `upload_file` / `download_file` | Copy files or folders between this Mac and a VM |
-| `forward_port(name, guest_port, host_port?)` | Reach a server running in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted) |
+| `forward_port(name, guest_port, host_port?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). SSH tunnel: reaches a server on the guest's own `127.0.0.1`; lasts until the VM stops |
+| `list_forwards(name)` / `remove_forward(name, host_port)` | List a VM's forwards / stop one |
+| `read_vm_log(name, which, tail_lines?)` | Tail a VM's `qemu` or `serial` log when it won't boot or the desktop is unreachable |
 | `list_desktop_tools(name, tool?)` | List the GUI tools inside a VM, or one tool's full schema |
 | `use_desktop_tool(name, tool, arguments)` | Call a GUI tool: click, type, launch apps, read the UI tree |
 
@@ -57,7 +60,8 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
 - `App` with `mode: "launch"` opens programs by name; `Shortcut` sends key combinations.
 - `run_command` runs PowerShell as the `agent` administrator. The screen is 1280x800.
 - Processes started over `run_command` end when the command returns: start servers and GUI apps
-  with `background: true`, and open the Windows firewall for ports you `forward_port`.
+  with `background: true`. `forward_port` tunnels over SSH, so it reaches a server on the guest's
+  own `127.0.0.1` with no Windows firewall change.
 - SmartScreen, Windows Update and first-run pop-ups are turned off. Edge is the browser.
 - It's a clean install: no Visual C++ redistributable, no .NET (only .NET Framework 4.8.1),
   no PowerShell 7. A missing `VCRUNTIME140.dll` means the app under test doesn't ship its
@@ -118,3 +122,5 @@ curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.
   Windows release matters; without it you get 25H2, or the newest Windows 11 image installed.
 - Don't put real credentials or secrets into a VM. The guest login is `agent` / `agent`, and
   the VMs are reachable from anything on the Mac.
+- VMs you create or start are stopped (never deleted) when the session ends, unless
+  `AGENTPC_KEEP_RUNNING=1`.
