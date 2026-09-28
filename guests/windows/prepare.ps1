@@ -35,3 +35,25 @@ Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSyncNGS
 
 # Toast notifications pop up over the windows the agent is working with.
 Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications' 'ToastEnabled' 0
+
+# Notepad's first launch shows an "automatically saves your progress" tip over the text.
+# The packaged app keeps its settings in its own hive; these are the values it writes when
+# the tip is dismissed. Their types are WinRT ones reg add can't write, so import them.
+$np = "$env:LOCALAPPDATA\Packages\Microsoft.WindowsNotepad_8wekyb3d8bbwe\Settings\settings.dat"
+if ((Test-Path $np) -and -not (Get-Process Notepad -ErrorAction SilentlyContinue)) {
+    $reg = "$env:TEMP\agentpc-notepad.reg"
+    @'
+Windows Registry Editor Version 5.00
+
+[HKEY_USERS\agentpc-notepad\LocalState]
+"TeachingTipVersion"=hex(5f5e105):00,00,00,00,f7,44,8f,39,67,4f,dd,01
+"TeachingTipCheckCount"=hex(5f5e105):01,00,00,00,f7,44,8f,39,67,4f,dd,01
+"TeachingTipExplicitClose"=hex(5f5e10b):01,85,69,e9,48,67,4f,dd,01
+"RecentFilesFirstLoad"=hex(5f5e10b):00,f5,f8,48,39,67,4f,dd,01
+'@ | Set-Content -Path $reg -Encoding Unicode
+    reg load HKU\agentpc-notepad $np | Out-Null
+    reg import $reg 2>&1 | Out-Null
+    [gc]::Collect()
+    reg unload HKU\agentpc-notepad | Out-Null
+    Remove-Item $reg -ErrorAction SilentlyContinue
+}

@@ -15,7 +15,7 @@ Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalizatio
 # The installer registers a logon task that runs its `serve` daemon elevated in the
 # interactive session (Session 0, where sshd runs, cannot see the desktop).
 # Pinned: the skill and docs describe this version's tools. Bump deliberately.
-$env:CUA_DRIVER_RS_VERSION = '0.30.1'
+$env:CUA_DRIVER_RS_VERSION = '0.30.3'
 # Telemetry off: VMs don't report to a third party.
 $env:CUA_DRIVER_RS_TELEMETRY_ENABLED = '0'
 $ProgressPreference = 'SilentlyContinue'
@@ -23,8 +23,8 @@ $ProgressPreference = 'SilentlyContinue'
 # cua.ai; fetch the one from the same tag so builds are reproducible.
 $dir = "$env:TEMP\cua-driver-install"
 New-Item -ItemType Directory -Path $dir -Force | Out-Null
-Invoke-WebRequest https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.30.1/install.ps1 -OutFile "$dir\install.ps1" -UseBasicParsing
-Invoke-WebRequest https://raw.githubusercontent.com/trycua/cua/cua-driver-rs-v0.30.1/libs/cua-driver/scripts/_install-common.psm1 -OutFile "$dir\_install-common.psm1" -UseBasicParsing
+Invoke-WebRequest https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.30.3/install.ps1 -OutFile "$dir\install.ps1" -UseBasicParsing
+Invoke-WebRequest https://raw.githubusercontent.com/trycua/cua/cua-driver-rs-v0.30.3/libs/cua-driver/scripts/_install-common.psm1 -OutFile "$dir\_install-common.psm1" -UseBasicParsing
 # Its own process: the installer sets ErrorActionPreference=Stop and calls exit.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$dir\install.ps1"
 $cua = "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin\cua-driver.exe"

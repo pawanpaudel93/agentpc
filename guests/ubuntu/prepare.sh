@@ -21,6 +21,22 @@ fi
 rm -f /etc/apt/sources.list.d/google-chrome.list
 apt-mark hold google-chrome-stable >/dev/null
 
+# A new profile opens Chrome's Additional Terms of Service dialog, which blocks agents.
+# The "First Run" marker skips first-run UI. (cua-driver's own isolated browsers pass
+# --no-first-run themselves.)
+install -d -o agent -g agent /home/agent/.config /home/agent/.config/google-chrome
+[ -e "/home/agent/.config/google-chrome/First Run" ] ||
+    install -o agent -g agent -m 644 /dev/null "/home/agent/.config/google-chrome/First Run"
+
+# Chrome builds its accessibility tree only when told to, so without this get_window_state
+# sees just the window frame, not the page. Every launcher (google-chrome,
+# google-chrome-stable, the menu entries, xdg-open) goes through this script; the package
+# is held, so the edit sticks. cua-driver's isolated browsers run the binary directly.
+launcher=/opt/google/chrome/google-chrome
+grep -q -- '--force-renderer-accessibility' "$launcher" ||
+    sed -i 's|^exec -a "$0" "$HERE/chrome" "$@"$|exec -a "$0" "$HERE/chrome" --force-renderer-accessibility "$@"|' "$launcher"
+grep -q -- '--force-renderer-accessibility' "$launcher"
+
 mkdir -p /etc/opt/chrome/policies/managed
 cat > /etc/opt/chrome/policies/managed/agentpc.json <<'EOF'
 {

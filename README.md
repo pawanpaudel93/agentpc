@@ -289,7 +289,7 @@ Each image records what it is (`agentpc image info <image>`):
   "base": "Windows 11 25H2 (Home/Pro) ISO, ARM64, en-us",
   "built": "20260927",
   "agentpc": "0.1.0",
-  "desktop_server": "cua-driver 0.30.1",
+  "desktop_server": "cua-driver 0.30.3",
   "iso_sha256": "32cde007…"
 }
 ```

@@ -354,7 +354,7 @@ pub struct ImageInfo {
     pub built: String,
     #[serde(default)]
     pub agentpc: String,
-    /// The desktop-control server agents drive, e.g. "cua-driver 0.30.1".
+    /// The desktop-control server agents drive, e.g. "cua-driver 0.30.3".
     #[serde(default)]
     pub desktop_server: String,
     /// Checksum of the Windows ISO it was built from.

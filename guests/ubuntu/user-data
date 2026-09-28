@@ -73,9 +73,9 @@ runcmd:
   # fetch both from the same tag. Telemetry off: VMs don't report to a third party.
   - |
     su - agent -c 'set -e; d=$(mktemp -d); cd "$d"
-      curl -fsSLO https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.30.1/install.sh
-      curl -fsSLO https://raw.githubusercontent.com/trycua/cua/cua-driver-rs-v0.30.1/libs/cua-driver/scripts/_install-rust.sh
-      CUA_DRIVER_RS_VERSION=0.30.1 CUA_DRIVER_RS_TELEMETRY_ENABLED=0 bash ./install.sh
+      curl -fsSLO https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.30.3/install.sh
+      curl -fsSLO https://raw.githubusercontent.com/trycua/cua/cua-driver-rs-v0.30.3/libs/cua-driver/scripts/_install-rust.sh
+      CUA_DRIVER_RS_VERSION=0.30.3 CUA_DRIVER_RS_TELEMETRY_ENABLED=0 bash ./install.sh
       ~/.local/bin/cua-driver telemetry disable; rm -rf "$d"'
   - touch /var/lib/cloud/agent-ready
   # VMs cloned from the image boot without a seed; stop cloud-init treating them as
