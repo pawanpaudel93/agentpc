@@ -1,5 +1,5 @@
 #!/bin/sh
-# agentpc installer: curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.sh | sh
+# agentpc installer: curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 #
 # Environment:
 #   AGENTPC_VERSION      version to install, e.g. 0.1.0 (default: latest release)

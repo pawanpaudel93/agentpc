@@ -15,7 +15,7 @@ The plugin bundles:
 - The `agentpc` binary on your `PATH`:
 
   ```sh
-  curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.sh | sh
+  curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   ```
 
 ## Install

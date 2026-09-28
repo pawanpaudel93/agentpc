@@ -16,7 +16,7 @@ If the agentpc tools (`list_vms`, `create_vm`, ...) aren't available, the `agent
 Tell the user to install it (Apple Silicon Mac only), then restart the session:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.sh | sh
+curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 ```
 
 ## Tools

@@ -1,3 +1,5 @@
+<img src="assets/logo.svg" alt="agentpc logo" width="96" height="96">
+
 # agentpc
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -5,6 +7,8 @@
 ![MCP server](https://img.shields.io/badge/MCP-server-8A2BE2)
 
 **Instant, resettable Windows and Ubuntu desktops for AI agents, on your Mac.**
+
+Website: <https://agentpc.pawanpaudel.com.np>
 
 agentpc gives AI agents (Claude Code, Claude Desktop, Codex, Cursor, Gemini CLI, VS Code, or
 any MCP client) real desktop computers to work in: create a VM in seconds, let the agent click,
@@ -62,7 +66,7 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 ## Installation
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/pawanpaudel93/agentpc/main/install.sh | sh
+curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 ```
 
 The installer:

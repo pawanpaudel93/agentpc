@@ -186,7 +186,7 @@ section() { # section TITLE REGEX: one bullet per matching subject, prefix strip
   [ -z "$lines" ] || printf '### %s\n\n%s\n\n' "$1" "$lines"
 }
 {
-  printf 'Install or upgrade:\n\n```sh\ncurl -fsSL https://raw.githubusercontent.com/%s/main/install.sh | sh\n```\n\n' "$REPO"
+  printf 'Install or upgrade:\n\n```sh\ncurl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh\n```\n\n'
   section "Features" '^feat(\(|!|:)'
   section "Fixes" '^fix(\(|!|:)'
   section "Performance" '^perf(\(|!|:)'
