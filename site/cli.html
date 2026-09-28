@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>agentpc CLI</title>
+    <meta
+      name="description"
+      content="agentpc CLI reference: create, checkpoint, reset and control Windows and Ubuntu desktop VMs from your Mac's terminal."
+    />
+    <meta property="og:title" content="agentpc CLI" />
+    <meta
+      property="og:description"
+      content="Create, checkpoint, reset and control Windows and Ubuntu VMs from your terminal."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta property="og:url" content="https://agentpc.pawanpaudel.com.np/cli.html" />
+    <meta name="theme-color" content="#1b1f4b" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="shell">
+      <nav class="nav" aria-label="Main navigation">
+        <a class="brand" href="index.html">
+          <img src="favicon.svg" width="36" height="36" alt="" decoding="async" />
+          <span>agentpc</span>
+          <span class="version" translate="no">v0.1.2</span>
+        </a>
+        <div class="nav-links">
+          <a href="index.html#install">Install</a>
+          <a href="index.html#features">Features</a>
+          <a href="mcp.html">MCP</a>
+          <a href="cli.html" aria-current="page">CLI</a>
+          <a href="guide.html">Guide</a>
+          <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
+        </div>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="shell hero compact">
+        <div class="hero-inner">
+          <p class="eyebrow">Documentation</p>
+          <h1>CLI</h1>
+          <p class="hero-copy">
+            Everything agents do over MCP, you can do from Terminal with
+            <code translate="no">agentpc</code>, plus image builds, setup and updates.
+          </p>
+        </div>
+      </section>
+
+      <div class="shell doc-layout">
+        <aside class="doc-nav" aria-label="CLI sections">
+          <strong>On this page</strong>
+          <div class="doc-nav-links">
+            <a href="#quick-start">Quick start</a>
+            <a href="#vms">VMs</a>
+            <a href="#checkpoints">Checkpoints</a>
+            <a href="#access">Shell, files, ports</a>
+            <a href="#images">Images</a>
+            <a href="#setup">Setup</a>
+            <a href="#completions">Completions</a>
+          </div>
+        </aside>
+
+        <article class="doc-main">
+          <section class="doc-section" id="quick-start">
+            <h2>Quick start</h2>
+            <div class="code-panel">
+              <pre><code translate="no"><span class="prompt">$ </span>agentpc create ubuntu           <span class="comment"># first run downloads ~1.2 GB; then ~1 s per VM</span>
+<span class="prompt">$ </span>agentpc ssh ubuntu-1 uname -a
+<span class="prompt">$ </span>agentpc screenshot ubuntu-1 shot.png
+<span class="prompt">$ </span>agentpc info ubuntu-1           <span class="comment"># viewer URL to watch the desktop</span>
+<span class="prompt">$ </span>agentpc reset ubuntu-1          <span class="comment"># back to a clean install</span></code></pre>
+            </div>
+            <p>
+              Windows images can't be redistributed, so each Mac builds its own once, from
+              Microsoft's official Windows 11 ARM64 ISO (7.3 GB, checksum-verified):
+            </p>
+            <div class="code-panel">
+              <pre><code translate="no"><span class="prompt">$ </span>agentpc image build windows     <span class="comment"># once: download + ~12 min install; or --iso &lt;path&gt;</span>
+<span class="prompt">$ </span>agentpc create windows          <span class="comment"># ~4 s per VM</span></code></pre>
+            </div>
+            <p>
+              Commands that act on VMs take several names (<code translate="no">agentpc stop a b</code>),
+              check them all before doing anything, and carry on past a failure (exit status 1 if any
+              failed). Every command has <code translate="no">--help</code>.
+            </p>
+          </section>
+
+          <section class="doc-section" id="vms">
+            <h2>VMs</h2>
+            <table class="data-table">
+              <thead>
+                <tr><th>Command</th><th>Description</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code translate="no">agentpc create &lt;image&gt; [name]</code></td>
+                  <td>
+                    Create a VM from <code translate="no">ubuntu</code>, <code translate="no">windows</code> or a
+                    version such as <code translate="no">ubuntu-22.04</code>; fetches Ubuntu images if missing.
+                    <code translate="no">--memory</code> 2–64 GB (default 8 Windows, 4 Ubuntu) and
+                    <code translate="no">--cpus</code> 1–16 (default 4); a non-default size boots cold instead of
+                    resuming. <code translate="no">--offline</code>: no internet and no access to this Mac (SSH,
+                    the viewer and forwarded ports still work). The default name is
+                    <code translate="no">&lt;os&gt;-&lt;n&gt;</code>.
+                  </td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc list [--json]</code></td>
+                  <td>VMs and images. <code translate="no">--json</code> gives the same data as the MCP <code translate="no">list_vms</code> tool. Alias: <code translate="no">ls</code>.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc info &lt;name&gt;</code></td>
+                  <td>Viewer URL (with the VNC password), SSH and VNC details, and checkpoints.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc start &lt;name&gt;… | --all</code></td>
+                  <td>Boot stopped VMs.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc stop &lt;name&gt;… | --all</code></td>
+                  <td>Shut VMs down cleanly; disks are kept.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc reset &lt;name&gt;…</code></td>
+                  <td>Discard all changes: back to a fresh copy of the image.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc rm &lt;name&gt;…</code></td>
+                  <td>Delete VMs with their disks and checkpoints. Alias: <code translate="no">delete</code>.</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="doc-section" id="checkpoints">
+            <h2>Checkpoints</h2>
+            <table class="data-table">
+              <thead>
+                <tr><th>Command</th><th>Description</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code translate="no">agentpc checkpoint &lt;name&gt; &lt;label&gt;</code></td>
+                  <td>Save a VM's disk and memory under a label (letters, digits, <code translate="no">.</code> <code translate="no">-</code> <code translate="no">_</code>). A running VM pauses for a few seconds. <code translate="no">-d</code> / <code translate="no">--delete</code> deletes the checkpoint instead.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc restore &lt;name&gt; &lt;label&gt;</code></td>
+                  <td>Put a VM back exactly as it was at a checkpoint; it resumes in seconds.</td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="code-panel">
+              <pre><code translate="no"><span class="prompt">$ </span>agentpc checkpoint windows-1 before-installer
+<span class="prompt">$ </span>agentpc cp setup.msi windows-1:Downloads/
+<span class="prompt">$ </span>agentpc ssh windows-1                        <span class="comment"># run the installer, poke around</span>
+<span class="prompt">$ </span>agentpc restore windows-1 before-installer   <span class="comment"># undo it all in seconds</span></code></pre>
+            </div>
+            <p>
+              A checkpoint of a running VM takes disk space about equal to the memory in use (3–4 GB for
+              Windows). The disk itself is an APFS copy-on-write clone, so it costs nothing until the VM
+              writes more.
+            </p>
+          </section>
+
+          <section class="doc-section" id="access">
+            <h2>Shell, files and ports</h2>
+            <table class="data-table">
+              <thead>
+                <tr><th>Command</th><th>Description</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code translate="no">agentpc ssh &lt;name&gt; [command]</code></td>
+                  <td>Run a command (PowerShell on Windows, bash on Ubuntu), or open an interactive shell with no command.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc screenshot &lt;name&gt; [file]</code></td>
+                  <td>Save a PNG screenshot from the hypervisor. Without a file, it goes to <code translate="no">screen.png</code> in the VM's directory.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc cp &lt;src&gt; &lt;dst&gt;</code></td>
+                  <td>Copy files or folders. The VM side is <code translate="no">&lt;name&gt;:&lt;path&gt;</code>, e.g. <code translate="no">agentpc cp app.msi windows-1:Downloads/</code>.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc forward &lt;name&gt; &lt;guest-port&gt; [host-port]</code></td>
+                  <td>Forward <code translate="no">127.0.0.1:&lt;host-port&gt;</code> to a port in a running VM over SSH. <code translate="no">--list</code> shows a VM's forwards; <code translate="no">--rm &lt;host-port&gt;</code> stops one.</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="doc-section" id="images">
+            <h2>Images</h2>
+            <p>
+              An image is a read-only disk with the OS, desktop and agent tools installed. Images are
+              named <code translate="no">&lt;os&gt;-&lt;version&gt;</code> and can be installed side by side.
+              See the <a href="guide.html#images">guide</a> for the versions available.
+            </p>
+            <table class="data-table">
+              <thead>
+                <tr><th>Command</th><th>Description</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code translate="no">agentpc image pull &lt;image&gt;</code></td>
+                  <td>Download a published image, e.g. <code translate="no">ubuntu</code> or <code translate="no">ubuntu-22.04</code>. Ubuntu only; Windows can't be redistributed.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc image build &lt;image&gt; [--iso &lt;path&gt;]</code></td>
+                  <td>Build an image locally: Ubuntu ~3 min, Windows ~12 min plus the ISO download.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc image ls</code></td>
+                  <td>List local images with their OS versions. Alias: <code translate="no">list</code>.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc image info &lt;image&gt;</code></td>
+                  <td>Everything recorded about an image: OS version, edition, build, source and tool versions.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc image rm &lt;image&gt;…</code></td>
+                  <td>Delete local images. Refuses while VMs of that image exist. Alias: <code translate="no">delete</code>.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc image snapshot &lt;image&gt;</code></td>
+                  <td>Recapture the snapshot VMs resume from (build and pull do this).</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="doc-section" id="setup">
+            <h2>Setup</h2>
+            <table class="data-table">
+              <thead>
+                <tr><th>Command</th><th>Description</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code translate="no">agentpc mcp</code></td>
+                  <td>Run the MCP server on stdio (what agents launch).</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc mcp-install [clients…]</code></td>
+                  <td>Register the MCP server with agents. <code translate="no">mcp-uninstall</code> removes it.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc update [--check]</code></td>
+                  <td>Update to the latest release, checksum-verified; images and VMs are kept. Alias: <code translate="no">upgrade</code>.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc doctor</code></td>
+                  <td>Check prerequisites.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc clean [-n]</code></td>
+                  <td>Free disk space: downloaded ISOs and cloud images, and leftovers of interrupted builds or checkpoints. Never touches images or VMs.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">agentpc uninstall [--keep-data] [-y]</code></td>
+                  <td>Stop all VMs, unregister the MCP server, and delete <code translate="no">~/.agentpc</code> and the binary.</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="doc-section" id="completions">
+            <h2>Completions</h2>
+            <p>Tab completion for bash, zsh, fish, elvish or PowerShell:</p>
+            <div class="code-panel">
+              <pre><code translate="no"><span class="prompt">$ </span>agentpc completions zsh &gt; ~/.zfunc/_agentpc</code></pre>
+            </div>
+          </section>
+        </article>
+      </div>
+      <span class="copy-status" aria-live="polite"></span>
+    </main>
+
+    <footer>
+      <div class="shell">
+        <span>agentpc by <a href="https://github.com/pawanpaudel93">Pawan Paudel</a> · MIT license</span>
+        <span>
+          <a href="index.html">Home</a>
+          ·
+          <a href="mcp.html">MCP</a>
+          ·
+          <a href="guide.html">Guide</a>
+          ·
+          <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
+        </span>
+      </div>
+    </footer>
+    <script src="script.js"></script>
+  </body>
+</html>

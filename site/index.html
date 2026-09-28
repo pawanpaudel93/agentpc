@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>agentpc: instant desktops for AI agents on your Mac</title>
+    <meta
+      name="description"
+      content="agentpc gives AI agents instant, resettable Windows and Ubuntu desktop VMs on an Apple Silicon Mac, over one MCP server."
+    />
+    <meta property="og:title" content="agentpc" />
+    <meta
+      property="og:description"
+      content="Instant, resettable Windows and Ubuntu desktops for AI agents, on your Mac. One MCP server for Claude, Codex, Cursor, Gemini and VS Code."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta property="og:url" content="https://agentpc.pawanpaudel.com.np/" />
+    <meta name="theme-color" content="#1b1f4b" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="shell">
+      <nav class="nav" aria-label="Main navigation">
+        <a class="brand" href="index.html">
+          <img src="favicon.svg" width="36" height="36" alt="" decoding="async" />
+          <span>agentpc</span>
+          <span class="version" translate="no">v0.1.2</span>
+        </a>
+        <div class="nav-links">
+          <a href="#install">Install</a>
+          <a href="#features">Features</a>
+          <a href="mcp.html">MCP</a>
+          <a href="cli.html">CLI</a>
+          <a href="guide.html">Guide</a>
+          <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
+        </div>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="shell hero hero-split" id="install">
+        <div class="hero-inner">
+          <p class="eyebrow">MCP server · Apple Silicon</p>
+          <h1>A real computer for your agent, ready in a second</h1>
+          <p class="hero-copy">
+            agentpc runs Windows and Ubuntu desktop VMs on your Mac and hands them to AI agents
+            over MCP. The agent clicks, types, runs commands and takes screenshots, then resets
+            the VM to a clean install in seconds.
+          </p>
+          <div class="actions">
+            <a class="button primary" href="#agents">Connect your agent</a>
+            <a class="button secondary" href="https://github.com/pawanpaudel93/agentpc">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.52-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.69 5.38-5.26 5.67.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5Z"/></svg>
+              View source
+            </a>
+          </div>
+          <div class="install">
+            <p class="install-label" id="install-label">Install from Terminal</p>
+            <div class="command" role="group" aria-labelledby="install-label">
+              <code class="desktop-command" translate="no"
+                >curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh</code
+              >
+              <code class="mobile-command" translate="no"
+                >curl -fsSL https://agentpc.pawanpaudel.com.np/<br />install.sh | sh</code
+              >
+              <button
+                class="copy-button"
+                type="button"
+                title="Copy install command"
+                aria-label="Copy install command"
+                data-copy-title="Copy install command"
+                data-copy-label="Install command copied."
+                data-copy="curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh"
+              >
+                <svg class="copy-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="9" y="9" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="2" />
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="2" />
+                </svg>
+                <svg class="check-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M20 6 9 17l-5-5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.4" />
+                </svg>
+              </button>
+            </div>
+            <span class="copy-status" aria-live="polite"></span>
+          </div>
+          <p class="requirements">
+            Free and open source (MIT). Apple Silicon Mac, M1 or later. The installer adds QEMU
+            and registers the MCP server with the agents it finds.
+          </p>
+        </div>
+
+        <figure class="demo">
+          <div class="vm-window" aria-hidden="true">
+            <div class="vm-titlebar">
+              <div class="vm-dots"><span></span><span></span><span></span></div>
+              <span class="vm-name">ubuntu-1 · 127.0.0.1:8100</span>
+              <span class="vm-state">running</span>
+            </div>
+            <div class="vm-desktop">
+              <div class="vm-panel"><span>Applications</span><span>agent · 10:42</span></div>
+              <div class="vm-term">
+                <div class="vm-term-bar">Terminal — agent@ubuntu-1: ~</div>
+                <pre><span class="ps">agent@ubuntu-1:~$</span> ./install.sh --check
+<span class="step-2"><span class="out">✓ dependencies ok
+✓ service started on :3000</span>
+<span class="ps">agent@ubuntu-1:~$</span> ▍</span></pre>
+              </div>
+            </div>
+          </div>
+          <div class="agent-log" aria-hidden="true">
+            <p class="agent-log-label">Agent tool calls <span>via MCP</span></p>
+            <ol>
+              <li><span class="tick">✓</span><span class="call">create_vm<em>(ubuntu)</em></span><span class="meta">1.1 s</span></li>
+              <li><span class="tick">✓</span><span class="call">run_command<em>(./install.sh)</em></span><span class="meta">exit 0</span></li>
+              <li><span class="tick">✓</span><span class="call">take_screenshot<em>()</em></span><span class="meta">40 ms</span></li>
+              <li><span class="tick">✓</span><span class="call">reset_vm<em>(ubuntu-1)</em></span><span class="meta">clean</span></li>
+            </ol>
+          </div>
+          <figcaption class="sr-only">
+            Illustration: an agent creates an Ubuntu VM in about a second, runs an install
+            script in its terminal, takes a screenshot, and resets the VM to a clean state.
+          </figcaption>
+        </figure>
+      </section>
+
+      <section class="shell section" id="features" aria-labelledby="features-title">
+        <div class="section-head">
+          <h2 id="features-title">What it does</h2>
+          <p>A single Rust binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents over MCP.</p>
+        </div>
+        <dl class="feature-list">
+          <div>
+            <dt>Instant VMs</dt>
+            <dd>New VMs resume from a snapshot of a running desktop: about 1 s for Ubuntu, 4 s for Windows. Resetting a VM takes just as long.</dd>
+          </div>
+          <div>
+            <dt>Checkpoints</dt>
+            <dd>Save a running VM's disk and memory before a risky step, then return to that exact state in seconds.</dd>
+          </div>
+          <div>
+            <dt>Real desktops</dt>
+            <dd>Windows 11 (ARM) and Ubuntu with XFCE, each with a desktop-control server (cua-driver) that agents drive with clicks and keystrokes.</dd>
+          </div>
+          <div>
+            <dt>One MCP server</dt>
+            <dd>Agents create, drive, screenshot and delete VMs on their own. Works with any MCP client; <code translate="no">agentpc mcp-install</code> sets up the popular ones.</dd>
+          </div>
+          <div>
+            <dt>Shell and screen</dt>
+            <dd>PowerShell or bash over SSH. Screenshots come straight from the hypervisor in about 40 ms, even while a guest is booting or hung.</dd>
+          </div>
+          <div>
+            <dt>Files and ports</dt>
+            <dd>Copy files and folders between your Mac and a VM, and reach a server running inside a VM from your Mac.</dd>
+          </div>
+          <div>
+            <dt>Watch along</dt>
+            <dd>Every VM has a browser viewer, so you can watch what the agent is doing, live.</dd>
+          </div>
+          <div>
+            <dt>Local and private</dt>
+            <dd>Everything runs on your Mac and listens on <code translate="no">127.0.0.1</code> only. Offline VMs can't reach the internet or your Mac.</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="shell section" id="loop" aria-labelledby="loop-title">
+        <div class="section-head">
+          <h2 id="loop-title">How an agent works in a VM</h2>
+          <p>The same loop a person uses: look at the screen, act, look again to check the result.</p>
+        </div>
+        <ol class="loop">
+          <li>
+            <h3>Look</h3>
+            <p>A hypervisor screenshot, or the UI tree with numbered elements.</p>
+            <div class="tool-chips" translate="no"><code>take_screenshot</code><code>get_window_state</code></div>
+          </li>
+          <li>
+            <h3>Act</h3>
+            <p>Click, type and launch apps, or run a shell command when that's quicker.</p>
+            <div class="tool-chips" translate="no"><code>use_desktop_tool</code><code>run_command</code></div>
+          </li>
+          <li>
+            <h3>Verify, then reset</h3>
+            <p>Check the result, save a checkpoint, or reset to a clean install for the next run.</p>
+            <div class="tool-chips" translate="no"><code>checkpoint_vm</code><code>reset_vm</code></div>
+          </li>
+        </ol>
+      </section>
+
+      <section class="shell section" id="agents" aria-labelledby="agents-title">
+        <div class="section-head">
+          <h2 id="agents-title">Works with your agent</h2>
+          <p>The installer registers agentpc with every supported agent it finds. You can also add it yourself.</p>
+        </div>
+        <ul class="clients" aria-label="Supported agents">
+          <li>Claude Code</li>
+          <li>Claude Desktop</li>
+          <li>Codex</li>
+          <li>Cursor</li>
+          <li>Gemini CLI</li>
+          <li>VS Code</li>
+          <li>Any MCP client</li>
+        </ul>
+        <div class="tabs" data-tabs>
+          <div class="tab-list" role="tablist" aria-label="Ways to connect">
+            <button class="tab" type="button" role="tab" id="tab-install" aria-controls="panel-install" aria-selected="true">mcp-install</button>
+            <button class="tab" type="button" role="tab" id="tab-plugin" aria-controls="panel-plugin" aria-selected="false" tabindex="-1">Claude plugin</button>
+            <button class="tab" type="button" role="tab" id="tab-json" aria-controls="panel-json" aria-selected="false" tabindex="-1">Other clients</button>
+          </div>
+          <div class="tab-panel" role="tabpanel" id="panel-install" aria-labelledby="tab-install" tabindex="0">
+            <div class="code-panel">
+              <pre><code translate="no"><span class="prompt">$ </span>agentpc mcp-install
+<span class="prompt">$ </span>agentpc mcp-install claude claude-desktop codex  <span class="comment"># or pick clients</span></code></pre>
+            </div>
+            <p class="tab-note">Restart Claude Desktop after registering. <code translate="no">agentpc mcp-uninstall</code> removes it again.</p>
+          </div>
+          <div class="tab-panel" role="tabpanel" id="panel-plugin" aria-labelledby="tab-plugin" tabindex="0" hidden>
+            <div class="code-panel">
+              <pre><code translate="no">/plugin marketplace add pawanpaudel93/agentpc
+/plugin install agentpc@agentpc</code></pre>
+            </div>
+            <p class="tab-note">Bundles the MCP server with a skill that teaches Claude when and how to use the VMs. Install the <code translate="no">agentpc</code> binary first.</p>
+          </div>
+          <div class="tab-panel" role="tabpanel" id="panel-json" aria-labelledby="tab-json" tabindex="0" hidden>
+            <div class="code-panel">
+              <pre><code translate="no">{
+  "mcpServers": {
+    "agentpc": { "command": "agentpc", "args": ["mcp"] }
+  }
+}</code></pre>
+            </div>
+            <p class="tab-note">One stdio server handles every VM. See the <a class="inline-link" href="mcp.html">MCP docs</a> for the tools.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="shell section" id="guests" aria-labelledby="guests-title">
+        <div class="section-head">
+          <h2 id="guests-title">Two desktops, any version</h2>
+          <p>Every VM is a copy-on-write clone of a read-only image, so it starts from a clean install and costs only a few MB.</p>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <p class="card-kicker" translate="no">ubuntu · ubuntu-22.04 · ubuntu-26.04</p>
+            <h3>Ubuntu</h3>
+            <p>XFCE on X11 with Google Chrome for the browser tools. The image downloads on first use (~1.2 GB).</p>
+            <pre class="terminal"><code translate="no"><span class="prompt">$ </span>agentpc create ubuntu</code></pre>
+            <div class="stat-row">
+              <div><strong>~1 s</strong><span>to a new VM</span></div>
+              <div><strong>4 GB</strong><span>RAM per VM</span></div>
+              <div><strong>bash</strong><span>over SSH</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <p class="card-kicker" translate="no">windows · windows-11-24h2 · windows-11-23h2</p>
+            <h3>Windows 11 ARM</h3>
+            <p>Built once on your Mac from Microsoft's official ISO, since Windows images can't be redistributed. Includes Edge.</p>
+            <pre class="terminal"><code translate="no"><span class="prompt">$ </span>agentpc image build windows  <span class="comment"># once, ~12 min</span>
+<span class="prompt">$ </span>agentpc create windows</code></pre>
+            <div class="stat-row">
+              <div><strong>~4 s</strong><span>to a new VM</span></div>
+              <div><strong>8 GB</strong><span>RAM per VM</span></div>
+              <div><strong>PowerShell</strong><span>over SSH</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="shell section" aria-labelledby="docs-title">
+        <div class="section-head">
+          <h2 id="docs-title">Documentation</h2>
+        </div>
+        <div class="grid">
+          <div class="card">
+            <h3>MCP</h3>
+            <p>All 20 tools agents use to create, drive and reset VMs, plus how to set up each client.</p>
+            <p class="card-action"><a href="mcp.html">Read the MCP docs</a></p>
+          </div>
+          <div class="card">
+            <h3>CLI</h3>
+            <p>Manage VMs and images yourself: create, checkpoint, ssh, copy files and forward ports.</p>
+            <p class="card-action"><a href="cli.html">Read the CLI reference</a></p>
+          </div>
+          <div class="card">
+            <h3>Guide</h3>
+            <p>Images, networking, configuration, guest tips, troubleshooting and security.</p>
+            <p class="card-action"><a href="guide.html">Read the guide</a></p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="shell">
+        <span>agentpc by <a href="https://github.com/pawanpaudel93">Pawan Paudel</a> · MIT license</span>
+        <span>
+          <a href="mcp.html">MCP</a>
+          ·
+          <a href="cli.html">CLI</a>
+          ·
+          <a href="guide.html">Guide</a>
+          ·
+          <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
+        </span>
+      </div>
+    </footer>
+    <script src="script.js"></script>
+  </body>
+</html>

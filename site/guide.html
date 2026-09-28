@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>agentpc Guide</title>
+    <meta
+      name="description"
+      content="agentpc guide: requirements, images and versions, how instant VMs work, networking, configuration, guest tips, troubleshooting and security."
+    />
+    <meta property="og:title" content="agentpc Guide" />
+    <meta
+      property="og:description"
+      content="Images, networking, configuration, guest tips, troubleshooting and security for agentpc."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta property="og:url" content="https://agentpc.pawanpaudel.com.np/guide.html" />
+    <meta name="theme-color" content="#1b1f4b" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="shell">
+      <nav class="nav" aria-label="Main navigation">
+        <a class="brand" href="index.html">
+          <img src="favicon.svg" width="36" height="36" alt="" decoding="async" />
+          <span>agentpc</span>
+          <span class="version" translate="no">v0.1.2</span>
+        </a>
+        <div class="nav-links">
+          <a href="index.html#install">Install</a>
+          <a href="index.html#features">Features</a>
+          <a href="mcp.html">MCP</a>
+          <a href="cli.html">CLI</a>
+          <a href="guide.html" aria-current="page">Guide</a>
+          <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
+        </div>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="shell hero compact">
+        <div class="hero-inner">
+          <p class="eyebrow">Documentation</p>
+          <h1>Guide</h1>
+          <p class="hero-copy">
+            What you need, where images come from, how VMs start in a second, and how to get
+            files, ports and networks to do what you want.
+          </p>
+        </div>
+      </section>
+
+      <div class="shell doc-layout">
+        <aside class="doc-nav" aria-label="Guide sections">
+          <strong>On this page</strong>
+          <div class="doc-nav-links">
+            <a href="#requirements">Requirements</a>
+            <a href="#install">Install</a>
+            <a href="#images">Images</a>
+            <a href="#how">How it works</a>
+            <a href="#networking">Networking</a>
+            <a href="#config">Configuration</a>
+            <a href="#windows">Windows tips</a>
+            <a href="#troubleshooting">Troubleshooting</a>
+            <a href="#security">Security</a>
+            <a href="#uninstall">Uninstall</a>
+          </div>
+        </aside>
+
+        <article class="doc-main">
+          <section class="doc-section" id="requirements">
+            <h2>Requirements</h2>
+            <table class="data-table">
+              <thead>
+                <tr><th>Requirement</th><th>Details</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>Hardware</td><td>Apple Silicon Mac, M1 or later (tested on M4).</td></tr>
+                <tr><td>macOS</td><td>A version QEMU supports: the current one and, for up to two years, the previous one (tested on macOS 15).</td></tr>
+                <tr><td>Runtime</td><td>QEMU from Homebrew. The installer handles it, installing Homebrew too if needed.</td></tr>
+                <tr><td>Memory</td><td>4 GB per running Ubuntu VM, 8 GB per running Windows VM.</td></tr>
+                <tr><td>Disk</td><td>~10 GB per Ubuntu image, ~30 GB per Windows image, each including its snapshot.</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="doc-section" id="install">
+            <h2>Install</h2>
+            <div class="code-panel">
+              <pre><code translate="no">curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh</code></pre>
+            </div>
+            <p>The installer:</p>
+            <ol>
+              <li>downloads the latest release and verifies its checksum,</li>
+              <li>installs <code translate="no">agentpc</code> to <code translate="no">~/.local/bin</code> (no <code translate="no">sudo</code>) and adds it to your <code translate="no">PATH</code>,</li>
+              <li>installs QEMU with Homebrew if it's missing (installing Homebrew first if needed, which asks for your password once),</li>
+              <li>registers the MCP server with the agents it finds,</li>
+              <li>checks everything with <code translate="no">agentpc doctor</code>.</li>
+            </ol>
+            <p>Upgrade later with <code translate="no">agentpc update</code>. Installer options:</p>
+            <table class="data-table">
+              <thead>
+                <tr><th>Variable</th><th>Effect</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><code translate="no">AGENTPC_VERSION=0.1.0</code></td><td>Install a specific version.</td></tr>
+                <tr><td><code translate="no">AGENTPC_INSTALL_DIR=&lt;dir&gt;</code></td><td>Install somewhere other than <code translate="no">~/.local/bin</code>.</td></tr>
+                <tr><td><code translate="no">AGENTPC_NO_MCP=1</code></td><td>Skip registering the MCP server.</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="doc-section" id="images">
+            <h2>Images</h2>
+            <p>
+              Every VM is a copy-on-write clone of a read-only image, so it starts from a clean
+              install and costs only a few MB. A bare <code translate="no">ubuntu</code> means
+              <code translate="no">ubuntu-24.04</code>, and a bare <code translate="no">windows</code>
+              means <code translate="no">windows-11-25h2</code>. Pin the full name when the release
+              matters, for example in test harnesses.
+            </p>
+            <table class="data-table">
+              <thead>
+                <tr><th>Image</th><th>Source and how to get it</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code translate="no">ubuntu</code> = <code translate="no">ubuntu-24.04</code></td>
+                  <td>Official Ubuntu 24.04 cloud image. <code translate="no">image pull</code> (automatic on first <code translate="no">create</code>) or <code translate="no">image build</code>.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">ubuntu-&lt;release&gt;</code></td>
+                  <td>Any release on cloud-images.ubuntu.com, e.g. <code translate="no">22.04</code> or <code translate="no">26.04</code>. <code translate="no">image build ubuntu-22.04</code>, or <code translate="no">image pull</code> if published.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">windows-11-25h2</code></td>
+                  <td>Windows 11 25H2 (Home/Pro), 7.3 GB ISO from Microsoft. <code translate="no">image build windows</code>.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">windows-11-24h2</code>, <code translate="no">windows-11-23h2</code></td>
+                  <td>Earlier Windows 11 releases. <code translate="no">image build windows-11-23h2</code>.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">windows-&lt;name&gt;</code></td>
+                  <td>Your own Windows 11 ARM64 Home/Pro ISO. <code translate="no">image build windows-&lt;name&gt; --iso &lt;path&gt;</code>.</td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="callout warn">
+              <p>
+                Only ARM64 Windows runs at native speed on Apple Silicon, and Windows 10's ARM64 build
+                hangs at boot, so Windows 11 is the minimum. Enterprise, LTSC and evaluation ISOs aren't
+                supported. Windows runs unactivated (a watermark, nothing else).
+              </p>
+            </div>
+            <p>
+              Images are clean installs, like a customer's new PC: Windows has no Visual C++
+              redistributable, no .NET beyond the built-in Framework 4.8.1, and no PowerShell 7. If a
+              program fails with a missing <code translate="no">VCRUNTIME140.dll</code>, its installer is
+              missing a dependency. Each image records what it is:
+            </p>
+            <div class="code-panel">
+              <pre><code translate="no"><span class="prompt">$ </span>agentpc image info windows
+{
+  "os": "windows",
+  "version": "Windows 11 Pro 25H2 (build 26200.6584)",
+  "arch": "arm64",
+  "built": "20260927",
+  "desktop_server": "cua-driver 0.30.1",
+  …
+}</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="how">
+            <h2>How it works</h2>
+            <ul>
+              <li><strong>Hypervisor.</strong> VMs run in QEMU on Apple's Hypervisor.framework, natively on Apple Silicon.</li>
+              <li><strong>Instant start.</strong> After building or downloading an image, agentpc boots it once, waits until the desktop and its control server are running, and saves the VM's memory. New VMs resume from that state instead of booting: ~1 s / ~4 s instead of ~14 s / ~25 s.</li>
+              <li><strong>Checkpoints.</strong> A checkpoint pauses the VM for a few seconds, writes its memory to a file and clones its disk with an APFS copy-on-write clone.</li>
+              <li><strong>Snapshots stay local.</strong> A memory snapshot depends on the Mac's chip and QEMU version, so only the disk is published; the snapshot is recaptured after each pull (about a minute).</li>
+              <li><strong>Image distribution.</strong> Ubuntu images are OCI artifacts on GitHub Container Registry: a compressed qcow2 split into 64 MB parts, downloaded in parallel and checksum-verified.</li>
+              <li><strong>Agent-ready guests.</strong> Each snapshot capture turns off what interrupts unattended work (SmartScreen, updates, first-run pop-ups, Ubuntu's background apt jobs) and installs Chrome on Ubuntu.</li>
+            </ul>
+          </section>
+
+          <section class="doc-section" id="networking">
+            <h2>Networking</h2>
+            <p>
+              Each VM sits behind QEMU's user-mode NAT: VMs are isolated from each other but share the
+              Mac's network, so a VPN on the Mac applies to their outbound traffic.
+            </p>
+            <table class="data-table">
+              <thead>
+                <tr><th>To reach</th><th>Do this</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>A VM server from the Mac</td>
+                  <td><code translate="no">agentpc forward &lt;name&gt; &lt;guest-port&gt;</code> (MCP: <code translate="no">forward_port</code>), then connect to <code translate="no">127.0.0.1:&lt;host-port&gt;</code>. Works for servers bound to the guest's own <code translate="no">127.0.0.1</code>; the Windows firewall doesn't apply.</td>
+                </tr>
+                <tr>
+                  <td>The Mac from a VM</td>
+                  <td><code translate="no">10.0.2.2</code> is the Mac. A dev server on <code translate="no">127.0.0.1</code> or <code translate="no">0.0.0.0</code> is at <code translate="no">10.0.2.2:&lt;port&gt;</code>.</td>
+                </tr>
+                <tr>
+                  <td>VM to VM</td>
+                  <td>Forward VM B's port to the Mac, then from VM A connect to <code translate="no">10.0.2.2:&lt;host-port&gt;</code>.</td>
+                </tr>
+                <tr>
+                  <td>Through a corporate proxy</td>
+                  <td>Guests inherit no proxy. Set <code translate="no">HTTP_PROXY</code>/<code translate="no">HTTPS_PROXY</code> in the guest and import your root CA (<code translate="no">Import-Certificate</code> or <code translate="no">update-ca-certificates</code>).</td>
+                </tr>
+              </tbody>
+            </table>
+            <p>
+              Offline VMs (<code translate="no">--offline</code> / <code translate="no">offline: true</code>)
+              can't reach the internet or <code translate="no">10.0.2.2</code>, but ports you forward from
+              the Mac still reach them.
+            </p>
+          </section>
+
+          <section class="doc-section" id="config">
+            <h2>Configuration</h2>
+            <table class="data-table">
+              <thead>
+                <tr><th>Variable</th><th>Description</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><code translate="no">AGENTPC_HOME</code></td><td>Where images, VMs, keys and caches live. Default <code translate="no">~/.agentpc</code>.</td></tr>
+                <tr><td><code translate="no">AGENTPC_IMAGE_REPO</code></td><td>Package for <code translate="no">image pull</code>/<code translate="no">push</code>. Default <code translate="no">ghcr.io/pawanpaudel93/agentpc</code>.</td></tr>
+                <tr><td><code translate="no">WIN_ISO</code></td><td>Windows ISO used by <code translate="no">image build windows-…</code> without <code translate="no">--iso</code>.</td></tr>
+                <tr><td><code translate="no">AGENTPC_KEEP_RUNNING</code></td><td>Set to <code translate="no">1</code> to keep VMs running when an MCP session ends.</td></tr>
+              </tbody>
+            </table>
+            <p>Each VM gets its own ports on <code translate="no">127.0.0.1</code>, derived from its slot number <em>n</em>:</p>
+            <table class="data-table">
+              <thead>
+                <tr><th>Port</th><th>Use</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><code translate="no">47000 + n</code></td><td>SSH</td></tr>
+                <tr><td><code translate="no">47100 + n</code></td><td>Windows-MCP (Windows images built by 0.1.0)</td></tr>
+                <tr><td><code translate="no">47200 + n</code></td><td>noVNC WebSocket, for the viewer</td></tr>
+                <tr><td><code translate="no">47300 + n</code></td><td>VNC</td></tr>
+                <tr><td><code translate="no">8100</code></td><td>Browser viewer, shared by all VMs</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="doc-section" id="windows">
+            <h2>Windows guest tips</h2>
+            <h3>GUI installers return immediately</h3>
+            <p>Run them silently and wait for the process, then check its exit code:</p>
+            <div class="code-panel">
+              <pre><code translate="no">Start-Process installer.exe -ArgumentList '/S' -Wait -PassThru</code></pre>
+            </div>
+            <h3>Windows Update is disabled</h3>
+            <p>
+              So updates never interrupt a task. This also blocks DISM <code translate="no">/online</code>
+              and <code translate="no">Add-WindowsCapability</code>. Re-enable it temporarily:
+            </p>
+            <div class="code-panel">
+              <pre><code translate="no">Set-Service wuauserv -StartupType Manual; Start-Service wuauserv
+<span class="comment"># … Add-WindowsCapability / DISM …</span>
+Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
+            </div>
+            <h3>Defender is on</h3>
+            <p>
+              Only SmartScreen is off. Defender may quarantine a fresh or unsigned test binary, so
+              exclude your work directory:
+            </p>
+            <div class="code-panel">
+              <pre><code translate="no">Add-MpPreference -ExclusionPath C:\work</code></pre>
+            </div>
+            <h3>Hardware limits</h3>
+            <p>Guests have a fixed 1280×800 display, a 2D-only GPU (no 3D acceleration; WebGL is software-rendered or unavailable) and no audio device.</p>
+          </section>
+
+          <section class="doc-section" id="troubleshooting">
+            <h2>Troubleshooting</h2>
+            <table class="data-table">
+              <thead>
+                <tr><th>Symptom</th><th>Try</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>Something's off with the setup</td><td><code translate="no">agentpc doctor</code></td></tr>
+                <tr><td>Can't tell what the VM is doing</td><td><code translate="no">agentpc screenshot &lt;name&gt;</code>, or open the viewer URL from <code translate="no">agentpc info &lt;name&gt;</code>.</td></tr>
+                <tr><td>VM won't boot</td><td>Read <code translate="no">qemu.log</code> and <code translate="no">serial.log</code> in <code translate="no">~/.agentpc/instances/&lt;name&gt;/</code> (MCP: <code translate="no">read_vm_log</code>).</td></tr>
+                <tr><td>VM is in a bad state</td><td><code translate="no">agentpc reset &lt;name&gt;</code></td></tr>
+                <tr><td>SSH dropped after a reboot</td><td><code translate="no">agentpc start &lt;name&gt;</code> waits until the desktop is ready again.</td></tr>
+                <tr><td><code translate="no">image build</code>/<code translate="no">pull</code>/<code translate="no">rm</code> refuses</td><td>VMs still use that image; <code translate="no">agentpc rm</code> them first.</td></tr>
+                <tr><td>Running low on disk</td><td><code translate="no">agentpc clean</code> deletes what can be downloaded again.</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="doc-section" id="security">
+            <h2>Security</h2>
+            <ul>
+              <li>Everything listens on <code translate="no">127.0.0.1</code> only.</li>
+              <li>The desktop-control servers inside VMs are unauthenticated; any process on your Mac can reach them.</li>
+              <li>Each VM has its own VNC password. The viewer URL from <code translate="no">agentpc info</code> carries it, so the browser viewer connects without a prompt.</li>
+              <li>Guests use the fixed login <code translate="no">agent</code> / <code translate="no">agent</code>. Windows VMs have UAC prompts, SmartScreen and Windows Update turned off.</li>
+              <li>VMs can reach the internet and your Mac through <code translate="no">10.0.2.2</code>. Use <code translate="no">--offline</code> for untrusted software.</li>
+              <li>Treat VMs as throwaway sandboxes, not a place for secrets.</li>
+            </ul>
+          </section>
+
+          <section class="doc-section" id="uninstall">
+            <h2>Uninstall</h2>
+            <div class="code-panel">
+              <pre><code translate="no"><span class="prompt">$ </span>agentpc uninstall            <span class="comment"># asks first; -y skips the prompt</span></code></pre>
+            </div>
+            <p>
+              This stops all VMs, removes the MCP server from every agent, and deletes
+              <code translate="no">~/.agentpc</code> (<code translate="no">--keep-data</code> keeps it) and the
+              binary. It leaves shared things alone and lists them: the <code translate="no">PATH</code> line,
+              QEMU, and the Claude plugin.
+            </p>
+          </section>
+        </article>
+      </div>
+      <span class="copy-status" aria-live="polite"></span>
+    </main>
+
+    <footer>
+      <div class="shell">
+        <span>agentpc by <a href="https://github.com/pawanpaudel93">Pawan Paudel</a> · MIT license</span>
+        <span>
+          <a href="index.html">Home</a>
+          ·
+          <a href="mcp.html">MCP</a>
+          ·
+          <a href="cli.html">CLI</a>
+          ·
+          <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
+        </span>
+      </div>
+    </footer>
+    <script src="script.js"></script>
+  </body>
+</html>

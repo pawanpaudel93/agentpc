@@ -1,0 +1,19 @@
+# agentpc
+
+agentpc gives AI agents instant, resettable Windows and Ubuntu desktop VMs on an Apple Silicon Mac, through one MCP server (`agentpc mcp`).
+
+## Links
+
+- [Website](https://agentpc.pawanpaudel.com.np/)
+- [MCP docs](https://agentpc.pawanpaudel.com.np/mcp.html)
+- [CLI docs](https://agentpc.pawanpaudel.com.np/cli.html)
+- [Guide](https://agentpc.pawanpaudel.com.np/guide.html)
+- [Agent instructions](https://github.com/pawanpaudel93/agentpc/blob/main/AGENTS.md)
+- [Source](https://github.com/pawanpaudel93/agentpc)
+- [Releases](https://github.com/pawanpaudel93/agentpc/releases)
+
+## Install
+
+```sh
+curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
+```

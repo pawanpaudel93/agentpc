@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://agentpc.pawanpaudel.com.np/sitemap.xml

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="agentpc">
+  <!--
+    agentpc mark: a desktop (the VM) showing a shell prompt, with the agent's
+    pointer reaching in over its bezel. Indigo tile, mint pointer.
+    Source for site/favicon.svg and the README logo; keep them identical.
+  -->
+  <defs>
+    <linearGradient id="apc-tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#232873"/>
+      <stop offset="0.55" stop-color="#4148B8"/>
+      <stop offset="1" stop-color="#8A91FF"/>
+    </linearGradient>
+    <linearGradient id="apc-screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0C0F2E"/>
+      <stop offset="1" stop-color="#171B4A"/>
+    </linearGradient>
+    <linearGradient id="apc-shine" x1="0.2" y1="0" x2="0.7" y2="0.8">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="48" y="48" width="928" height="928" rx="232" fill="url(#apc-tile)"/>
+  <rect x="80" y="72" width="864" height="500" rx="210" fill="url(#apc-shine)"/>
+
+  <!-- monitor: bezel, screen, stand -->
+  <rect x="184" y="228" width="656" height="456" rx="72" fill="#F5F6FF"/>
+  <rect x="226" y="270" width="572" height="372" rx="36" fill="url(#apc-screen)"/>
+  <path d="M452 684h120l18 76H434z" fill="#F5F6FF"/>
+  <rect x="360" y="748" width="304" height="52" rx="26" fill="#F5F6FF"/>
+
+  <!-- prompt: >_ -->
+  <path d="M300 374l84 64-84 64" fill="none" stroke="#B4B8FF" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="418" y="478" width="124" height="44" rx="22" fill="#B4B8FF"/>
+
+  <!-- the agent's pointer, crossing the bezel -->
+  <path d="M618 424v300l74-70 52 116 62-28-52-114 104-8z" fill="#7DF0B0" stroke="#0C0F2E" stroke-width="30" stroke-linejoin="round"/>
+</svg>

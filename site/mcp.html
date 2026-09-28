@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>agentpc MCP</title>
+    <meta
+      name="description"
+      content="agentpc MCP server documentation: connect AI agents and give them tools to create, drive, screenshot and reset desktop VMs."
+    />
+    <meta property="og:title" content="agentpc MCP" />
+    <meta
+      property="og:description"
+      content="One MCP server that lets agents create, drive, screenshot and reset Windows and Ubuntu VMs on a Mac."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta property="og:url" content="https://agentpc.pawanpaudel.com.np/mcp.html" />
+    <meta name="theme-color" content="#1b1f4b" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="shell">
+      <nav class="nav" aria-label="Main navigation">
+        <a class="brand" href="index.html">
+          <img src="favicon.svg" width="36" height="36" alt="" decoding="async" />
+          <span>agentpc</span>
+          <span class="version" translate="no">v0.1.2</span>
+        </a>
+        <div class="nav-links">
+          <a href="index.html#install">Install</a>
+          <a href="index.html#features">Features</a>
+          <a href="mcp.html" aria-current="page">MCP</a>
+          <a href="cli.html">CLI</a>
+          <a href="guide.html">Guide</a>
+          <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
+        </div>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="shell hero compact">
+        <div class="hero-inner">
+          <p class="eyebrow">Documentation</p>
+          <h1>MCP</h1>
+          <p class="hero-copy">
+            <code translate="no">agentpc mcp</code> is one stdio MCP server for every VM. Agents use it
+            to create desktops, drive them, take screenshots and reset them, with no human in the loop.
+          </p>
+        </div>
+      </section>
+
+      <div class="shell doc-layout">
+        <aside class="doc-nav" aria-label="MCP sections">
+          <strong>On this page</strong>
+          <div class="doc-nav-links">
+            <a href="#connect">Connect an agent</a>
+            <a href="#clients">Client configs</a>
+            <a href="#tools">Tools</a>
+            <a href="#desktop">Desktop control</a>
+            <a href="#workflow">Typical session</a>
+            <a href="#jobs">Long jobs</a>
+            <a href="#lifecycle">Session lifecycle</a>
+            <a href="#annotations">Tool annotations</a>
+          </div>
+        </aside>
+
+        <article class="doc-main">
+          <section class="doc-section" id="connect">
+            <h2>Connect an agent</h2>
+            <p>
+              The installer already ran this for you. Run it again after installing a new agent,
+              or pass client names to pick which ones to register:
+            </p>
+            <div class="code-panel">
+              <pre><code translate="no"><span class="prompt">$ </span>agentpc mcp-install
+<span class="prompt">$ </span>agentpc mcp-install claude claude-desktop codex cursor gemini vscode</code></pre>
+            </div>
+            <p>
+              Supported: Claude Code, Claude Desktop, Codex, Cursor, Gemini CLI and VS Code.
+              Restart Claude Desktop after registering. For Codex it also raises the MCP timeouts
+              so slow builds and boots don't trip them. <code translate="no">agentpc mcp-uninstall</code>
+              removes the registration again.
+            </p>
+
+            <h3>Claude plugin</h3>
+            <p>
+              In Claude Code, the plugin bundles the MCP server with a skill that teaches Claude when
+              and how to use the VMs. It runs the installed <code translate="no">agentpc</code> binary,
+              so install that first.
+            </p>
+            <div class="code-panel">
+              <pre><code translate="no">/plugin marketplace add pawanpaudel93/agentpc
+/plugin install agentpc@agentpc</code></pre>
+            </div>
+            <div class="callout">
+              <p>
+                With the plugin installed, <code translate="no">agentpc mcp-install</code> skips Claude
+                Code so the server isn't registered twice.
+              </p>
+            </div>
+          </section>
+
+          <section class="doc-section" id="clients">
+            <h2>Client configs</h2>
+            <p>For any other MCP client, add the server by hand. The standard shape:</p>
+            <div class="code-panel">
+              <pre><code translate="no">{
+  "mcpServers": {
+    "agentpc": { "command": "agentpc", "args": ["mcp"] }
+  }
+}</code></pre>
+            </div>
+
+            <h3>Codex</h3>
+            <p>
+              A first <code translate="no">create_vm</code> can take minutes while the image downloads, so
+              the server needs longer timeouts than Codex's defaults. <code translate="no">agentpc mcp-install codex</code>
+              adds these for you:
+            </p>
+            <div class="code-panel">
+              <pre><code translate="no">[mcp_servers.agentpc]
+command = "agentpc"
+args = ["mcp"]
+startup_timeout_sec = 60
+tool_timeout_sec = 900</code></pre>
+            </div>
+
+            <h3>VS Code</h3>
+            <div class="code-panel">
+              <pre><code translate="no">{
+  "servers": {
+    "agentpc": { "type": "stdio", "command": "agentpc", "args": ["mcp"] }
+  }
+}</code></pre>
+            </div>
+            <p>
+              The agentpc repository ships these as project configs (<code translate="no">.mcp.json</code>,
+              <code translate="no">.codex/config.toml</code>, <code translate="no">.cursor/mcp.json</code>,
+              <code translate="no">.gemini/settings.json</code>, <code translate="no">.vscode/mcp.json</code>),
+              so an agent opened in a clone picks the server up automatically.
+            </p>
+          </section>
+
+          <section class="doc-section" id="tools">
+            <h2>Tools</h2>
+            <h3>VMs</h3>
+            <table class="data-table">
+              <thead>
+                <tr><th>Tool</th><th>Use</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code translate="no">list_vms</code></td>
+                  <td>VMs (owner, state, size, checkpoints, viewer) and the images they come from, with OS versions. Start here.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">create_vm</code></td>
+                  <td>
+                    New clone, returned once its desktop is ready: Ubuntu ~1 s, Windows ~4 s (the first
+                    create of an image can take minutes). Takes <code translate="no">os</code>, and optionally
+                    <code translate="no">version</code> (Ubuntu <code translate="no">"22.04"</code>; Windows
+                    <code translate="no">"11-25h2"</code>, <code translate="no">"11-24h2"</code>,
+                    <code translate="no">"11-23h2"</code>), <code translate="no">name</code>,
+                    <code translate="no">memory_gb</code> (2–64, default 8 Windows / 4 Ubuntu),
+                    <code translate="no">cpus</code> (1–16, default 4) and <code translate="no">offline</code>.
+                    A non-default size boots cold (~25 s / ~15 s). Retrying in the same session returns the
+                    VM it already made.
+                  </td>
+                </tr>
+                <tr>
+                  <td><code translate="no">start_vm</code> / <code translate="no">stop_vm</code></td>
+                  <td>Boot a stopped VM, waiting until it's ready / shut one down cleanly.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">reset_vm</code></td>
+                  <td>Discard all changes: back to a fresh copy of the image, booted.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">delete_vm</code></td>
+                  <td>Stop a VM and delete it with its disk and checkpoints.</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <h3>Checkpoints</h3>
+            <table class="data-table">
+              <thead>
+                <tr><th>Tool</th><th>Use</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code translate="no">checkpoint_vm</code></td>
+                  <td>Save a VM's disk and memory under a label (replacing an older one of that name) before a risky step. A running VM pauses for a few seconds.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">restore_vm</code></td>
+                  <td>Go back to a checkpoint exactly as it was and start it, in seconds. Port forwards must be set up again.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">delete_checkpoint</code></td>
+                  <td>Delete one checkpoint by label; the VM is untouched.</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <h3>Shell, files and ports</h3>
+            <table class="data-table">
+              <thead>
+                <tr><th>Tool</th><th>Use</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code translate="no">run_command</code></td>
+                  <td>
+                    PowerShell on Windows, bash on Ubuntu, over SSH. Returns the exit code, stdout and
+                    stderr, each trimmed to its first and last 10,000 characters. A foreground run is
+                    killed at <code translate="no">timeout</code> (default 120 s) with partial output;
+                    <code translate="no">background: true</code> returns a job id.
+                  </td>
+                </tr>
+                <tr>
+                  <td><code translate="no">get_job_status</code></td>
+                  <td>A background job's state (running, or exited with its code) and the tail of its log (<code translate="no">tail_lines</code>, default 50).</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">upload_file</code> / <code translate="no">download_file</code></td>
+                  <td>Copy files or folders between the Mac and a VM.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">forward_port</code></td>
+                  <td>
+                    Reach a server in the VM from the Mac at <code translate="no">127.0.0.1:&lt;host_port&gt;</code>.
+                    An SSH tunnel, so it reaches servers bound to the guest's own
+                    <code translate="no">127.0.0.1</code>. Lasts until the VM stops.
+                  </td>
+                </tr>
+                <tr>
+                  <td><code translate="no">list_forwards</code> / <code translate="no">delete_forward</code></td>
+                  <td>List a VM's forwards and whether each tunnel is alive / stop one by its host port.</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <h3>Screen and desktop</h3>
+            <table class="data-table">
+              <thead>
+                <tr><th>Tool</th><th>Use</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code translate="no">take_screenshot</code></td>
+                  <td>PNG straight from the hypervisor, even while booting or hung. <code translate="no">save_to</code> also writes it to a path on the Mac.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">list_desktop_tools</code></td>
+                  <td>The desktop-control tools inside a VM, or one tool's full schema.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">use_desktop_tool</code></td>
+                  <td>Call one of them (<code translate="no">tool</code> plus <code translate="no">arguments</code>): click, type, launch apps, read the UI tree, and more. Gives up after 120 s.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">read_vm_log</code></td>
+                  <td>Tail a VM's <code translate="no">qemu</code> or <code translate="no">serial</code> log (<code translate="no">tail_lines</code>, default 100) when it won't boot or the desktop is unreachable.</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="doc-section" id="desktop">
+            <h2>Desktop control</h2>
+            <p>
+              Both guests run <a href="https://github.com/trycua/cua">cua-driver</a> and are
+              1280×800. Work in a loop: look (<code translate="no">take_screenshot</code> or a
+              snapshot tool), act (<code translate="no">use_desktop_tool</code>), then look again to
+              verify. Prefer <code translate="no">run_command</code> for anything a shell can do.
+            </p>
+            <table class="data-table">
+              <thead>
+                <tr><th>Guest</th><th>How to drive it</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Windows</td>
+                  <td>
+                    <code translate="no">launch_app</code> takes a name such as <code translate="no">notepad</code>
+                    and returns the <code translate="no">pid</code> and <code translate="no">window_id</code>s.
+                    <code translate="no">get_window_state(pid, window_id)</code> returns numbered elements and a
+                    <code translate="no">snapshot_id</code>; <code translate="no">click</code> and
+                    <code translate="no">type_text</code> take that <code translate="no">snapshot_id</code> with an
+                    <code translate="no">element_index</code>. Input goes in the background first; typing into the
+                    focused field, scroll, drag and right-click often need
+                    <code translate="no">"delivery_mode": "foreground"</code>, which the driver asks for when
+                    background input can't reach the target.
+                  </td>
+                </tr>
+                <tr>
+                  <td>Ubuntu</td>
+                  <td>
+                    XFCE on X11. <code translate="no">get_desktop_state</code> returns a screenshot plus window
+                    <code translate="no">pid</code>/<code translate="no">window_id</code> values. Keyboard and mouse
+                    tools need <code translate="no">"delivery_mode": "foreground"</code>.
+                    <code translate="no">launch_app</code> takes a command such as
+                    <code translate="no">xfce4-terminal</code>. Google Chrome is installed for the
+                    <code translate="no">browser_*</code> tools.
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="callout">
+              <p>
+                Windows images built by agentpc 0.1.0 use Windows-MCP instead: call
+                <code translate="no">Snapshot</code> first, <code translate="no">Click</code> takes
+                <code translate="no">loc: [x, y]</code>, and <code translate="no">Type</code> needs
+                <code translate="no">loc</code> or <code translate="no">label</code>.
+                <code translate="no">list_desktop_tools</code> shows which one a VM has.
+              </p>
+            </div>
+            <p>Open Notepad on Windows and type into it, as three <code translate="no">use_desktop_tool</code> calls. The <code translate="no">pid</code> and <code translate="no">window_id</code> come from <code translate="no">launch_app</code>; the <code translate="no">snapshot_id</code> and <code translate="no">element_index</code> from <code translate="no">get_window_state</code>:</p>
+            <div class="code-panel">
+              <pre><code translate="no">{ "name": "windows-1", "tool": "launch_app", "arguments": { "name": "notepad" } }
+{ "name": "windows-1", "tool": "get_window_state", "arguments": { "pid": 4120, "window_id": 65812 } }
+{ "name": "windows-1", "tool": "type_text", "arguments": {
+    "pid": 4120, "window_id": 65812, "snapshot_id": "s1a2b3c4d",
+    "element_index": 7, "text": "Hello from the agent" } }</code></pre>
+            </div>
+          </section>
+
+          <section class="doc-section" id="workflow">
+            <h2>Typical session</h2>
+            <p>Test an install script on a clean machine, keeping a checkpoint to retry from:</p>
+            <div class="code-panel">
+              <pre><code translate="no">create_vm        { "os": "ubuntu", "name": "install-test" }
+upload_file      { "name": "install-test", "host_path": "./install.sh", "guest_path": "/tmp/" }
+checkpoint_vm    { "name": "install-test", "label": "before-install" }
+run_command      { "name": "install-test", "command": "bash /tmp/install.sh" }
+take_screenshot  { "name": "install-test" }
+restore_vm       { "name": "install-test", "label": "before-install" }  <span class="comment"># retry from the same state</span>
+delete_vm        { "name": "install-test" }</code></pre>
+            </div>
+            <p>Some prompts to try:</p>
+            <ul>
+              <li><em>"Create an Ubuntu VM, open a terminal and run <code translate="no">uname -a</code>."</em></li>
+              <li><em>"Reset ubuntu-1 and check that my install script works on a clean machine."</em></li>
+              <li><em>"Open Notepad on windows-1, type a short note and show me a screenshot."</em></li>
+            </ul>
+          </section>
+
+          <section class="doc-section" id="jobs">
+            <h2>Long jobs and servers</h2>
+            <p>
+              A foreground <code translate="no">run_command</code> ends when the command returns, and is
+              killed at its timeout. Start builds, servers and GUI apps with
+              <code translate="no">background: true</code>, then poll:
+            </p>
+            <div class="code-panel">
+              <pre><code translate="no">run_command     { "name": "ubuntu-1", "command": "npm run dev", "background": true }  <span class="comment"># → job id 1</span>
+get_job_status  { "name": "ubuntu-1", "id": 1, "tail_lines": 40 }
+forward_port    { "name": "ubuntu-1", "guest_port": 3000 }  <span class="comment"># → 127.0.0.1:&lt;port&gt; on the Mac</span></code></pre>
+            </div>
+            <p>
+              Reboots (some installers) drop SSH. Call <code translate="no">start_vm</code> on the same VM,
+              which waits until the desktop is ready again even if it's already running, or retry
+              <code translate="no">run_command</code>.
+            </p>
+          </section>
+
+          <section class="doc-section" id="lifecycle">
+            <h2>Session lifecycle</h2>
+            <ul>
+              <li>VMs a session created or started are <strong>stopped, never deleted</strong>, when the session ends. Set <code translate="no">AGENTPC_KEEP_RUNNING=1</code> to keep them running.</li>
+              <li><code translate="no">list_vms</code> shows each VM's owner. Agents should create their own uniquely named VM per task, and never reset, restore or delete one they didn't create.</li>
+              <li>Each running VM takes 4 GB (Ubuntu) or 8 GB (Windows) of RAM, so delete VMs when done.</li>
+              <li>The guest login is <code translate="no">agent</code> / <code translate="no">agent</code>.</li>
+            </ul>
+          </section>
+
+          <section class="doc-section" id="annotations">
+            <h2>Tool annotations</h2>
+            <p>
+              Tools carry MCP annotations so clients can auto-approve or confirm them:
+              <code translate="no">list_vms</code>, <code translate="no">take_screenshot</code>,
+              <code translate="no">list_desktop_tools</code>, <code translate="no">get_job_status</code>,
+              <code translate="no">list_forwards</code> and <code translate="no">read_vm_log</code> are read-only.
+              Tools that discard or overwrite state are marked destructive, including
+              <code translate="no">download_file</code>, which writes to your Mac.
+              <code translate="no">start_vm</code> and <code translate="no">stop_vm</code> are idempotent.
+            </p>
+          </section>
+        </article>
+      </div>
+      <span class="copy-status" aria-live="polite"></span>
+    </main>
+
+    <footer>
+      <div class="shell">
+        <span>agentpc by <a href="https://github.com/pawanpaudel93">Pawan Paudel</a> · MIT license</span>
+        <span>
+          <a href="index.html">Home</a>
+          ·
+          <a href="cli.html">CLI</a>
+          ·
+          <a href="guide.html">Guide</a>
+          ·
+          <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
+        </span>
+      </div>
+    </footer>
+    <script src="script.js"></script>
+  </body>
+</html>
