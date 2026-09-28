@@ -389,12 +389,11 @@ echo "server=$(~/.local/bin/cua-driver --version 2>/dev/null | awk '{print $NF}'
         Os::Windows => {
             r#"$v = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 $cua = "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin\cua-driver.exe"
-$mcp = if (Test-Path C:\uv\uv.exe) { & C:\uv\uv.exe tool list 2>$null | Select-String '^windows-mcp v' }
 "caption=$((Get-CimInstance Win32_OperatingSystem).Caption -replace '^Microsoft ', '')"
 "release=$($v.DisplayVersion)"
 "build=$($v.CurrentBuild).$($v.UBR)"
 "arch=$($env:PROCESSOR_ARCHITECTURE.ToLower())"
-"server=$(if (Test-Path $cua) { & $cua --version } elseif ($mcp) { $mcp.Line -replace '^windows-mcp v', 'Windows-MCP ' })""#
+"server=$(if (Test-Path $cua) { & $cua --version })""#
         }
     };
     let out = ssh(inst, script)?;

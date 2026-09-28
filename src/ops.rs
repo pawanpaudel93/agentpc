@@ -200,12 +200,11 @@ pub const WINDOWS_CUA_DRIVER: &str =
 /// Desktop session up and its control server answering. Errs when it never will be.
 pub fn ready(inst: &Instance) -> Result<bool> {
     match inst.os {
-        // Images built before cua-driver shipped run Windows-MCP over HTTP instead.
         Os::Windows => {
             let probe = format!(
                 r#"if (-not (Test-Path C:\OEM\done.txt)) {{ 'wait' }}
 elseif (Test-Path "{WINDOWS_CUA_DRIVER}") {{ if ((& "{WINDOWS_CUA_DRIVER}" status 2>&1 | Out-String) -match 'daemon is running') {{ 'ready' }} }}
-elseif (Test-Path C:\uv\bin\windows-mcp.exe) {{ 'http' }}
+elseif (Test-Path C:\uv\bin\windows-mcp.exe) {{ 'old' }}
 else {{ 'missing' }}"#
             );
             let out = ssh_within(inst, &probe, Duration::from_secs(20));
@@ -217,7 +216,7 @@ else {{ 'missing' }}"#
                     .map(str::trim)
                 {
                     Some("ready") => true,
-                    Some("http") => http_responds(inst.mcp_port()),
+                    Some("old") => bail!("{}", old_windows_image(inst)),
                     Some("missing") => bail!(
                         "{}: setup finished but installed no desktop-control server \
                      (see C:\\OEM\\setup.log in the guest)",
@@ -261,20 +260,14 @@ fn ssh_within(inst: &Instance, remote: &str, limit: Duration) -> Option<Output> 
     }
 }
 
-/// Any HTTP reply at all (Windows-MCP answers a bare GET with 4xx).
-fn http_responds(port: u16) -> bool {
-    use std::io::{Read, Write};
-    let Ok(mut s) = std::net::TcpStream::connect_timeout(
-        &([127, 0, 0, 1], port).into(),
-        Duration::from_secs(2),
-    ) else {
-        return false;
-    };
-    let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
-    let mut buf = [0u8; 12];
-    s.write_all(b"GET /mcp HTTP/1.0\r\n\r\n").is_ok()
-        && s.read(&mut buf)
-            .is_ok_and(|n| n > 0 && buf.starts_with(b"HTTP/"))
+/// Why a Windows VM from an image built by agentpc 0.1.0 (Windows-MCP, no cua-driver) can't be
+/// driven, and what to do about it.
+pub fn old_windows_image(inst: &Instance) -> String {
+    format!(
+        "{} comes from an image built by agentpc 0.1.0, whose desktop server (Windows-MCP) is no \
+         longer supported. Rebuild the image (agentpc image build {}) and create a new VM",
+        inst.name, inst.image
+    )
 }
 
 pub fn wait_ready(inst: &Instance, timeout: Duration) -> Result<Duration> {

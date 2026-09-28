@@ -199,6 +199,13 @@ pub fn mcp_install(clients: &[String]) -> Result<()> {
                 register_cmd("codex", &["mcp", "remove", SERVER], true)?;
                 register_cmd("codex", &["mcp", "add", SERVER, "--", &bin, "mcp"], false)?;
                 codex_set_timeouts()?;
+                // Approving every tool is the user's call (download_file writes to this Mac),
+                // so say how rather than set it.
+                log!(
+                    "codex asks before each desktop action; to approve {SERVER}'s tools up front, \
+                     add default_tools_approval_mode = \"approve\" under [mcp_servers.{SERVER}] \
+                     in ~/.codex/config.toml"
+                );
             }
             "cursor" => {
                 if !home.join(".cursor").is_dir() {

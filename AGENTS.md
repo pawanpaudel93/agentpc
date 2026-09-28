@@ -22,8 +22,8 @@ can run `agentpc mcp-install` (or install first: see README.md).
 | `forward_port(name, guest_port, host_port?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). SSH tunnel: reaches a server on the guest's own `127.0.0.1`; lasts until the VM stops. |
 | `list_forwards(name)` / `delete_forward(name, host_port)` | List a VM's forwards / stop one. |
 | `read_vm_log(name, which, tail_lines?)` | Tail a VM's `qemu` or `serial` log when it won't boot or the desktop is unreachable. |
-| `list_desktop_tools(name, tool?)` | Desktop-control tools in that VM, or one tool's full schema. |
-| `use_desktop_tool(name, tool, arguments?)` | Call one of those tools (click, type, launch, snapshot…). |
+| `list_desktop_tools(name, tool?)` | Desktop-control tools in that VM with their required arguments and read-only marks, or one tool's full schema. |
+| `use_desktop_tool(name, tool, arguments?)` | Call one of those tools (click, type, launch, snapshot…). Wrong arguments or a wrong name return the argument list or close matches. |
 
 Work in a loop: look (`take_screenshot` or a snapshot tool) → act (`use_desktop_tool`) → look again to
 verify. Prefer `run_command` for anything a shell can do; use `use_desktop_tool` for GUI-only work.
@@ -31,15 +31,19 @@ verify. Prefer `run_command` for anything a shell can do; use `use_desktop_tool`
 **Windows** (desktop tools from cua-driver): `launch_app` takes a name such as `notepad` and
 returns the `pid` and `window_id`s. `get_window_state(pid, window_id)` returns numbered elements
 and a `snapshot_id`; `click`/`type_text` take `snapshot_id` with `element_index`. Typing into the
-focused field, scroll, drag and right-click often need `"delivery_mode": "foreground"`. Windows images
-built by agentpc 0.1.0 use Windows-MCP instead: call `Snapshot` first, `Click` takes
-`loc: [x, y]`, `Type` needs `loc` or `label`.
+focused field, scroll, drag and right-click often need `"delivery_mode": "foreground"`.
 
 **Ubuntu** (desktop tools from cua-driver, XFCE on X11): `get_desktop_state` returns a
 screenshot plus window pid/window_id values to pass to other tools. Keyboard and mouse
 tools need `"delivery_mode": "foreground"`. `launch_app` takes a command name such as
-`xfce4-terminal`. Google Chrome is installed for the `browser_*` tools (see the plugin skill
-for the call sequence).
+`xfce4-terminal`. Google Chrome is installed: `launch_app` `google-chrome` with the URL in
+`additional_arguments`, then `get_window_state`, reads a page; the `browser_*` tools drive one
+(the MCP server's instructions and the plugin skill give the call sequence).
+
+`list_desktop_tools` shows each tool's required arguments, and a call with wrong arguments returns
+the tool's argument list. If `get_window_state` comes back "degraded" with no elements, act by
+pixels (`x`/`y` from that call's screenshot). The driver is pinned per image; don't update it
+inside a VM.
 
 Guest tips:
 
@@ -82,8 +86,8 @@ Rules:
 - Rust, single binary `agentpc` (CLI + MCP server). `src/main.rs` is the CLI; modules:
   `instance` (VMs, images, on-disk layout), `qemu`, `ops` (lifecycle),
   `viewer` (browser viewer), `image` (build/snapshot), `registry` (pull/push), `setup` (`doctor`, `mcp-install`, `clean`, `uninstall`), `update` (self-update), `mcp` (the server).
-- Ports derive from the instance slot n: SSH 47000+n, Windows-MCP (0.1.0 images) 47100+n, noVNC websocket
-  47200+n, VNC 47300+n; the shared browser viewer is on 8100.
+- Ports derive from the instance slot n: SSH 47000+n, noVNC websocket 47200+n,
+  VNC 47300+n; the shared browser viewer is on 8100.
 - Guest assets in `guests/` are embedded in the binary. A Windows build writes them to a
   FAT `setup.img`: `Autounattend.xml` drives Setup, `SetupComplete.cmd` runs after it, and
   `oem/setup.ps1` runs at first logon; `guests/ubuntu/user-data` is the Ubuntu cloud-init.
@@ -96,5 +100,7 @@ Rules:
   `.claude-plugin/marketplace.json`. Keep the skill's tool guidance in sync with the
   "Using the VMs" section above; check with `claude plugin validate plugin --strict`.
 - Verify with `cargo clippy -- -D warnings` plus a real instance (`agentpc create ubuntu`, then
-  the MCP tools). Unit tests can't cover the VM paths.
+  the MCP tools). Unit tests can't cover the VM paths. After changing `guests/`, the desktop
+  driver or the MCP gateway, rebuild the affected images and run `scripts/smoke.py --bin
+  target/release/agentpc`: it drives fresh VMs through the MCP server like an agent does.
 - Never commit `target/`.

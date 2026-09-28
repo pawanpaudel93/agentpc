@@ -173,15 +173,30 @@ pick the server up automatically.
 | `forward_port` | Reach a server running in a VM from your Mac (SSH tunnel; works even for servers bound to the guest's own `127.0.0.1`) |
 | `list_forwards` / `delete_forward` | List a VM's active port forwards / stop one by its host port |
 | `read_vm_log` | Read the tail of a VM's `qemu` or `serial` log, for when a VM won't boot or the desktop is unreachable |
-| `list_desktop_tools` | List the desktop-control tools inside a VM |
-| `use_desktop_tool` | Call one of them: click, type, launch apps, read the UI tree, … |
+| `list_desktop_tools` | List the desktop-control tools inside a VM, with each one's required arguments and whether it's read-only |
+| `use_desktop_tool` | Call one of them: click, type, launch apps, read the UI tree, … A call with wrong arguments or a wrong name returns the tool's arguments or close matches |
 
 VMs an MCP session created or started are stopped (never deleted) when the session ends, unless
 `AGENTPC_KEEP_RUNNING=1`.
 
+### Approval prompts
+
+Every desktop action goes through `use_desktop_tool`, which is marked destructive, so clients that
+confirm tool calls ask before each click or keystroke. To approve agentpc's tools up front:
+
+| Client | Setting |
+| --- | --- |
+| Claude Code | Allow `mcp__agentpc` (all of its tools) with `/permissions`, or in `permissions.allow` in settings |
+| Codex | `default_tools_approval_mode = "approve"` under `[mcp_servers.agentpc]` in `~/.codex/config.toml` |
+| Gemini CLI | `"trust": true` on the `agentpc` server in `~/.gemini/settings.json` |
+| Others | The client's own tool-approval settings |
+
+That approves every agentpc tool, including `upload_file` and `download_file`, which read and write
+files on your Mac. The VMs themselves are throwaway: `reset_vm` undoes anything done inside one.
+
 | Guest | Desktop | Desktop-control server |
 | --- | --- | --- |
-| Windows | Windows 11 (ARM64), 1280x800, Edge | [cua-driver](https://github.com/trycua/cua) (over SSH; Windows-MCP on images built by 0.1.0) |
+| Windows | Windows 11 (ARM64), 1280x800, Edge | [cua-driver](https://github.com/trycua/cua) (over SSH) |
 | Ubuntu | Ubuntu 24.04 or another release, XFCE on X11, 1280x800, Google Chrome | [cua-driver](https://github.com/trycua/cua) (over SSH) |
 
 [AGENTS.md](AGENTS.md) has usage tips for agents.
@@ -317,7 +332,6 @@ moves to its new ports the next time it starts):
 | Port | Use |
 | --- | --- |
 | `47000 + n` | SSH |
-| `47100 + n` | Windows-MCP (Windows images built by 0.1.0) |
 | `47200 + n` | noVNC WebSocket (for the viewer) |
 | `47300 + n` | VNC |
 | `8100` | Browser viewer, shared by all VMs |
@@ -456,8 +470,8 @@ To only reclaim disk space, `agentpc clean` deletes what can be downloaded again
 - VMs can reach the internet and, through its gateway `10.0.2.2`, services on your Mac. Create
   a VM with `--offline` (`offline: true` in `create_vm`) to cut both off, e.g. for untrusted
   software; SSH, the viewer and forwarded ports keep working.
-- The MCP tools carry annotations: `list_vms`, `take_screenshot` and `list_desktop_tools` are
-  read-only, and tools that discard or overwrite state (including `download_file`, which writes
+- The MCP tools carry annotations: `list_vms`, `take_screenshot`, `list_desktop_tools`,
+  `get_job_status`, `list_forwards` and `read_vm_log` are read-only, and tools that discard or overwrite state (including `download_file`, which writes
   to your Mac) are marked destructive, so clients can auto-approve or confirm accordingly.
 - Treat VMs as throwaway sandboxes, not as a place for secrets.
 
@@ -467,7 +481,12 @@ To only reclaim disk space, `agentpc clean` deletes what can be downloaded again
 cargo build --release                  # target/release/agentpc
 cargo clippy --all-targets -- -D warnings
 cargo test
+scripts/smoke.py --bin target/release/agentpc   # drives fresh VMs through the MCP server
 ```
+
+Run the smoke test after changing guest scripts, the desktop driver or the MCP gateway (rebuild
+the affected images first). It checks that guests open apps without first-run dialogs, that the
+desktop tools read and type, and that the gateway explains bad arguments.
 
 Guest provisioning files in `guests/` are embedded into the binary. [AGENTS.md](AGENTS.md)
 describes the code layout for contributors and coding agents.

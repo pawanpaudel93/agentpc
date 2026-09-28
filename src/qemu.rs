@@ -197,7 +197,7 @@ fn launch(
         Some(state) => resume_machine(state),
         None => machine_type(),
     };
-    let mut fwd = format!("hostfwd=tcp:127.0.0.1:{}-:22", inst.ssh_port());
+    let fwd = format!("hostfwd=tcp:127.0.0.1:{}-:22", inst.ssh_port());
     let (mem, cpus) = inst.size();
     let mut args: Vec<String> = vec![
         "-smp".into(),
@@ -207,7 +207,6 @@ fn launch(
     ];
     match inst.os {
         Os::Windows => {
-            fwd += &format!(",hostfwd=tcp:127.0.0.1:{}-:8000", inst.mcp_port());
             args.extend(
                 [
                     "-device",

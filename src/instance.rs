@@ -222,19 +222,15 @@ impl FromStr for Os {
 
 /// Per-slot host ports. Kept in an uncommon 47xxx range so they don't collide with the
 /// dev servers people run on 22/8000/5900. Slot n (1..=50) gets `<base>+n` in each band.
+/// (47100+n was Windows-MCP's, for images built by agentpc 0.1.0; left unused so the other
+/// bands keep their numbers.)
 const SSH_BASE: u16 = 47000;
-const MCP_BASE: u16 = 47100;
 const WS_BASE: u16 = 47200;
 const VNC_BASE: u16 = 47300;
 
-/// The four host ports a slot occupies, for slot-selection bind tests.
-fn slot_host_ports(slot: u16) -> [u16; 4] {
-    [
-        SSH_BASE + slot,
-        MCP_BASE + slot,
-        WS_BASE + slot,
-        VNC_BASE + slot,
-    ]
+/// The host ports a slot occupies, for slot-selection bind tests.
+fn slot_host_ports(slot: u16) -> [u16; 3] {
+    [SSH_BASE + slot, WS_BASE + slot, VNC_BASE + slot]
 }
 
 /// A VM instance. Its ports derive from its slot so several can run at once.
@@ -349,9 +345,6 @@ impl Instance {
 
     pub fn ssh_port(&self) -> u16 {
         SSH_BASE + self.slot
-    }
-    pub fn mcp_port(&self) -> u16 {
-        MCP_BASE + self.slot
     }
     /// Actual VNC port (QEMU adds 5900 to the display number).
     pub fn vnc_port(&self) -> u16 {

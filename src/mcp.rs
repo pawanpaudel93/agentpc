@@ -1,6 +1,5 @@
 //! MCP gateway over stdio. Lifecycle tools wrap `ops`; `use_desktop_tool` forwards to the
-//! instance's own desktop-control server (cua-driver over SSH; Windows-MCP over HTTP on
-//! older Windows images)
+//! instance's own desktop-control server (cua-driver over SSH)
 //! through one session kept open per instance, so element references returned by one
 //! call stay valid in the next.
 
@@ -18,7 +17,7 @@ use rmcp::model::{
     ProgressNotificationParam, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RunningService};
-use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
+use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use rmcp::{
     RoleClient, RoleServer, ServerHandler, ServiceError, ServiceExt, tool, tool_handler,
     tool_router,
@@ -45,8 +44,27 @@ The first create of an image can take minutes (download/build); after that it's 
 Desktop tools come from cua-driver on both OSes: launch_app returns a pid and window_ids;
 get_window_state(pid, window_id) returns numbered elements and a snapshot_id to pass with
 element_index to click/type_text. On Ubuntu, keyboard/mouse input needs \"delivery_mode\":
-\"foreground\"; on Windows, typing into the focused field, scroll, drag and right-click often do. Windows images built by agentpc 0.1.0 use Windows-MCP instead (call Snapshot
-first; Click/Type need a loc [x, y] or label); list_desktop_tools shows which.
+\"foreground\"; on Windows, typing into the focused field, scroll, drag and right-click often do.
+list_desktop_tools shows each tool's required arguments; a call with wrong arguments returns
+the tool's argument list.
+
+If get_window_state comes back \"degraded\" (no elements), act by pixels instead: pass x/y read
+from the screenshot of a get_window_state call that included one (the default).
+
+Web pages on Ubuntu (Google Chrome):
+- To read a page: launch_app {\"name\": \"google-chrome\", \"additional_arguments\": [\"<url>\"]},
+  then get_window_state on its window; the page's text, links and fields are in the tree.
+- To drive a page with the browser_* tools: browser_prepare {\"allow_launch\": true, \"profile\":
+  {\"mode\": \"isolated_new\"}, \"session\": \"<label>\"} -> list_windows {\"pid\": <prepared_pid>} ->
+  get_browser_state {pid, window_id} for target_id/tab_id -> browser_navigate / browser_click /
+  browser_type. Pass the same session label on every call. A session ends after about 5
+  minutes without calls, or if the driver connection drops (the reply then says so): run
+  browser_prepare again.
+- launch_app with `urls` opens them through the default handler and returns no pid; don't use
+  the legacy `page` tool.
+
+The desktop driver is pinned per image so tools match these docs; don't update it inside a VM
+(reset_vm restores it).
 
 Rules:
 - Ownership: create your OWN uniquely named VM and work in it. Never reset/delete/restore a VM you
@@ -101,6 +119,11 @@ struct Gateway {
     owned: Arc<Mutex<HashSet<String>>>,
     /// Identifies this server process, so a VM's owner tag is unique per session.
     session_id: Arc<str>,
+    /// VMs this process has connected to the desktop driver of, and those whose connection
+    /// has since been replaced (the driver's sessions, bindings and snapshot ids went with
+    /// the old one) and whose next desktop call should say so.
+    connected: Arc<Mutex<HashSet<String>>>,
+    reconnected: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Gateway {
@@ -114,6 +137,8 @@ impl Gateway {
             sessions: Default::default(),
             owned: Default::default(),
             session_id: format!("{pid:x}{nanos:x}").into(),
+            connected: Default::default(),
+            reconnected: Default::default(),
         }
     }
 
@@ -659,10 +684,23 @@ impl Gateway {
                             .chars()
                             .take(160)
                             .collect();
-                        format!("{}: {first}", t.name)
+                        let read_only = t
+                            .annotations
+                            .as_ref()
+                            .and_then(|a| a.read_only_hint)
+                            .unwrap_or(false);
+                        format!(
+                            "{}({}){}: {first}",
+                            t.name,
+                            signature(&t.input_schema),
+                            if read_only { " [read-only]" } else { "" }
+                        )
                     })
                     .collect();
-                return Ok(lines.join("\n"));
+                return Ok(format!(
+                    "Required arguments in (), \"…\" = optional ones; pass `tool` for a full schema.\n{}",
+                    lines.join("\n")
+                ));
             };
             let t = tools
                 .iter()
@@ -694,7 +732,7 @@ impl Gateway {
                 async move { c.call_tool(params).await }
             })
             .await;
-        match r {
+        let failure = match r {
             Ok(res) if res.is_error == Some(true) => {
                 let msg: Vec<&str> = res
                     .content
@@ -702,11 +740,11 @@ impl Gateway {
                     .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
                     .collect();
                 let msg = msg.join(" ");
-                CallToolResult::error(vec![ContentBlock::text(if msg.is_empty() {
+                if msg.is_empty() {
                     format!("{} failed", a.tool)
                 } else {
                     msg
-                })])
+                }
             }
             Ok(res) => {
                 // Inner servers (cua-driver's browser tools) put ids like tab_id only in
@@ -723,10 +761,46 @@ impl Gateway {
                 }
                 let mut out = CallToolResult::success(content);
                 out.structured_content = res.structured_content;
-                out
+                return self.noted(&a.name, out);
             }
-            Err(e) => text(Err(e)),
-        }
+            Err(e) => format!("{e:#}"),
+        };
+        // A wrong guess at a tool's name or arguments is the usual failure: answer it with the
+        // right names or the arguments, so the next call can be right without another lookup.
+        // (cua-driver reports an unknown name as a permission error, so check names here.)
+        let tools = self
+            .with_session(&a.name, "list_tools", |c: Client| async move {
+                c.list_all_tools().await
+            })
+            .await
+            .ok();
+        let hint = match tools.as_deref().map(|ts| (ts, ts.iter().find(|t| t.name == a.tool))) {
+            Some((ts, None)) => {
+                let names: Vec<&str> = ts.iter().map(|t| t.name.as_ref()).collect();
+                let near = similar(&a.tool, &names);
+                format!(
+                    "\n\nThere is no desktop tool named \"{}\" in {}{}; list_desktop_tools lists them.",
+                    a.tool,
+                    a.name,
+                    if near.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (did you mean {}?)", near.join(", "))
+                    }
+                )
+            }
+            Some((_, Some(t))) if is_argument_error(&failure) => format!(
+                "\n\n{} arguments (* = required): {}\nFull schema: list_desktop_tools with tool=\"{}\".",
+                a.tool,
+                arguments(&t.input_schema),
+                a.tool
+            ),
+            _ => String::new(),
+        };
+        self.noted(
+            &a.name,
+            CallToolResult::error(vec![ContentBlock::text(failure + &hint)]),
+        )
     }
 
     #[tool(
@@ -840,6 +914,22 @@ impl Gateway {
         with_progress(ctx, move || op(&inst)).await
     }
 
+    /// Puts a note in front of a desktop call's result when its connection to the VM's driver
+    /// was replaced since the last call, since references from before no longer resolve.
+    fn noted(&self, name: &str, mut r: CallToolResult) -> CallToolResult {
+        if self.reconnected.lock().unwrap().remove(name) {
+            r.content.insert(
+                0,
+                ContentBlock::text(format!(
+                    "Note: agentpc reconnected to the desktop driver in {name}, so driver sessions, \
+                     browser bindings and snapshot ids from earlier calls are gone: take a new \
+                     snapshot, and run browser_prepare again for browser work."
+                )),
+            );
+        }
+        r
+    }
+
     fn drop_session(&self, name: &str) {
         self.sessions.lock().unwrap().remove(name);
     }
@@ -858,6 +948,9 @@ impl Gateway {
         }
         let c = Arc::new(connect(name).await?);
         *slot = Some(c.clone());
+        if !self.connected.lock().unwrap().insert(name.to_string()) {
+            self.reconnected.lock().unwrap().insert(name.to_string());
+        }
         Ok(c)
     }
 
@@ -907,8 +1000,8 @@ async fn connect(name: &str) -> Result<RunningService<RoleClient, ()>> {
         match inst.os {
             // The `serve` daemon runs in the logged-in desktop session; SSH is Session 0,
             // where plain `mcp` refuses to start, so name the daemon's pipe explicitly.
-            // Images built before cua-driver shipped still run Windows-MCP over HTTP.
-            Os::Windows if windows_cua_driver(&inst).await? => {
+            Os::Windows => {
+                windows_cua_driver(&inst).await?;
                 let remote = format!(
                     "& \"{}\" mcp --socket \\\\.\\pipe\\cua-driver",
                     ops::WINDOWS_CUA_DRIVER
@@ -917,13 +1010,6 @@ async fn connect(name: &str) -> Result<RunningService<RoleClient, ()>> {
                     c.args(ops::ssh_args(&inst, &remote));
                 });
                 Ok(().serve(TokioChildProcess::new(cmd)?).await?)
-            }
-            Os::Windows => {
-                let url = format!("http://127.0.0.1:{}/mcp", inst.mcp_port());
-                Ok(
-                    ().serve(StreamableHttpClientTransport::from_uri(url))
-                        .await?,
-                )
             }
             Os::Ubuntu => {
                 let remote = format!("{} ~/.local/bin/cua-driver mcp", ops::UBUNTU_SESSION_ENV);
@@ -941,9 +1027,9 @@ async fn connect(name: &str) -> Result<RunningService<RoleClient, ()>> {
         .with_context(|| format!("cannot reach the desktop server in {name}"))
 }
 
-/// Whether the VM has cua-driver, starting its daemon first if it isn't running (its
-/// logon task doesn't restart it after a crash or kill).
-async fn windows_cua_driver(inst: &Instance) -> Result<bool> {
+/// Makes sure the VM's cua-driver daemon is running, starting it if needed (its logon task
+/// doesn't restart it after a crash or kill).
+async fn windows_cua_driver(inst: &Instance) -> Result<()> {
     let script = format!(
         r#"$c = "{}"
 if (-not (Test-Path $c)) {{ exit 3 }}
@@ -960,8 +1046,8 @@ exit 0"#,
         .await
         .context("run ssh")?;
     match out.status.code() {
-        Some(0) => Ok(true),
-        Some(3) => Ok(false),
+        Some(0) => Ok(()),
+        Some(3) => bail!("{}", ops::old_windows_image(inst)),
         _ => bail!(
             "ssh to {} failed: {}",
             inst.name,
@@ -1168,6 +1254,126 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
     tokio::task::spawn_blocking(f).await?
 }
 
+/// A desktop tool's required argument names, with "…" when it also takes optional ones:
+/// `get_window_state(pid, window_id, …)`.
+fn signature(schema: &JsonObject) -> String {
+    let required = required(schema);
+    let optional = schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .is_some_and(|p| p.keys().any(|k| !required.contains(&k.as_str())));
+    let mut parts: Vec<&str> = required;
+    if optional {
+        parts.push("…");
+    }
+    parts.join(", ")
+}
+
+/// Every argument of a desktop tool, one short entry each: `text* (string); scope
+/// (window|desktop)`. `*` marks required ones. Descriptions are left to the full schema.
+fn arguments(schema: &JsonObject) -> String {
+    let required = required(schema);
+    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return "none".into();
+    };
+    let mut entries: Vec<(bool, String)> = props
+        .iter()
+        .map(|(name, p)| {
+            let kind = match p.get("enum").and_then(|e| e.as_array()) {
+                Some(values) => values
+                    .iter()
+                    .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
+                    .collect::<Vec<_>>()
+                    .join("|"),
+                None => match p.get("type") {
+                    Some(serde_json::Value::String(t)) => t.clone(),
+                    Some(serde_json::Value::Array(ts)) => ts
+                        .iter()
+                        .filter_map(|t| t.as_str())
+                        .filter(|t| *t != "null")
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                    _ => "object".into(),
+                },
+            };
+            let req = required.contains(&name.as_str());
+            (!req, format!("{name}{} ({kind})", if req { "*" } else { "" }))
+        })
+        .collect();
+    // Required first, then the rest in the schema's order.
+    entries.sort_by_key(|(optional, _)| *optional);
+    let entries: Vec<String> = entries.into_iter().map(|(_, e)| e).collect();
+    entries.join("; ")
+}
+
+fn required(schema: &JsonObject) -> Vec<&str> {
+    schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default()
+}
+
+/// Up to three tool names close to a mistyped one: same letters ignoring `_`/case, one
+/// containing the other, or a small edit distance.
+fn similar<'a>(want: &str, names: &[&'a str]) -> Vec<&'a str> {
+    let norm = |s: &str| s.to_lowercase().replace(['_', '-'], "");
+    let w = norm(want);
+    let mut scored: Vec<(usize, &str)> = names
+        .iter()
+        .filter_map(|n| {
+            let m = norm(n);
+            let d = if m == w || m.contains(&w) || w.contains(&m) {
+                0
+            } else {
+                edit_distance(&m, &w)
+            };
+            (d <= 2.max(w.len() / 4)).then_some((d, *n))
+        })
+        .collect();
+    scored.sort();
+    scored.into_iter().take(3).map(|(_, n)| n).collect()
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cur = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != *cb)).min(row[j] + 1).min(cur + 1);
+            prev = cur;
+        }
+    }
+    row[b.len()]
+}
+
+/// Whether a desktop tool failed because of the arguments it was given, as opposed to what
+/// happened on screen.
+fn is_argument_error(msg: &str) -> bool {
+    let msg = msg.to_lowercase();
+    [
+        "missing required",
+        "required parameter",
+        "required property",
+        "invalid param",
+        "invalid argument",
+        "invalid type",
+        "invalid value",
+        "unknown field",
+        "unknown property",
+        "unknown variant",
+        "additional propert",
+        "unknown tool",
+        "tool not found",
+        "no such tool",
+    ]
+    .iter()
+    .any(|p| msg.contains(p))
+}
+
 fn text(r: Result<String>) -> CallToolResult {
     reply(r.map(|s| vec![ContentBlock::text(s)]))
 }
@@ -1195,5 +1401,63 @@ mod tests {
         assert!(c.contains("[... 80 characters omitted ...]"), "{c}");
         // Multi-byte characters are counted, not split.
         assert_eq!(super::clip(&"é".repeat(30), 10).matches('é').count(), 20);
+    }
+
+    fn schema(v: serde_json::Value) -> rmcp::model::JsonObject {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn summarizes_desktop_tool_arguments() {
+        let s = schema(serde_json::json!({
+            "type": "object",
+            "required": ["text"],
+            "properties": {
+                "pid": {"type": "integer"},
+                "text": {"type": "string"},
+                "delivery_mode": {"enum": ["background", "foreground"], "type": "string"},
+                "target": {"anyOf": [{"type": "object"}, {"type": "null"}]},
+                "window_id": {"type": ["integer", "null"]}
+            }
+        }));
+        assert_eq!(super::signature(&s), "text, …");
+        assert_eq!(
+            super::arguments(&s),
+            "text* (string); pid (integer); delivery_mode (background|foreground); \
+             target (object); window_id (integer)"
+        );
+        let none = schema(serde_json::json!({"type": "object", "properties": {}}));
+        assert_eq!(super::signature(&none), "");
+        assert_eq!(
+            super::signature(&schema(serde_json::json!({
+                "required": ["pid", "window_id"],
+                "properties": {"pid": {}, "window_id": {}}
+            }))),
+            "pid, window_id"
+        );
+    }
+
+    #[test]
+    fn spots_argument_errors() {
+        // Messages seen from cua-driver and serde.
+        assert!(super::is_argument_error("Missing required parameter: window_id"));
+        assert!(super::is_argument_error(
+            "invalid type: string \"x\", expected integer"
+        ));
+        assert!(super::is_argument_error("unknown field `foo`, expected one of `pid`"));
+        assert!(!super::is_argument_error(
+            "The latest snapshot for this window does not contain a screenshot owned by this session."
+        ));
+        assert!(!super::is_argument_error("no elements found"));
+        assert!(super::is_argument_error("Missing required string field: text"));
+    }
+
+    #[test]
+    fn suggests_close_tool_names() {
+        let names = ["type_text", "get_window_state", "get_desktop_state", "click", "list_windows"];
+        assert_eq!(super::similar("typetext", &names), ["type_text"]);
+        assert_eq!(super::similar("get_windows_state", &names)[0], "get_window_state");
+        assert_eq!(super::similar("clik", &names), ["click"]);
+        assert!(super::similar("screenshot", &names).is_empty());
     }
 }

@@ -65,7 +65,7 @@
             <a href="#workflow">Typical session</a>
             <a href="#jobs">Long jobs</a>
             <a href="#lifecycle">Session lifecycle</a>
-            <a href="#annotations">Tool annotations</a>
+            <a href="#annotations">Approval prompts</a>
           </div>
         </aside>
 
@@ -258,11 +258,11 @@ tool_timeout_sec = 900</code></pre>
                 </tr>
                 <tr>
                   <td><code translate="no">list_desktop_tools</code></td>
-                  <td>The desktop-control tools inside a VM, or one tool's full schema.</td>
+                  <td>The desktop-control tools inside a VM, with each one's required arguments and whether it's read-only, or one tool's full schema.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">use_desktop_tool</code></td>
-                  <td>Call one of them (<code translate="no">tool</code> plus <code translate="no">arguments</code>): click, type, launch apps, read the UI tree, and more. Gives up after 120 s.</td>
+                  <td>Call one of them (<code translate="no">tool</code> plus <code translate="no">arguments</code>): click, type, launch apps, read the UI tree, and more. Wrong arguments or a wrong name return the tool's arguments or close matches. Gives up after 120 s.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">read_vm_log</code></td>
@@ -306,21 +306,15 @@ tool_timeout_sec = 900</code></pre>
                     <code translate="no">pid</code>/<code translate="no">window_id</code> values. Keyboard and mouse
                     tools need <code translate="no">"delivery_mode": "foreground"</code>.
                     <code translate="no">launch_app</code> takes a command such as
-                    <code translate="no">xfce4-terminal</code>. Google Chrome is installed for the
-                    <code translate="no">browser_*</code> tools.
+                    <code translate="no">xfce4-terminal</code>. Google Chrome is installed: launch it with
+                    <code translate="no">launch_app</code> (<code translate="no">google-chrome</code>, URL in
+                    <code translate="no">additional_arguments</code>) and read the page with
+                    <code translate="no">get_window_state</code>, or drive it with the
+                    <code translate="no">browser_*</code> tools after <code translate="no">browser_prepare</code>.
                   </td>
                 </tr>
               </tbody>
             </table>
-            <div class="callout">
-              <p>
-                Windows images built by agentpc 0.1.0 use Windows-MCP instead: call
-                <code translate="no">Snapshot</code> first, <code translate="no">Click</code> takes
-                <code translate="no">loc: [x, y]</code>, and <code translate="no">Type</code> needs
-                <code translate="no">loc</code> or <code translate="no">label</code>.
-                <code translate="no">list_desktop_tools</code> shows which one a VM has.
-              </p>
-            </div>
             <p>Open Notepad on Windows and type into it, as three <code translate="no">use_desktop_tool</code> calls. The <code translate="no">pid</code> and <code translate="no">window_id</code> come from <code translate="no">launch_app</code>; the <code translate="no">snapshot_id</code> and <code translate="no">element_index</code> from <code translate="no">get_window_state</code>:</p>
             <div class="code-panel">
               <pre><code translate="no">{ "name": "windows-1", "tool": "launch_app", "arguments": { "name": "notepad" } }
@@ -381,9 +375,30 @@ forward_port    { "name": "ubuntu-1", "guest_port": 3000 }  <span class="comment
           </section>
 
           <section class="doc-section" id="annotations">
-            <h2>Tool annotations</h2>
+            <h2>Approval prompts</h2>
             <p>
-              Tools carry MCP annotations so clients can auto-approve or confirm them:
+              Every desktop action goes through <code translate="no">use_desktop_tool</code>, which is
+              marked destructive, so clients that confirm tool calls ask before each click or
+              keystroke. To approve agentpc's tools up front:
+            </p>
+            <table class="data-table">
+              <thead>
+                <tr><th>Client</th><th>Setting</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>Claude Code</td><td>Allow <code translate="no">mcp__agentpc</code> (all of its tools) with <code translate="no">/permissions</code>, or in <code translate="no">permissions.allow</code> in settings.</td></tr>
+                <tr><td>Codex</td><td><code translate="no">default_tools_approval_mode = "approve"</code> under <code translate="no">[mcp_servers.agentpc]</code> in <code translate="no">~/.codex/config.toml</code>.</td></tr>
+                <tr><td>Gemini CLI</td><td><code translate="no">"trust": true</code> on the <code translate="no">agentpc</code> server in <code translate="no">~/.gemini/settings.json</code>.</td></tr>
+                <tr><td>Others</td><td>The client's own tool-approval settings.</td></tr>
+              </tbody>
+            </table>
+            <p>
+              That approves every agentpc tool, including <code translate="no">upload_file</code> and
+              <code translate="no">download_file</code>, which read and write files on your Mac. The VMs
+              themselves are throwaway: <code translate="no">reset_vm</code> undoes anything done inside one.
+            </p>
+            <p>
+              Tools also carry MCP annotations, which some clients use to decide what to confirm:
               <code translate="no">list_vms</code>, <code translate="no">take_screenshot</code>,
               <code translate="no">list_desktop_tools</code>, <code translate="no">get_job_status</code>,
               <code translate="no">list_forwards</code> and <code translate="no">read_vm_log</code> are read-only.

@@ -50,7 +50,9 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
    must be set up again after a restore.
 4. For GUI work, loop: look (`take_screenshot` or a UI-snapshot tool), act (`use_desktop_tool`), then
    look again to verify.
-5. Call `list_desktop_tools` once per VM to learn the exact tool names and arguments.
+5. Call `list_desktop_tools` once per VM to learn the exact tool names and required arguments.
+   A call with wrong arguments returns that tool's argument list. The desktop driver is pinned
+   per image so tools match these docs: don't update it inside a VM (`reset_vm` restores it).
 6. When finished, `delete_vm` VMs you created, unless the user wants to keep them.
 
 ## Windows (desktop tools from cua-driver)
@@ -63,9 +65,10 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 - Input goes to the app in the background. Keys typed into whatever has focus (e.g. after
   `ctrl+l`), scroll, drag and right-click often need `"delivery_mode": "foreground"`; a reply
   that says "not verified" or "retry with foreground" means use it.
-- If `get_window_state` returns no elements, look for another window of the same app (e.g.
-  Notepad's first-run tip, "PopupHost") and dismiss it first. Browser page content appears a
-  few seconds after load; read again if it's missing.
+- If `get_window_state` comes back "degraded" with no elements (modern Notepad does this), act
+  by pixels: pass `x`/`y` read from the screenshot of a `get_window_state` call that included
+  one (the default). Also check for another window of the same app (a pop-up or dialog). Browser
+  page content appears a few seconds after load; read again if it's missing.
 - Modern apps (Notepad, Settings) ignore raw shortcuts like `ctrl+s`: use `invoke_menu` with a
   path such as `["File", "Save as"]`, or click the menu items.
 - Dialogs, menus and pop-ups are separate windows: `list_windows` again to find them.
@@ -75,8 +78,6 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 - The taskbar, Start menu and desktop aren't listed windows: use `click` with
   `"scope": "desktop"` and screen coordinates (`"button": "right"` for the desktop menu).
   `foreground_unavailable` can come back even when the click worked; check with a screenshot.
-- Windows images built by agentpc 0.1.0 use Windows-MCP instead (`list_desktop_tools` shows
-  which): call `Snapshot` first; `Click` takes `loc: [x, y]`; `Type` needs `loc` or `label`.
 - `run_command` runs PowerShell as the `agent` administrator. The screen is 1280x800.
 - Processes started over `run_command` end when the command returns: start servers and GUI apps
   with `background: true`. `forward_port` tunnels over SSH, so it reaches a server on the guest's
@@ -93,10 +94,16 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 - Keyboard and mouse tools need `"delivery_mode": "foreground"`.
 - `launch_app` takes a command name such as `xfce4-terminal`.
 - `run_command` runs bash as `agent`, with passwordless `sudo`. The screen is 1280x800.
-- Google Chrome is installed. Browser tools: `browser_prepare` with `allow_launch: true` and
-  `profile: {"mode": "isolated_new"}`, then `list_windows` for Chrome's `pid`/`window_id`,
-  `get_browser_state` with those to get `target_id`/`tab_id`, then `browser_navigate`,
-  `browser_click`, `browser_type`. Pass the same `session` label on every call.
+- Google Chrome is installed. To read a page: `launch_app` with `name: "google-chrome"` and
+  the URL in `additional_arguments`, then `get_window_state` on its window; the page's text,
+  links and fields are in the tree.
+- To drive a page with the browser tools: `browser_prepare` with `allow_launch: true` and
+  `profile: {"mode": "isolated_new"}`, then `list_windows` with its `prepared_pid` for
+  Chrome's `window_id`, `get_browser_state` with those to get `target_id`/`tab_id`, then
+  `browser_navigate`, `browser_click`, `browser_type`. Pass the same `session` label on every
+  call. A session ends after about 5 minutes without calls, or if the driver connection drops
+  (the reply then says so): run `browser_prepare` again. `launch_app` with `urls` returns no
+  pid; don't use the legacy `page` tool.
 
 ## Guest tips
 
