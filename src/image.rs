@@ -79,7 +79,6 @@ pub fn build(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     build_locked(image, iso)
 }
 
-/// `build`, for a caller already holding the image lock.
 /// Delete this image's half-written temp files (`*.qcow2.tmp`, `*.state.tmp`) left by an
 /// aborted build or snapshot. Best-effort: it runs on the failure path.
 fn remove_image_tmp(image: &Image) {
@@ -126,6 +125,7 @@ impl Drop for BuildGuard {
     }
 }
 
+/// `build`, for a caller already holding the image lock.
 pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     let os = image.os;
     if !image.instances()?.is_empty() {

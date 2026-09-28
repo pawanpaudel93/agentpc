@@ -774,7 +774,10 @@ impl Gateway {
             })
             .await
             .ok();
-        let hint = match tools.as_deref().map(|ts| (ts, ts.iter().find(|t| t.name == a.tool))) {
+        let hint = match tools
+            .as_deref()
+            .map(|ts| (ts, ts.iter().find(|t| t.name == a.tool)))
+        {
             Some((ts, None)) => {
                 let names: Vec<&str> = ts.iter().map(|t| t.name.as_ref()).collect();
                 let near = similar(&a.tool, &names);
@@ -1297,7 +1300,10 @@ fn arguments(schema: &JsonObject) -> String {
                 },
             };
             let req = required.contains(&name.as_str());
-            (!req, format!("{name}{} ({kind})", if req { "*" } else { "" }))
+            (
+                !req,
+                format!("{name}{} ({kind})", if req { "*" } else { "" }),
+            )
         })
         .collect();
     // Required first, then the rest in the schema's order.
@@ -1440,23 +1446,38 @@ mod tests {
     #[test]
     fn spots_argument_errors() {
         // Messages seen from cua-driver and serde.
-        assert!(super::is_argument_error("Missing required parameter: window_id"));
+        assert!(super::is_argument_error(
+            "Missing required parameter: window_id"
+        ));
         assert!(super::is_argument_error(
             "invalid type: string \"x\", expected integer"
         ));
-        assert!(super::is_argument_error("unknown field `foo`, expected one of `pid`"));
+        assert!(super::is_argument_error(
+            "unknown field `foo`, expected one of `pid`"
+        ));
         assert!(!super::is_argument_error(
             "The latest snapshot for this window does not contain a screenshot owned by this session."
         ));
         assert!(!super::is_argument_error("no elements found"));
-        assert!(super::is_argument_error("Missing required string field: text"));
+        assert!(super::is_argument_error(
+            "Missing required string field: text"
+        ));
     }
 
     #[test]
     fn suggests_close_tool_names() {
-        let names = ["type_text", "get_window_state", "get_desktop_state", "click", "list_windows"];
+        let names = [
+            "type_text",
+            "get_window_state",
+            "get_desktop_state",
+            "click",
+            "list_windows",
+        ];
         assert_eq!(super::similar("typetext", &names), ["type_text"]);
-        assert_eq!(super::similar("get_windows_state", &names)[0], "get_window_state");
+        assert_eq!(
+            super::similar("get_windows_state", &names)[0],
+            "get_window_state"
+        );
         assert_eq!(super::similar("clik", &names), ["click"]);
         assert!(super::similar("screenshot", &names).is_empty());
     }

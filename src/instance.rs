@@ -738,7 +738,6 @@ pub fn host_mem_bytes() -> Option<u64> {
 pub fn mac_timezone() -> Option<String> {
     let target = std::fs::read_link("/etc/localtime").ok()?;
     let s = target.to_string_lossy();
-    // .../zoneinfo/Asia/Kathmandu -> Asia/Kathmandu
     s.split_once("zoneinfo/").map(|(_, tz)| tz.to_string())
 }
 

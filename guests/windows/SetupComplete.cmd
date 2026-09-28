@@ -42,7 +42,6 @@ reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Edge" /v "HideFirstRunExperience" 
 rem Disable hibernation in the registry.
 reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\Power" /v "HibernateFileSizePercent" /t REG_DWORD /d 0 /f
 
-rem Disable hibernation.
 reg.exe add "HKLM\SYSTEM\CurrentControlSet\Control\Power" /v "HibernateEnabled" /t REG_DWORD /d 0 /f
 
 rem Disable sleep.
@@ -99,7 +98,6 @@ reg.exe add "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /
 rem Disable unsupported hardware notifications.
 reg.exe add "HKCU\Control Panel\UnsupportedHardwareNotificationCache" /v SV1 /d 0 /t REG_DWORD /f
 
-rem Disable unsupported hardware notifications.
 reg.exe add "HKCU\Control Panel\UnsupportedHardwareNotificationCache" /v SV2 /d 0 /t REG_DWORD /f
 
 
