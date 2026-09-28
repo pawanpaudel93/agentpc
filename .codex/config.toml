@@ -2,6 +2,7 @@
 [mcp_servers.agentpc]
 command = "agentpc"
 args = ["mcp"]
-# create_vm windows takes ~30 s.
-startup_timeout_sec = 120
-tool_timeout_sec = 600
+# Same timeouts `agentpc mcp-install` writes: a first create_vm can take minutes while its
+# image downloads or its snapshot is captured.
+startup_timeout_sec = 60
+tool_timeout_sec = 900
