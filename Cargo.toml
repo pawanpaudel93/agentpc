@@ -1,6 +1,6 @@
 [package]
 name = "agentpc"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.88"
 description = "Instant, resettable Windows and Ubuntu desktop VMs for AI agents on Apple Silicon Macs (CLI + MCP server)"
