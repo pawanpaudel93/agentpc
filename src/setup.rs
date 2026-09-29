@@ -439,8 +439,8 @@ pub fn clean(dry_run: bool) -> Result<String> {
         .flatten()
     {
         let name = e.file_name().to_string_lossy().into_owned();
-        // The viewer's noVNC copy is tiny and needed offline.
-        if name == "novnc" {
+        // The viewer's noVNC copy is tiny and needed offline; dotfiles are download locks.
+        if name == "novnc" || name.starts_with('.') {
             continue;
         }
         let why = if name.ends_with(".iso") || name.ends_with(".img") {
@@ -452,9 +452,8 @@ pub fn clean(dry_run: bool) -> Result<String> {
         };
         targets.push((e.path(), why));
     }
-    // Hidden `_`-prefixed VMs are build/snapshot scratch. A held image lock means a build is
-    // live right now, so leave them alone; otherwise any that remain are crash leftovers.
-    let build_active = crate::instance::try_image_lock().is_none();
+    // Hidden `_`-prefixed VMs are build/snapshot scratch. A held lock on their image means
+    // that build is live right now, so leave them alone; otherwise they are crash leftovers.
     for e in std::fs::read_dir(instances_dir())
         .into_iter()
         .flatten()
@@ -463,7 +462,10 @@ pub fn clean(dry_run: bool) -> Result<String> {
         let name = e.file_name().to_string_lossy().into_owned();
         let inst = Instance::load(&name).ok();
         if name.starts_with('_') {
-            if build_active {
+            let live = inst
+                .as_ref()
+                .is_some_and(|i| crate::instance::try_image_lock(&i.image).is_none());
+            if live {
                 continue;
             }
             if let Some(i) = inst.as_ref().filter(|i| i.running()) {

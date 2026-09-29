@@ -1,4 +1,4 @@
-//! Images: install an OS once into a build VM (`_build-<image>`, slot 0), freeze its disk
+//! Images: install an OS once into a build VM (`_build-<image>`, in a free slot), freeze its disk
 //! as a read-only image that `create` clones, and capture its RAM snapshot.
 
 use std::path::{Path, PathBuf};
@@ -75,7 +75,7 @@ const WIN_OEM: [(&str, &[u8]); 2] = [
 ];
 
 pub fn build(image: &Image, iso: Option<PathBuf>) -> Result<()> {
-    let _lock = crate::instance::image_lock()?;
+    let _lock = crate::instance::image_lock(image)?;
     build_locked(image, iso)
 }
 
@@ -157,7 +157,7 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
         }
         Os::Ubuntu => None,
     };
-    let guard = BuildGuard::new(Instance::create(&name, image, 0)?);
+    let guard = BuildGuard::new(Instance::create_scratch(&name, image)?);
     match &iso_path {
         Some(iso) => build_windows(&guard.inst, iso)?,
         None => build_ubuntu(&guard.inst)?,
@@ -181,7 +181,7 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
 /// settle, then save RAM and flatten the disk as it was at that instant. Clones of it
 /// resume in seconds instead of booting.
 pub fn snapshot(image: &Image) -> Result<()> {
-    let _lock = crate::instance::image_lock()?;
+    let _lock = crate::instance::image_lock(image)?;
     snapshot_locked(image)
 }
 
@@ -204,7 +204,7 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
         }
         std::fs::remove_dir_all(instances_dir().join(&name))?;
     }
-    let guard = BuildGuard::new(Instance::create(&name, image, 0)?);
+    let guard = BuildGuard::new(Instance::create_scratch(&name, image)?);
     let inst = &guard.inst;
     run(
         "qemu-img",
@@ -868,7 +868,14 @@ fn virtio_drivers() -> Result<PathBuf> {
     if dir.is_dir() {
         return Ok(dir);
     }
-    std::fs::create_dir_all(cache_dir())?;
+    // Every Windows image shares them, and builds of different images run in parallel.
+    let _lock = crate::instance::lock(
+        &cache_dir().join(".virtio.lock"),
+        Some("waiting for another build's virtio driver download"),
+    )?;
+    if dir.is_dir() {
+        return Ok(dir);
+    }
     let archive = dir.with_extension("tar.xz");
     log!("downloading the virtio drivers for Windows");
     run(

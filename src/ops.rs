@@ -455,7 +455,7 @@ pub fn create(
 fn provision_image(image: &Image) -> Result<()> {
     match image.os {
         Os::Ubuntu => {
-            let _lock = crate::instance::image_lock()?;
+            let _lock = crate::instance::image_lock(image)?;
             // Another create may have fetched it while this one waited for the lock.
             if image.exists() {
                 return Ok(());

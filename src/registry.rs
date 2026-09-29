@@ -140,7 +140,7 @@ pub fn push(image: &Image) -> Result<()> {
 
 /// Download an image, then capture its RAM snapshot locally.
 pub fn pull(image: &Image) -> Result<()> {
-    let _lock = crate::instance::image_lock()?;
+    let _lock = crate::instance::image_lock(image)?;
     pull_locked(image)
 }
 

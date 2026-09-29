@@ -280,6 +280,13 @@ impl Instance {
         })
     }
 
+    /// A hidden build or snapshot VM (`_build-*`, `_snap-*`) of `image`, in a free slot so
+    /// builds of different images can run side by side.
+    pub fn create_scratch(name: &str, image: &Image) -> Result<Self> {
+        let _lock = creation_lock()?;
+        Self::create(name, image, Self::free_slot()?)
+    }
+
     /// User-visible instances; `_build-*` build VMs are excluded.
     pub fn list() -> Result<Vec<Self>> {
         let mut out = Vec::new();
@@ -334,8 +341,15 @@ impl Instance {
         Ok(())
     }
 
+    /// A slot no VM uses, build and snapshot VMs included. Call it under `creation_lock`.
     pub fn free_slot() -> Result<u16> {
-        let used: Vec<u16> = Self::list()?.iter().map(|i| i.slot).collect();
+        let used: Vec<u16> = std::fs::read_dir(instances_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| Self::load(&e.file_name().to_string_lossy()).ok())
+            .map(|i| i.slot)
+            .collect();
         (1..=50)
             .filter(|s| !used.contains(s))
             // Skip a slot whose host ports something else is already bound to.
@@ -479,29 +493,36 @@ pub fn creation_lock() -> Result<std::fs::File> {
     lock(&instances_dir().join(".lock"), None)
 }
 
-/// Held while an image is built, downloaded or snapshotted: they all run in slot 0 and
-/// write the image's files. A second one waits. Not reentrant: take it once per command.
-pub fn image_lock() -> Result<std::fs::File> {
+/// Held while one image is built, downloaded or snapshotted, since those write its files.
+/// A second one of the same image waits; other images proceed in parallel. Not reentrant:
+/// take it once per command.
+pub fn image_lock(image: &Image) -> Result<std::fs::File> {
     lock(
-        &images_dir().join(".lock"),
-        Some("waiting for another image build or download to finish"),
+        &image_lock_path(image),
+        Some(&format!(
+            "waiting for another build or download of {image} to finish"
+        )),
     )
 }
 
-/// The image lock if it's free right now, else None (a build, pull or snapshot holds it).
+fn image_lock_path(image: &Image) -> PathBuf {
+    images_dir().join(format!(".{image}.lock"))
+}
+
+/// `image`'s lock if it's free right now, else None (a build, pull or snapshot holds it).
 /// Never blocks. Used by `clean` to tell a crashed build's leftovers from a live build.
-pub fn try_image_lock() -> Option<std::fs::File> {
+pub fn try_image_lock(image: &Image) -> Option<std::fs::File> {
     use std::os::fd::AsRawFd;
     const LOCK_EX: i32 = 2;
     const LOCK_NB: i32 = 4;
-    let path = images_dir().join(".lock");
+    let path = image_lock_path(image);
     std::fs::create_dir_all(images_dir()).ok()?;
     let f = std::fs::File::create(&path).ok()?;
     // SAFETY: flock(2) on a descriptor we own.
     (unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0).then_some(f)
 }
 
-fn lock(path: &Path, waiting: Option<&str>) -> Result<std::fs::File> {
+pub(crate) fn lock(path: &Path, waiting: Option<&str>) -> Result<std::fs::File> {
     use std::os::fd::AsRawFd;
     const LOCK_EX: i32 = 2;
     const LOCK_NB: i32 = 4;
