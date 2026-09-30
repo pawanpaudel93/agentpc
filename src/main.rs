@@ -44,7 +44,7 @@ enum Cmd {
     Create {
         /// ubuntu, windows, arch, or a version: ubuntu-22.04, ubuntu-x86apps, arch-x86apps, windows-11-23h2 (see image build --help)
         image: String,
-        /// VM name (default: <os>-<n>)
+        /// VM name: up to 64 letters, digits, . - _ (default: <os>-<n>)
         name: Option<String>,
         /// Memory in GB (default 8 Windows, 4 Ubuntu and Arch); a non-default size cold-boots
         #[arg(long)]
@@ -170,6 +170,11 @@ enum Cmd {
         clients: Vec<String>,
     },
     /// Free disk space: downloaded ISOs and cloud images, and leftovers of interrupted work
+    ///
+    /// Removes downloads fetched again when needed (Windows ISOs, cloud images, virtio drivers,
+    /// the Arch Linux ARM tarball), leftovers of interrupted builds, pulls, pushes and
+    /// checkpoints, and other agentpc versions' TSO libraries. Never touches images or VMs, and
+    /// keeps what a running build, pull or push is using; lists images no VM uses.
     Clean {
         /// Only show what would be deleted
         #[arg(short = 'n', long)]
@@ -191,7 +196,7 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
-    /// Check prerequisites
+    /// Check prerequisites: Apple Silicon, macOS and QEMU versions, free disk, images
     Doctor,
     /// Print a shell completion script: agentpc completions zsh > ~/.zfunc/_agentpc
     Completions {
@@ -215,9 +220,9 @@ Images are <os>-<version>; a bare os means the default version.
   windows-11-23h2             Windows 11 23H2 Home/Pro (archive mirror)
   arch-rolling                Arch Linux ARM (default: arch), installed from an Ubuntu helper VM
   arch-rolling-x86apps        Arch that also runs x86_64/i386 Linux programs, through FEX (arch-x86apps)
-Dated Arch builds (arch-rolling-YYYYMMDD, arch-rolling-x86apps-YYYYMMDD) can only be pulled.
+Dated builds (ubuntu-24.04-YYYYMMDD, arch-rolling-x86apps-YYYYMMDD, ...) can only be pulled.
 Build and rm refuse while a running build uses the image (an Arch build runs in a clone of
-the Ubuntu image).
+the Ubuntu image); rm also while a pull or snapshot of it runs.
 ISOs are checksum-verified. --iso installs your own: it must match a release name above,
 or use any other name (windows-custom).")]
     Build {
@@ -229,10 +234,10 @@ or use any other name (windows-custom).")]
         iso: Option<PathBuf>,
     },
     /// Download a published image, e.g. ubuntu-22.04, ubuntu-x86apps, arch or arch-x86apps
-    /// (Windows can't be redistributed)
+    /// (Windows can't be redistributed); pulling again after a failure resumes it
     Pull {
         /// Image, e.g. ubuntu, ubuntu-22.04, ubuntu-x86apps, arch, arch-x86apps, or a pinned
-        /// build such as arch-rolling-YYYYMMDD
+        /// build such as ubuntu-24.04-YYYYMMDD or arch-rolling-YYYYMMDD
         image: String,
     },
     /// Publish a local image to the registry (maintainers; needs `oras login`)
@@ -248,7 +253,7 @@ or use any other name (windows-custom).")]
         /// Image, e.g. ubuntu-24.04 or windows
         image: String,
     },
-    /// Delete local images (refused while VMs or a running build use one)
+    /// Delete local images (refused while VMs, or a build, pull or snapshot, use one)
     #[command(visible_alias = "delete")]
     Rm {
         /// Images, e.g. windows-11-24h2

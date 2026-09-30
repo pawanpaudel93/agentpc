@@ -169,7 +169,7 @@ pick the server up automatically.
 | Tool | Description |
 | --- | --- |
 | `list_vms` | VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, `x86_tso`) and the available images with their OS versions |
-| `create_vm` | Create a VM (optionally of a given version, size, or offline) and wait until its desktop is ready. Retrying it with the same `name` in the same session returns the VM already created |
+| `create_vm` | Create a VM (optionally of a given version, size, or offline) and wait until its desktop is ready. Retrying it with the same `name` and image in the same session returns the VM already created, booting it if it was stopped |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down cleanly |
 | `reset_vm` | Discard all changes: back to a fresh copy of the image |
 | `checkpoint_vm` / `restore_vm` | Save a VM's disk and memory under a label; go back to it in seconds |
@@ -188,8 +188,8 @@ pick the server up automatically.
 If a desktop-tool reply starts with a reconnect note (the VM or its driver restarted), earlier
 snapshot ids and browser sessions are gone: take a new snapshot and run `browser_prepare` again.
 
-VMs an MCP session created or started are stopped (never deleted) when the session ends, unless
-`AGENTPC_KEEP_RUNNING=1`.
+VMs an MCP session created, started, reset or restored are stopped (never deleted) when the
+session ends, unless `AGENTPC_KEEP_RUNNING=1`.
 
 ### Approval prompts
 
@@ -224,7 +224,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 
 | Command | Description |
 | --- | --- |
-| `agentpc create <image> [name] [--memory GB] [--cpus N] [--offline]` | Create a VM from `ubuntu`, `windows`, `arch` or a version such as `ubuntu-22.04`; fetches Ubuntu and Arch images if missing. `--memory` is 2–64 GB, `--cpus` 1–16; a non-default size boots cold instead of resuming. `--offline`: no internet or access to this Mac |
+| `agentpc create <image> [name] [--memory GB] [--cpus N] [--offline]` | Create a VM from `ubuntu`, `windows`, `arch` or a version such as `ubuntu-22.04`; fetches Ubuntu and Arch images if missing. A name is up to 64 letters, digits, `.` `-` `_`. `--memory` is 2–64 GB, `--cpus` 1–16; a non-default size boots cold instead of resuming. `--offline`: no internet or access to this Mac |
 | `agentpc list [--json]` (`ls`) | VMs and images; `--json` gives the same data as the MCP `list_vms` tool |
 | `agentpc info <name>` | Viewer URL (with the VNC password), SSH and VNC details, checkpoints, and on x86apps VMs how x86 programs run (`x86 programs: FEX, hardware\|emulated TSO`) |
 | `agentpc start <name>… \| --all` | Boot stopped VMs |
@@ -242,11 +242,11 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 
 | Command | Description |
 | --- | --- |
-| `agentpc image pull <image>` | Download a published image, e.g. `ubuntu`, `ubuntu-22.04`, `ubuntu-x86apps`, `arch`, `arch-x86apps` or a pinned `arch-rolling-YYYYMMDD` |
+| `agentpc image pull <image>` | Download a published image, e.g. `ubuntu`, `ubuntu-22.04`, `ubuntu-x86apps`, `arch`, `arch-x86apps` or a pinned `ubuntu-24.04-YYYYMMDD` / `arch-rolling-YYYYMMDD`. Pulling again after a failure resumes, reusing the parts already verified |
 | `agentpc image build <image> [--iso <path>]` | Build an image locally (Ubuntu ~3 min, Arch ~6 min, `ubuntu-x86apps` ~8 min, `arch-x86apps` ~10 min, Windows ~12 min + ISO download) |
 | `agentpc image ls` (`list`) | List local images with their OS versions |
 | `agentpc image info <image>` | Version, source, build date and desktop server of an image |
-| `agentpc image rm <image>…` (`delete`) | Delete local images (refused while VMs or a running build use one) |
+| `agentpc image rm <image>…` (`delete`) | Delete local images (refused while VMs, or a build, pull or snapshot, use one) |
 | `agentpc image snapshot <image>` | Recapture the snapshot VMs resume from (build and pull do this) |
 | `agentpc image push <image>` | Maintainers: publish an Ubuntu or Arch image to ghcr.io |
 
@@ -257,9 +257,9 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 | `agentpc mcp` | Run the MCP server on stdio (what agents launch) |
 | `agentpc mcp-install [clients…]` | Register the MCP server with agents (skips Claude Code when the plugin is installed; raises Codex's MCP timeouts so slow builds and boots don't trip it) |
 | `agentpc mcp-uninstall [clients…]` | Remove it from agents again |
-| `agentpc update [--check]` | Update to the latest release (checksum-verified; images and VMs are kept). Alias: `upgrade` |
-| `agentpc doctor` | Check prerequisites |
-| `agentpc clean [-n]` | Free disk space: downloaded ISOs and cloud images, and leftovers of interrupted builds or checkpoints. Never touches images or VMs; lists images no VM uses |
+| `agentpc update [--check]` | Update to the latest release (checksum-verified; images and VMs are kept). Alias: `upgrade`. If the binary's directory isn't writable, it suggests `sudo agentpc update` or reinstalling with `AGENTPC_INSTALL_DIR` |
+| `agentpc doctor` | Check prerequisites, with the macOS and QEMU versions (warns below macOS 15, where x86apps VMs get emulated TSO, and below QEMU 9.0) |
+| `agentpc clean [-n]` | Free disk space: downloads fetched again when needed (ISOs, cloud images, the ~830 MB Arch Linux ARM tarball), leftovers of interrupted builds, pulls or checkpoints, and other versions' TSO libraries. Never touches images or VMs, and keeps what a running build, pull or push uses ("kept …"); lists images no VM uses |
 | `agentpc uninstall [--keep-data] [-y]` | Remove agentpc (see [Uninstalling](#uninstalling)) |
 | `agentpc completions <shell>` | Print tab completion for bash, zsh or fish, e.g. `agentpc completions zsh > ~/.zfunc/_agentpc` |
 
@@ -333,13 +333,17 @@ name. Windows images can't be redistributed:
 | --- | --- | --- |
 | `ubuntu-24.04` | Newest build of Ubuntu 24.04 (also tagged `ubuntu`) | `agentpc image pull ubuntu` |
 | `ubuntu-<release>` | Newest build of another release | `agentpc image pull ubuntu-22.04` |
-| `ubuntu-24.04-YYYYMMDD` | One specific build (pinned) | `agentpc image pull ubuntu-24.04-YYYYMMDD` |
+| `ubuntu-24.04-YYYYMMDD` | One specific build (pinned; can't be built locally) | `agentpc image pull ubuntu-24.04-YYYYMMDD` |
 | `ubuntu-24.04-x86apps` | Newest build of Ubuntu 24.04 with x86 programs | `agentpc image pull ubuntu-x86apps` |
-| `ubuntu-24.04-x86apps-YYYYMMDD` | One specific build (pinned) | `agentpc image pull ubuntu-24.04-x86apps-YYYYMMDD` |
+| `ubuntu-24.04-x86apps-YYYYMMDD` | One specific build (pinned; can't be built locally) | `agentpc image pull ubuntu-24.04-x86apps-YYYYMMDD` |
 | `arch-rolling` | Newest build of Arch Linux ARM (also tagged `arch`) | `agentpc image pull arch` |
 | `arch-rolling-YYYYMMDD` | One specific build (pinned; can't be built locally) | `agentpc image pull arch-rolling-YYYYMMDD` |
 | `arch-rolling-x86apps` | Newest build of Arch Linux ARM with x86 programs | `agentpc image pull arch-x86apps` |
 | `arch-rolling-x86apps-YYYYMMDD` | One specific build (pinned; can't be built locally) | `agentpc image pull arch-rolling-x86apps-YYYYMMDD` |
+
+A pinned build is download-only: `image build` refuses it, and a `create` whose download fails
+doesn't fall back to building today's instead. Short names work too (`ubuntu-x86apps-YYYYMMDD`
+is `ubuntu-24.04-x86apps-YYYYMMDD`).
 
 ## Configuration
 
@@ -385,18 +389,26 @@ The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
   desktop tool call gives up after 120 s, and a viewer that won't start no longer fails a VM
   start. The browser viewer (noVNC) is downloaded against a pinned checksum.
 - **Image distribution.** Ubuntu and Arch images are OCI artifacts on GitHub Container Registry: a
-  compressed qcow2 split into 64 MB parts, downloaded in parallel and checksum-verified.
+  compressed qcow2 split into 64 MB parts, downloaded in parallel and checksum-verified. A pull
+  checks free disk space first; an interrupted one keeps its verified parts, and pulling again
+  resumes from them.
+- **Pinned downloads.** What an image build fetches is pinned and verified: FEX by tag and
+  commit, the Ubuntu and Arch x86 root filesystems and cua-driver's installers and binaries by
+  SHA-256, the Arch Linux ARM tarball by its signature, and Chrome from Google's signed apt
+  repository. Builds and snapshots check that the guest runs the pinned cua-driver.
 - **Windows build.** agentpc writes a small setup disk next to the ISO: an unattended-install
   answer file (adapted from [dockur/windows-arm](https://github.com/dockur/windows-arm)), Red
   Hat's ARM64 virtio drivers, and a first-logon script that installs OpenSSH and cua-driver (telemetry off).
-  Windows Setup then runs in QEMU with no clicks.
+  Windows Setup then runs in QEMU with no clicks; if that script fails, the build stops at once
+  (see `C:\OEM\failed.txt` and `C:\OEM\setup.log` in the guest) instead of timing out.
 - **Ubuntu build.** The official cloud image is provisioned with cloud-init: XFCE on X11,
   auto-login, and cua-driver (pinned, so tool names match these docs; telemetry off). cloud-init is then disabled so clones don't re-provision. To opt in to cua-driver's telemetry, run `cua-driver telemetry enable` in the VM.
 - **Arch build.** A clone of the Ubuntu image gets a blank second disk, and a script installs
   the Arch Linux ARM tarball onto it: systemd-boot, XFCE on X11 with auto-login, Chromium and
-  the same pinned cua-driver. That disk becomes the image.
+  the same pinned cua-driver. That disk becomes the image. The verified tarball is kept in
+  `~/.agentpc/cache/alarm` for the next build (`agentpc clean` removes it).
 - **x86apps build.** On `ubuntu-x86apps` and `arch-x86apps`, `guests/<os>/x86apps.sh` builds
-  [FEX](https://fex-emu.com) (version pinned there) from source as a static-pie with
+  [FEX](https://fex-emu.com) (tag and commit pinned there) from source as a static-pie with
   `guests/ubuntu/fex.patch` (so x86 containers work) and installs an x86 root filesystem: Ubuntu's
   as a squashfs, Arch Linux's unpacked so `fex-pacman` can add packages to it.
   QEMU for these VMs loads `src/hvf_tso.c`, which turns on the CPU's TSO mode; agentpc checks
@@ -417,7 +429,12 @@ The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
 - **A VM is in a bad state:** `agentpc reset <name>`.
 - **`image build`/`pull`/`rm` refuses:** VMs still depend on that image; `agentpc rm` them
   first. Build and rm also refuse while a running build uses the image (an Arch build runs in
-  a clone of the Ubuntu image); try again when it finishes.
+  a clone of the Ubuntu image), and rm while a pull or snapshot of it runs; try again when it
+  finishes. A pinned `…-YYYYMMDD` image can only be pulled.
+- **An image build or snapshot says the guest runs another cua-driver:** the image was built
+  by a different agentpc version; rebuild it with `agentpc image build <image>`.
+- **`agentpc update` can't write to its directory** (e.g. a root-owned `/usr/local/bin`): run
+  `sudo agentpc update`, or reinstall there with `AGENTPC_INSTALL_DIR=<dir>`.
 
 ### Networking
 

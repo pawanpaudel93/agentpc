@@ -88,8 +88,8 @@ The desktop driver is pinned per image so tools match these docs; don't update i
 Rules:
 - Ownership: create your OWN uniquely named VM and work in it. Never reset/delete/restore a VM you
   did not create (list_vms shows each VM's owner) unless the user asks. Delete the VMs you created
-  when you're done, unless the user wants them kept. VMs you started may be stopped automatically
-  when this session ends.
+  when you're done, unless the user wants them kept. VMs you created, started, reset or restored
+  may be stopped automatically when this session ends.
 - Long jobs and servers: use run_command with background: true (it keeps running after the call
   and returns a job id); poll it with get_job_status. Foreground run_command times out (default 120 s).
 - Reach a server in the VM from the Mac with forward_port (works even for servers bound to the
@@ -227,10 +227,11 @@ struct CreateArgs {
     os: OsArg,
     /// Default: ubuntu 24.04, windows 11, arch rolling. Ubuntu: any release, e.g. "22.04", "26.04";
     /// "x86apps" (or "<release>-x86apps", e.g. "22.04-x86apps") is Ubuntu that also runs
-    /// x86_64 and i386 Linux programs. Windows: "11-25h2", "11-24h2" or "11-23h2". Omitted,
-    /// Windows uses 25H2, or the newest installed Windows 11 image if 25H2 isn't built. Arch:
-    /// the default, "rolling"; "x86apps" (Arch that also runs x86 Linux programs); or a pinned
-    /// download, "rolling-YYYYMMDD" / "rolling-x86apps-YYYYMMDD".
+    /// x86_64 and i386 Linux programs; "24.04-YYYYMMDD" pins a published build (download-only).
+    /// Windows: "11-25h2", "11-24h2" or "11-23h2". Omitted, Windows uses 25H2, or the newest
+    /// installed Windows 11 image if 25H2 isn't built. Arch: the default, "rolling"; "x86apps"
+    /// (Arch that also runs x86 Linux programs); or a pinned download, "rolling-YYYYMMDD" /
+    /// "rolling-x86apps-YYYYMMDD".
     version: Option<String>,
     /// VM name: up to 64 letters, digits, ".", "-" or "_" (default "<os>-<n>"). With a name,
     /// retrying a create that timed out returns the same VM instead of making another.

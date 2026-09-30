@@ -12,7 +12,7 @@ can run `agentpc mcp-install` (or install first: see README.md).
 | Tool | Use |
 | --- | --- |
 | `list_vms` | VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, `x86_tso`) and the images (with OS version) they come from. Start here. |
-| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New clone: ubuntu/arch ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready; retrying with the same `name` in the same session returns the VM it already made. `memory_gb` 2–64, `cpus` 1–16. `offline` cuts off the internet. |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New clone: ubuntu/arch ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready; `name` is up to 64 letters, digits, `.` `-` `_`. Retrying with the same `name` and image in the same session returns the VM it already made (booting it if stopped). `memory_gb` 2–64, `cpus` 1–16. `offline` cuts off the internet. |
 | `start_vm` / `stop_vm` / `reset_vm` / `delete_vm` | Lifecycle. `reset_vm` = back to a clean install. |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save disk + memory before a risky step; restore in seconds; or drop one checkpoint. |
 | `take_screenshot(name, save_to?)` | Hypervisor screenshot; works even while booting or hung. `save_to` also writes the PNG to a Mac path. |
@@ -95,14 +95,15 @@ Rules:
   if the download fails). `create_vm arch` (`arch-rolling`; `version` may be `x86apps`, or pin
   a published build, `rolling-YYYYMMDD` / `rolling-x86apps-YYYYMMDD`) downloads the Arch image
   on first use, or builds it locally (~6 min; ~10 min for x86apps) if the download fails.
+  A dated version (`24.04-YYYYMMDD`, `rolling-YYYYMMDD`, …) is download-only, never built.
   A Windows image must be built by the user once:
   `agentpc image build windows` (downloads the ISO; ~12 min), or another version
   (`windows-11-24h2`, `windows-11-23h2`; `agentpc image build --help` lists them).
   If `list_vms` shows no windows image, ask the user to run that. Don't start a build
   yourself unless asked.
 - The login for every guest is `agent` / `agent`. Everything binds to 127.0.0.1.
-- VMs you create or start over MCP are stopped (never deleted) when the session ends, unless
-  `AGENTPC_KEEP_RUNNING=1`.
+- VMs you create, start, reset or restore over MCP are stopped (never deleted) when the
+  session ends, unless `AGENTPC_KEEP_RUNNING=1`.
 
 ## Working on this repo
 
@@ -121,14 +122,18 @@ Rules:
   `guests/<os>/prepare.*` runs in the guest every time a snapshot is captured (agent defaults:
   no pop-ups or updates, Chrome on Ubuntu, Chromium flags on Arch), so it also upgrades
   existing and pulled images.
-  On `ubuntu-<release>-x86apps` images, `guests/ubuntu/x86apps.sh` runs first: FEX (version
-  pinned there) built static-pie from source with `guests/ubuntu/fex.patch` (so x86 containers
-  work; bumping the pin may need the patch rebased), its x86 root filesystem,
+  On `ubuntu-<release>-x86apps` images, `guests/ubuntu/x86apps.sh` runs first: FEX (tag and
+  commit pinned there) built static-pie from source with `guests/ubuntu/fex.patch` (so x86
+  containers work; bumping the pin may need the patch rebased), its x86 root filesystem,
   amd64 apt sources, and `agentpc-fex-tso`. On `arch-rolling-x86apps`, `guests/arch/x86apps.sh`
   does the same with the same patch and an unpacked x86 Arch Linux root filesystem (no multiarch;
   `fex-pacman` installs x86 packages into it in a chroot). QEMU for those VMs loads `src/hvf_tso.c` (built by
   `build.rs`) to turn on the CPU's TSO mode; after each boot `ops` tells FEX which mode it got.
   Changes take effect on the next `agentpc image build`, which refuses while VMs of that image exist.
+  What guests download is pinned: FEX by tag and commit, the x86 root filesystems and
+  cua-driver's installers and binaries by sha256. Bumping cua-driver means `CUA_DRIVER_VERSION`
+  in `image.rs` plus the version and sha256s in each guest's setup (a unit test checks the
+  versions); builds and snapshots refuse a guest running another version.
 - Images are `<os>-<version>` (`Image` in `instance.rs`); a bare OS means its default version.
 - State (images, keys, instances) lives in `~/.agentpc` (`AGENTPC_HOME` overrides).
 - `plugin/` is the Claude plugin (MCP server + `skills/agentpc/SKILL.md`), listed by

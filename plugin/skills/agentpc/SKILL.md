@@ -24,7 +24,7 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 | Tool | Use |
 | --- | --- |
 | `list_vms` | VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, `x86_tso`) and the available images with OS versions. Start here. |
-| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New VM (`ubuntu`, `windows` or `arch`, optionally a version such as `22.04`, `x86apps` or `22.04-x86apps`); returns when the desktop is ready. `offline: true` cuts it off from the internet and this Mac |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New VM (`ubuntu`, `windows` or `arch`, optionally a version such as `22.04`, `x86apps` or `22.04-x86apps`); returns when the desktop is ready. `name`: up to 64 letters, digits, `.` `-` `_`; retrying with the same `name` and image returns the VM already made (booting it if stopped). `offline: true` cuts it off from the internet and this Mac |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down |
 | `reset_vm(name)` | Discard all changes: back to a clean install |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save the VM's disk and memory; go back to that state in seconds; or drop one checkpoint |
@@ -159,7 +159,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   and `download_file` it.
 - Don't create VMs you won't use. Each running VM uses 4 GB (Ubuntu, Arch) or 8 GB (Windows) of RAM.
 - The first `create_vm ubuntu` downloads the Ubuntu image (~1.2 GB). Another Ubuntu release
-  (`version: "22.04"`, `"26.04"`, ...) is fetched or built the same way (~3 min).
+  (`version: "22.04"`, `"26.04"`, ...) is fetched or built the same way (~3 min). A dated
+  version (`"24.04-YYYYMMDD"`) pins one published build: download-only, never built.
 - `create_vm arch` (rolling release; no version needed, `x86apps`, or `rolling-YYYYMMDD` /
   `rolling-x86apps-YYYYMMDD` to pin a published build)
   downloads the Arch image on first use, or builds it locally (~6 min) if the download fails.
@@ -182,5 +183,5 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   Windows release matters; without it you get 25H2, or the newest Windows 11 image installed.
 - Don't put real credentials or secrets into a VM. The guest login is `agent` / `agent`, and
   the VMs are reachable from anything on the Mac.
-- VMs you create or start are stopped (never deleted) when the session ends, unless
-  `AGENTPC_KEEP_RUNNING=1`.
+- VMs you create, start, reset or restore are stopped (never deleted) when the session ends,
+  unless `AGENTPC_KEEP_RUNNING=1`.

@@ -111,7 +111,8 @@
                     <code translate="no">--cpus</code> 1–16 (default 4); a non-default size boots cold instead of
                     resuming. <code translate="no">--offline</code>: no internet and no access to this Mac (SSH,
                     the viewer and forwarded ports still work). The default name is
-                    <code translate="no">&lt;os&gt;-&lt;n&gt;</code>.
+                    <code translate="no">&lt;os&gt;-&lt;n&gt;</code>; a name is up to 64 letters, digits,
+                    <code translate="no">.</code> <code translate="no">-</code> <code translate="no">_</code>.
                   </td>
                 </tr>
                 <tr>
@@ -213,7 +214,7 @@
               <tbody>
                 <tr>
                   <td><code translate="no">agentpc image pull &lt;image&gt;</code></td>
-                  <td>Download a published image, e.g. <code translate="no">ubuntu</code>, <code translate="no">ubuntu-22.04</code>, <code translate="no">ubuntu-x86apps</code>, <code translate="no">arch</code> or <code translate="no">arch-x86apps</code>. Dated Arch builds (<code translate="no">arch-rolling-YYYYMMDD</code>, <code translate="no">arch-rolling-x86apps-YYYYMMDD</code>) can only be pulled. Windows can't be redistributed.</td>
+                  <td>Download a published image, e.g. <code translate="no">ubuntu</code>, <code translate="no">ubuntu-22.04</code>, <code translate="no">ubuntu-x86apps</code>, <code translate="no">arch</code> or <code translate="no">arch-x86apps</code>. Dated builds (<code translate="no">ubuntu-24.04-YYYYMMDD</code>, <code translate="no">arch-rolling-YYYYMMDD</code>, <code translate="no">…-x86apps-YYYYMMDD</code>) can only be pulled. Pulling again after a failure resumes, reusing the parts already verified. Windows can't be redistributed.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc image build &lt;image&gt; [--iso &lt;path&gt;]</code></td>
@@ -229,7 +230,7 @@
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc image rm &lt;image&gt;…</code></td>
-                  <td>Delete local images. Refuses while VMs of that image exist or a running build uses it (an Arch build runs in a clone of the Ubuntu image). Alias: <code translate="no">delete</code>.</td>
+                  <td>Delete local images. Refuses while VMs of that image exist, a running build uses it (an Arch build runs in a clone of the Ubuntu image), or a pull or snapshot of it runs. Alias: <code translate="no">delete</code>.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc image snapshot &lt;image&gt;</code></td>
@@ -256,15 +257,15 @@
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc update [--check]</code></td>
-                  <td>Update to the latest release, checksum-verified; images and VMs are kept. Alias: <code translate="no">upgrade</code>.</td>
+                  <td>Update to the latest release, checksum-verified; images and VMs are kept. Alias: <code translate="no">upgrade</code>. If the binary's directory isn't writable, it suggests <code translate="no">sudo agentpc update</code> or reinstalling with <code translate="no">AGENTPC_INSTALL_DIR</code>.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc doctor</code></td>
-                  <td>Check prerequisites.</td>
+                  <td>Check prerequisites, with the macOS and QEMU versions (warns below macOS 15, where x86apps VMs get emulated TSO, and below QEMU 9.0).</td>
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc clean [-n]</code></td>
-                  <td>Free disk space: downloaded ISOs and cloud images, and leftovers of interrupted builds or checkpoints. Never touches images or VMs.</td>
+                  <td>Free disk space: downloads fetched again when needed (ISOs, cloud images, the ~830 MB Arch Linux ARM tarball), leftovers of interrupted builds, pulls or checkpoints, and other versions' TSO libraries. Never touches images or VMs, and keeps what a running build, pull or push uses.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc uninstall [--keep-data] [-y]</code></td>
