@@ -12,13 +12,35 @@ jobs:
   check:
     runs-on: macos-14 # Apple Silicon (arm64)
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Pinned to a master commit (the README says pinned SHAs must be on master), so the
+      # toolchain is named explicitly; @stable meant the same.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (v2.9.2)
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo build --release
-      - run: cargo test
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo build --locked --release
+      - run: cargo test --locked
       - run: sh -n install.sh
+      - name: Syntax-check guest scripts
+        run: |
+          bash -n guests/arch/build.sh
+          for f in guests/arch/prepare.sh guests/arch/x86apps.sh guests/ubuntu/*.sh; do
+            sh -n "$f"
+          done
+      - name: shellcheck
+        run: |
+          command -v shellcheck >/dev/null || brew install shellcheck
+          shellcheck -S warning install.sh guests/arch/*.sh guests/ubuntu/*.sh
+      - run: python3 -m py_compile scripts/smoke.py
+      - name: Plugin manifests parse
+        run: |
+          find plugin .claude-plugin -name '*.json' -print0 | xargs -0 -n1 python3 -m json.tool >/dev/null
+      # The runner image ships Node and npm.
+      - name: Validate the plugin
+        run: |
+          npm install -g @anthropic-ai/claude-code@2.1.285
+          claude plugin validate plugin --strict
