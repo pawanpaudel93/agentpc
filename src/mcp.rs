@@ -40,6 +40,8 @@ checkpoint before a risky or slow-to-redo step. run_command runs PowerShell on W
 on Ubuntu; the guest login is agent/agent. create_vm takes an optional version (Ubuntu release
 like \"22.04\"; Windows \"11-25h2\", \"11-24h2\", \"11-23h2\"); list_vms shows which images exist.
 The first create of an image can take minutes (download/build); after that it's seconds.
+Both guests are ARM64. On Windows, x64 and x86 programs run through Prism emulation (slower;
+no x64 drivers), so prefer an ARM64 build when one exists.
 
 Desktop tools come from cua-driver on both OSes: launch_app returns a pid and window_ids;
 get_window_state(pid, window_id) returns numbered elements and a snapshot_id to pass with

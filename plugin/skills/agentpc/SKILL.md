@@ -121,6 +121,9 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 - **Defender real-time protection is on** (only SmartScreen is disabled) and may quarantine freshly
   built or unsigned test binaries. Exclude a path: `Add-MpPreference -ExclusionPath C:\work`
   (Tamper Protection can block `Set-MpPreference -DisableRealtimeMonitoring $true`).
+- **x64 apps run, slower.** Windows is ARM64; x64 and x86 programs (installers, desktop apps,
+  CLIs) run through Windows' built-in Prism emulation, roughly 2–4× slower than native. x64
+  drivers, kernel-mode software and anti-cheat don't. Prefer an ARM64 build when one exists.
 - **Proxy / corporate CA.** The guest inherits no Mac proxy; set `HTTP(S)_PROXY` inside it and
   import a corporate root with `Import-Certificate` (Windows) or `update-ca-certificates` (Ubuntu).
   Mac VPNs apply automatically (the VM's NAT rides the Mac's network).

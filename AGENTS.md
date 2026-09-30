@@ -59,7 +59,9 @@ Guest tips:
   which blocks DISM/`Add-WindowsCapability`; re-enable with `Set-Service wuauserv -StartupType
   Manual; Start-Service wuauserv`, then set it back to `Disabled`. Defender real-time protection
   is on (only SmartScreen is off) and may quarantine test binaries — `Add-MpPreference
-  -ExclusionPath C:\work`.
+  -ExclusionPath C:\work`. The guest is ARM64; x64 and x86 programs run through Windows' Prism
+  emulation (roughly 2–4× slower), but x64 drivers and kernel-mode software don't. Prefer an
+  ARM64 build when one exists.
 - Guests are 1280x800 with a 2D-only GPU (no acceleration) and no audio device.
 
 Rules:

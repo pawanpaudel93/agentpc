@@ -225,6 +225,21 @@ def windows(m, vm, r):
     r.check("run_command runs PowerShell", ok and "Desktop" in out, out[:200])
     gateway_checks(m, vm, r)
 
+    # The guest is ARM64; x64 programs run through Prism, and see an AMD64 environment.
+    ok, out = m.tool(
+        "run_command", name=vm, timeout=180,
+        command=(
+            "$ProgressPreference = 'SilentlyContinue'; $f = \"$env:TEMP\\busybox.exe\"; "
+            "Invoke-WebRequest https://frippery.org/files/busybox/busybox64.exe -OutFile $f; "
+            "\"host=$env:PROCESSOR_ARCHITECTURE\"; & $f sh -c 'echo x64=$PROCESSOR_ARCHITECTURE'"
+        ),
+    )
+    r.check(
+        "an x64 program runs through Prism",
+        ok and "host=ARM64" in out and "x64=AMD64" in out,
+        out[:300],
+    )
+
     ok, app = m.desktop(vm, "launch_app", name="notepad")
     pid = app.get("pid") if isinstance(app, dict) else None
     if not r.check("launch_app starts Notepad", ok and pid, str(app)[:200]):

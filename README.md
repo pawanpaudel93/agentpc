@@ -434,6 +434,10 @@ already running — or simply retry `run_command` once it's back.
   Defender may quarantine a freshly built or unsigned test binary. Exclude your work directory
   with `Add-MpPreference -ExclusionPath C:\work`, or turn real-time monitoring off with
   `Set-MpPreference -DisableRealtimeMonitoring $true` (Tamper Protection may block the latter).
+- **x64 apps run through emulation.** The guest is Windows 11 ARM64. x64 and x86 programs
+  (installers, desktop apps, CLIs) run through Windows' built-in Prism emulation, roughly 2–4×
+  slower than native; x64 drivers, kernel-mode software and anti-cheat don't run. Prefer an
+  ARM64 build when a download offers one.
 
 ### Hardware limits
 

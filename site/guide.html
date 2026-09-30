@@ -276,6 +276,12 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
             <div class="code-panel">
               <pre><code translate="no">Add-MpPreference -ExclusionPath C:\work</code></pre>
             </div>
+            <h3>x64 apps run through emulation</h3>
+            <p>
+              The guest is Windows 11 ARM64. x64 and x86 programs (installers, desktop apps, CLIs) run
+              through Windows' built-in Prism emulation, roughly 2–4× slower than native. x64 drivers,
+              kernel-mode software and anti-cheat don't run. Prefer an ARM64 build when one exists.
+            </p>
             <h3>Hardware limits</h3>
             <p>Guests have a fixed 1280×800 display, a 2D-only GPU (no 3D acceleration; WebGL is software-rendered or unavailable) and no audio device.</p>
           </section>
