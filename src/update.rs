@@ -9,6 +9,8 @@ use crate::log;
 
 const REPO: &str = "pawanpaudel93/agentpc";
 const TARGET: &str = "aarch64-apple-darwin";
+/// The installer the README and `setup::QEMU_HINT` point to.
+const INSTALL_URL: &str = "https://agentpc.pawanpaudel.com.np/install.sh";
 
 pub fn update(check: bool) -> Result<()> {
     tokio::runtime::Runtime::new()?.block_on(run(check))
@@ -61,13 +63,7 @@ async fn run(check: bool) -> Result<()> {
     // Unpack next to the binary so the final rename stays on one filesystem (atomic).
     let tmp = dir.join(format!(".agentpc-update-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir(&tmp).with_context(|| {
-        format!(
-            "can't write to {}; rerun the installer instead: \
-             curl -fsSL https://raw.githubusercontent.com/{REPO}/main/install.sh | sh",
-            dir.display()
-        )
-    })?;
+    std::fs::create_dir(&tmp).with_context(|| not_writable_hint(dir, &exe))?;
     let result = install(&tarball, &tmp, &name, &latest, &exe);
     let _ = std::fs::remove_dir_all(&tmp);
     result?;
@@ -98,6 +94,20 @@ fn install(tarball: &[u8], tmp: &Path, name: &str, version: &str, exe: &Path) ->
         bail!("the downloaded binary reports '{reported}', expected 'agentpc {version}'");
     }
     std::fs::rename(&new, exe).with_context(|| format!("replace {}", exe.display()))
+}
+
+/// What to do when the binary's directory isn't writable (e.g. root-owned /usr/local/bin).
+/// The update itself works as root (it only writes next to the binary), which keeps it
+/// where it is; install.sh can instead reinstall into that same directory, but running
+/// the whole installer as root would also register the MCP server for root.
+fn not_writable_hint(dir: &Path, exe: &Path) -> String {
+    format!(
+        "can't write to {dir}; update as its owner: sudo {exe} update\n\
+         or reinstall there (as a user who can write to it): \
+         curl -fsSL {INSTALL_URL} | AGENTPC_INSTALL_DIR={dir} sh",
+        dir = dir.display(),
+        exe = exe.display(),
+    )
 }
 
 /// The latest release's version, from where GitHub's releases/latest page redirects
@@ -143,7 +153,19 @@ fn is_newer(latest: &str, current: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_newer;
+    use super::*;
+
+    #[test]
+    fn not_writable_hint_names_the_same_dir() {
+        let h = not_writable_hint(
+            Path::new("/usr/local/bin"),
+            Path::new("/usr/local/bin/agentpc"),
+        );
+        assert!(h.contains("sudo /usr/local/bin/agentpc update"));
+        assert!(h.contains(&format!(
+            "curl -fsSL {INSTALL_URL} | AGENTPC_INSTALL_DIR=/usr/local/bin sh"
+        )));
+    }
 
     #[test]
     fn compares_versions_numerically() {

@@ -84,7 +84,7 @@ pub fn build(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     build_locked(image, iso)
 }
 
-/// Delete this image's half-written temp files (`*.qcow2.tmp`, `*.state.tmp`) left by an
+/// Delete this image's half-written temp files (`*.qcow2.tmp`, `*.state.tmp[.machine]`) left by an
 /// aborted build or snapshot. Best-effort: it runs on the failure path.
 fn remove_image_tmp(image: &Image) {
     let prefix = format!("{image}.");
@@ -94,7 +94,7 @@ fn remove_image_tmp(image: &Image) {
         .flatten()
     {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) && name.ends_with(".tmp") {
+        if name.starts_with(&prefix) && (name.ends_with(".tmp") || name.ends_with(".tmp.machine")) {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -154,12 +154,9 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
             busy.join(", ")
         );
     }
-    // A build is always today's Arch, so it can't stand in for a dated published one.
-    if os == Os::Arch && crate::instance::is_pinned_arch(&image.version) {
-        bail!(
-            "{image} is a published build and can only be downloaded: {} image pull {image}",
-            crate::setup::cmd_name()
-        );
+    // A build is always of today, so it can't stand in for a dated published one.
+    if image.pinned() {
+        bail!("{}", pinned_build_error(image));
     }
     for d in [home(), cache_dir(), images_dir(), instances_dir()] {
         std::fs::create_dir_all(&d).with_context(|| format!("create {}", d.display()))?;
@@ -200,6 +197,7 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     // pull, say) finds them in place instead of redoing slow work like installing Chrome.
     prepare_guest(&guard.inst)?;
     let mut info = guest_info(&guard.inst)?;
+    check_desktop_server(image, &info.desktop_server)?;
     if let (Os::Windows, Some(p)) = (os, &iso_path) {
         record_iso(&mut info, p)?;
     }
@@ -209,6 +207,14 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     guard.keep();
     write_info(image, &info)?;
     snapshot_locked(image)
+}
+
+/// Why `image` (a dated published build) can't be built here.
+pub(crate) fn pinned_build_error(image: &Image) -> String {
+    format!(
+        "pinned builds are download-only: {} image pull {image}",
+        crate::setup::cmd_name()
+    )
 }
 
 /// Capture the image's snapshot: boot the image once, let the desktop
@@ -254,6 +260,7 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
     log!("{os} ready in {}s; settling {settle}s", took.as_secs());
     // Guest-reported fields refresh; build-time ones (base, built, ISO checksum) are kept.
     let fresh = guest_info(inst)?;
+    check_desktop_server(image, &fresh.desktop_server)?;
     let mut info = read_info(image).unwrap_or_default();
     if info.base.is_empty() {
         info.base = fresh.base;
@@ -272,13 +279,12 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
         image.snapshot_vars(),
         image.snapshot_state(),
     );
-    for p in [&disk, &vars, &state] {
-        let _ = std::fs::remove_file(p);
-    }
+    image.remove_snapshot();
     let state_tmp = state.with_extension("state.tmp");
     let mem = u64::from(inst.size().0) << 30;
+    // The flattened convert writes the image's data plus the overlay's in full.
     wait_for_space(
-        allocated(&inst.disk()) + mem + (1 << 30),
+        allocated(&image.disk()) + allocated(&inst.disk()) + mem + (1 << 30),
         &format!("save the {} snapshot", inst.image),
     )?;
     qemu::save_state(inst, &state_tmp)?;
@@ -389,13 +395,19 @@ fn build_arch(image: &Image, name: &str) -> Result<()> {
     let script = inst.dir.join("build.sh");
     std::fs::write(&script, ARCH_BUILD)?;
     crate::ops::upload(inst, &script, "/tmp/agentpc-arch-build.sh")?;
+    let cached = seed_alarm_cache(inst)?;
     let tarball = run_arch_build(inst)?;
+    if !cached {
+        keep_alarm_tarball(inst);
+    }
 
     qemu::stop(inst)?;
     log!("writing the {image} image");
     let (disk, vars) = (image.disk(), image.vars());
     let _ = std::fs::remove_file(&disk);
     let _ = std::fs::remove_file(&vars);
+    // An old snapshot would resume the previous build if the new one fails.
+    image.remove_snapshot();
     let tmp = disk.with_extension("qcow2.tmp");
     wait_for_space(
         allocated(&target) + (1 << 30),
@@ -440,6 +452,82 @@ fn build_arch(image: &Image, name: &str) -> Result<()> {
     };
     write_info(image, &info)?;
     snapshot_locked(image)
+}
+
+/// The Arch Linux ARM tarball and its signature. build.sh verifies and uses them when
+/// they are in `ALARM_GUEST_DIR` at its start, and leaves the ones it downloads there.
+const ALARM_FILES: [&str; 2] = [
+    "ArchLinuxARM-aarch64-latest.tar.gz",
+    "ArchLinuxARM-aarch64-latest.tar.gz.sig",
+];
+/// The tarball's Last-Modified date, which build.sh reports; optional, carried along if present.
+const ALARM_DATE: &str = "ArchLinuxARM-aarch64-latest.tar.gz.date";
+/// Where build.sh looks for (and leaves) the tarball in the helper VM.
+const ALARM_GUEST_DIR: &str = "/home/agent/agentpc-alarm";
+
+/// The host's copy of the tarball, reused across Arch builds (`clean` removes it).
+fn alarm_cache_dir() -> PathBuf {
+    cache_dir().join("alarm")
+}
+
+/// Hand the cached tarball to the helper VM, if the host has one. Returns whether it did.
+fn seed_alarm_cache(inst: &Instance) -> Result<bool> {
+    let dir = alarm_cache_dir();
+    if !ALARM_FILES.iter().all(|f| dir.join(f).is_file()) {
+        return Ok(false);
+    }
+    let out = ssh(inst, &format!("mkdir -p {ALARM_GUEST_DIR}"))?;
+    if !out.status.success() {
+        bail!(
+            "creating {ALARM_GUEST_DIR} in {} failed: {}",
+            inst.name,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    log!("using the cached Arch Linux ARM tarball");
+    for f in ALARM_FILES {
+        crate::ops::upload(inst, &dir.join(f), &format!("{ALARM_GUEST_DIR}/{f}"))?;
+    }
+    if dir.join(ALARM_DATE).is_file() {
+        let _ = crate::ops::upload(
+            inst,
+            &dir.join(ALARM_DATE),
+            &format!("{ALARM_GUEST_DIR}/{ALARM_DATE}"),
+        );
+    }
+    Ok(true)
+}
+
+/// Copy the tarball build.sh downloaded back to the host cache, for the next build.
+/// Best-effort: a failure only means the next build downloads it again.
+fn keep_alarm_tarball(inst: &Instance) {
+    let dir = alarm_cache_dir();
+    // Named per build VM: two Arch builds can finish at once.
+    let part = |f: &str| dir.join(format!("{f}.{}.part", inst.name));
+    let got = std::fs::create_dir_all(&dir)
+        .map_err(anyhow::Error::from)
+        .and_then(|()| {
+            for f in ALARM_FILES {
+                let part = part(f);
+                crate::ops::download(inst, &format!("{ALARM_GUEST_DIR}/{f}"), &part)?;
+                std::fs::rename(&part, dir.join(f))?;
+            }
+            // Only the date build.sh reports; without it a reused tarball says "cached".
+            let part = part(ALARM_DATE);
+            if crate::ops::download(inst, &format!("{ALARM_GUEST_DIR}/{ALARM_DATE}"), &part).is_ok()
+            {
+                let _ = std::fs::rename(&part, dir.join(ALARM_DATE));
+            } else {
+                let _ = std::fs::remove_file(&part);
+            }
+            Ok(())
+        });
+    if let Err(e) = got {
+        for f in ALARM_FILES {
+            let _ = std::fs::remove_file(part(f));
+        }
+        log!("not caching the Arch Linux ARM tarball: {e:#}");
+    }
 }
 
 /// Lines of build.sh output kept for the error when it fails.
@@ -523,7 +611,7 @@ fn run_guest_script(inst: &Instance, script: &str, what: &str) -> Result<()> {
             format!("agentpc-{what}.ps1"),
             format!(
                 "powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:USERPROFILE\\agentpc-{what}.ps1\"; \
-                 Remove-Item \"$env:USERPROFILE\\agentpc-{what}.ps1\""
+                 $c = $LASTEXITCODE; Remove-Item \"$env:USERPROFILE\\agentpc-{what}.ps1\"; exit $c"
             ),
         ),
     };
@@ -532,11 +620,14 @@ fn run_guest_script(inst: &Instance, script: &str, what: &str) -> Result<()> {
     crate::ops::upload(inst, &local, &name)?;
     let out = ssh(inst, &run)?;
     if !out.status.success() {
-        bail!(
-            "{what} on {} failed: {}",
-            inst.os,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        // PowerShell reports a script's failures on stdout as often as on stderr.
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = if err.trim().is_empty() {
+            String::from_utf8_lossy(&out.stdout)
+        } else {
+            err
+        };
+        bail!("{what} on {} failed: {}", inst.os, err.trim());
     }
     Ok(())
 }
@@ -577,6 +668,30 @@ pub fn read_info(image: &Image) -> Option<ImageInfo> {
 pub fn write_info(image: &Image, info: &ImageInfo) -> Result<()> {
     std::fs::write(image.info_file(), serde_json::to_vec_pretty(info)?)?;
     Ok(())
+}
+
+/// The cua-driver release the guest setups install (`guests/ubuntu/user-data`,
+/// `guests/arch/build.sh`, `guests/windows/oem/setup.ps1`); bump it with them.
+pub const CUA_DRIVER_VERSION: &str = "0.30.3";
+
+/// The version in a guest's desktop-server string ("cua-driver 0.30.3", "v0.30.3").
+fn desktop_server_version(server: &str) -> Option<&str> {
+    let v = server.split_whitespace().last()?;
+    Some(v.strip_prefix('v').unwrap_or(v))
+}
+
+/// Fail an image build or snapshot whose guest doesn't run the pinned cua-driver: agents
+/// and the MCP gateway are written against that release's tools.
+fn check_desktop_server(image: &Image, server: &str) -> Result<()> {
+    match desktop_server_version(server) {
+        Some(v) if v == CUA_DRIVER_VERSION => Ok(()),
+        found => bail!(
+            "{image}: the guest runs {} but this agentpc needs cua-driver {CUA_DRIVER_VERSION}; \
+             rebuild the image with: {} image build {image}",
+            found.map_or("no cua-driver".to_string(), |v| format!("cua-driver {v}")),
+            crate::setup::cmd_name()
+        ),
+    }
 }
 
 /// Ask a running guest what it is, as `key=value` lines.
@@ -811,6 +926,10 @@ pub fn describe(image: &Image) -> Result<String> {
 }
 
 pub fn remove(image: &Image) -> Result<String> {
+    // Held for the removal, so no build, pull or snapshot starts writing it meanwhile.
+    let Some(_lock) = crate::instance::try_image_lock(image) else {
+        bail!("a build, pull or snapshot of {image} is running; try again when it finishes");
+    };
     if !image.instances()?.is_empty() {
         bail!("VMs of {image} depend on it; rm them first");
     }
@@ -821,24 +940,18 @@ pub fn remove(image: &Image) -> Result<String> {
             busy.join(", ")
         );
     }
-    let files = [
-        image.info_file(),
-        image.disk(),
-        image.vars(),
-        image.snapshot_disk(),
-        image.snapshot_vars(),
-        image.snapshot_state(),
-    ];
-    if !files.iter().any(|p| p.exists()) {
+    let files = [image.info_file(), image.disk(), image.vars()];
+    if !files
+        .iter()
+        .chain(&image.snapshot_files())
+        .any(|p| p.exists())
+    {
         bail!("no {image} image");
     }
     for p in files {
         let _ = std::fs::remove_file(p);
     }
-    // The machine-type sidecar qemu::save_state writes next to the snapshot state.
-    let mut sidecar = image.snapshot_state().into_os_string();
-    sidecar.push(".machine");
-    let _ = std::fs::remove_file(sidecar);
+    image.remove_snapshot();
     Ok(format!("removed {image}"))
 }
 
@@ -1377,6 +1490,8 @@ fn promote_image(inst: &Instance) -> Result<()> {
     let (disk, vars) = (image.disk(), image.vars());
     let _ = std::fs::remove_file(&disk);
     let _ = std::fs::remove_file(&vars);
+    // An old snapshot would resume the previous build if the new one fails.
+    image.remove_snapshot();
     let tmp = disk.with_extension("qcow2.tmp");
     wait_for_space(
         allocated(&inst.disk()) + (1 << 30),
@@ -1407,6 +1522,41 @@ fn promote_image(inst: &Instance) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guest_setups_install_the_pinned_cua_driver() {
+        let tag = format!("cua-driver-rs-v{}", super::CUA_DRIVER_VERSION);
+        for (file, text) in [
+            ("guests/ubuntu/user-data", super::UBUNTU_USER_DATA),
+            ("guests/arch/build.sh", super::ARCH_BUILD),
+        ] {
+            assert!(text.contains(&tag), "{file} doesn't install {tag}");
+        }
+        // setup.ps1 builds its URLs from one variable.
+        let setup_ps1 = String::from_utf8_lossy(super::WIN_OEM[1].1).into_owned();
+        let pin = format!("$cuaVersion = '{}'", super::CUA_DRIVER_VERSION);
+        assert!(
+            setup_ps1.contains(&pin),
+            "guests/windows/oem/setup.ps1 doesn't pin {pin}"
+        );
+    }
+
+    #[test]
+    fn checks_the_desktop_server_version() {
+        use super::{CUA_DRIVER_VERSION, check_desktop_server, desktop_server_version};
+        assert_eq!(desktop_server_version("cua-driver 0.30.3"), Some("0.30.3"));
+        assert_eq!(desktop_server_version("cua-driver v0.30.3"), Some("0.30.3"));
+        assert_eq!(desktop_server_version("0.30.3"), Some("0.30.3"));
+        assert_eq!(desktop_server_version(""), None);
+        let image: crate::instance::Image = "ubuntu-24.04".parse().unwrap();
+        let pinned = format!("cua-driver {CUA_DRIVER_VERSION}");
+        assert!(check_desktop_server(&image, &pinned).is_ok());
+        let err = check_desktop_server(&image, "cua-driver 0.29.0").unwrap_err();
+        assert!(err.to_string().contains("cua-driver 0.29.0"));
+        // A guest whose `--version` printed nothing has no driver at all.
+        assert!(check_desktop_server(&image, "cua-driver ").is_err());
+        assert!(check_desktop_server(&image, "").is_err());
+    }
+
     /// Downloads the 7.3 GB Windows ISO from Microsoft; run with AGENTPC_HOME set to a scratch dir.
     #[test]
     #[ignore]

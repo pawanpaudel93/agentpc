@@ -98,14 +98,10 @@ fn is_date(s: &str) -> bool {
     s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// `rolling-YYYYMMDD` or `rolling-x86apps-YYYYMMDD`: a published Arch build, downloaded by
-/// its dated registry tag.
-pub fn is_pinned_arch(version: &str) -> bool {
-    version
-        .strip_prefix(ARCH_VERSION)
-        .and_then(|d| d.strip_prefix('-'))
-        .map(|d| d.strip_prefix("x86apps-").unwrap_or(d))
-        .is_some_and(is_date)
+/// Whether `version` pins one published build by its registry date, `…-YYYYMMDD`
+/// (`24.04-20260930`, `rolling-x86apps-20261001`). Those can only be downloaded.
+pub fn is_pinned(version: &str) -> bool {
+    version.rsplit_once('-').is_some_and(|(_, d)| is_date(d))
 }
 
 impl Image {
@@ -114,8 +110,14 @@ impl Image {
         if os == Os::Windows && version == "11" {
             version = os.default_version().into();
         }
-        if version == X86_APPS {
-            version = format!("{}-{X86_APPS}", os.default_version());
+        // `x86apps` and `x86apps-YYYYMMDD` mean the default release's.
+        if version == X86_APPS
+            || version
+                .strip_prefix(X86_APPS)
+                .and_then(|d| d.strip_prefix('-'))
+                .is_some_and(is_date)
+        {
+            version = format!("{}-{version}", os.default_version());
         }
         if os == Os::Windows && version.split('-').any(|p| p == X86_APPS) {
             bail!("Windows runs x64 and x86 apps through Prism already; use a plain windows image");
@@ -123,14 +125,15 @@ impl Image {
         // Arch is rolling: one version (plain or x86apps), plus the dated tags of published
         // builds (pinned pulls).
         let arch_x86 = format!("{ARCH_VERSION}-{X86_APPS}");
-        if os == Os::Arch
-            && version != ARCH_VERSION
-            && version != arch_x86
-            && !is_pinned_arch(&version)
-        {
+        let unpinned = match version.rsplit_once('-') {
+            Some((v, _)) if is_pinned(&version) => v,
+            _ => &version,
+        };
+        if os == Os::Arch && unpinned != ARCH_VERSION && unpinned != arch_x86 {
             bail!(
-                "arch is a rolling release: use arch (arch-{ARCH_VERSION}) or arch-x86apps (arch-{arch_x86}), \
-                 or add -YYYYMMDD to download one published build"
+                "arch is a rolling release; images: arch, arch-x86apps, arch-{ARCH_VERSION}-YYYYMMDD, \
+                 arch-{arch_x86}-YYYYMMDD (as a version: none, \"{X86_APPS}\", \"{ARCH_VERSION}-YYYYMMDD\" \
+                 or \"{arch_x86}-YYYYMMDD\"); a dated one downloads that published build"
             );
         }
         // It becomes part of file names and registry tags.
@@ -165,6 +168,11 @@ impl Image {
     /// published builds (`ubuntu-24.04-x86apps-YYYYMMDD`) included.
     pub fn x86_apps(&self) -> bool {
         matches!(self.os, Os::Ubuntu | Os::Arch) && self.version.split('-').any(|p| p == X86_APPS)
+    }
+
+    /// A dated published build (`ubuntu-24.04-20260930`): download-only, never built here.
+    pub fn pinned(&self) -> bool {
+        is_pinned(&self.version)
     }
 
     /// The OS release the image installs: its version up to the x86apps variant, if any.
@@ -222,6 +230,24 @@ impl Image {
 
     pub fn snapshot_state(&self) -> PathBuf {
         self.file(".snapshot.state")
+    }
+
+    /// The snapshot's files, the machine-type sidecar `qemu::save_state` writes next to its
+    /// state included.
+    pub fn snapshot_files(&self) -> [PathBuf; 4] {
+        [
+            self.snapshot_disk(),
+            self.snapshot_vars(),
+            self.snapshot_state(),
+            self.file(".snapshot.state.machine"),
+        ]
+    }
+
+    /// Drop the snapshot, so new VMs can't resume one taken of an older disk.
+    pub fn remove_snapshot(&self) {
+        for p in self.snapshot_files() {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     pub fn exists(&self) -> bool {
@@ -406,18 +432,24 @@ impl Instance {
         self.dir.join("offline").exists()
     }
 
+    /// Refuse a size a VM can't have.
+    pub fn check_size(memory: Option<u32>, cpus: Option<u32>) -> Result<()> {
+        if memory.is_some_and(|m| !(2..=64).contains(&m)) {
+            bail!("memory must be 2-64 GB");
+        }
+        if cpus.is_some_and(|c| !(1..=16).contains(&c)) {
+            bail!("cpus must be 1-16");
+        }
+        Ok(())
+    }
+
     /// Record a non-default size (defaults leave no file, so older VMs keep theirs).
     pub fn set_size(&self, memory: Option<u32>, cpus: Option<u32>) -> Result<()> {
+        Self::check_size(memory, cpus)?;
         if let Some(m) = memory {
-            if !(2..=64).contains(&m) {
-                bail!("memory must be 2-64 GB");
-            }
             std::fs::write(self.dir.join("memory"), m.to_string())?;
         }
         if let Some(c) = cpus {
-            if !(1..=16).contains(&c) {
-                bail!("cpus must be 1-16");
-            }
             std::fs::write(self.dir.join("cpus"), c.to_string())?;
         }
         Ok(())
@@ -560,13 +592,14 @@ impl Instance {
     }
 }
 
-const IMAGE_FILES: [&str; 6] = [
+const IMAGE_FILES: [&str; 7] = [
     ".qcow2",
     ".vars.fd",
     ".json",
     ".snapshot.qcow2",
     ".snapshot.vars.fd",
     ".snapshot.state",
+    ".snapshot.state.machine",
 ];
 
 /// Held while a VM claims its slot and name, so parallel creates get different ones.
@@ -594,12 +627,16 @@ fn image_lock_path(image: &Image) -> PathBuf {
 /// `image`'s lock if it's free right now, else None (a build, pull or snapshot holds it).
 /// Never blocks. Used by `clean` to tell a crashed build's leftovers from a live build.
 pub fn try_image_lock(image: &Image) -> Option<std::fs::File> {
+    try_lock(&image_lock_path(image))
+}
+
+/// The lock at `path` if it's free right now, else None. Never blocks.
+pub fn try_lock(path: &Path) -> Option<std::fs::File> {
     use std::os::fd::AsRawFd;
     const LOCK_EX: i32 = 2;
     const LOCK_NB: i32 = 4;
-    let path = image_lock_path(image);
-    std::fs::create_dir_all(images_dir()).ok()?;
-    let f = std::fs::File::create(&path).ok()?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let f = std::fs::File::create(path).ok()?;
     // SAFETY: flock(2) on a descriptor we own.
     (unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0).then_some(f)
 }
@@ -867,6 +904,36 @@ mod tests {
     }
 
     #[test]
+    fn checks_vm_sizes() {
+        use super::Instance;
+        assert!(Instance::check_size(None, None).is_ok());
+        assert!(Instance::check_size(Some(2), Some(16)).is_ok());
+        assert!(Instance::check_size(Some(1), None).is_err());
+        assert!(Instance::check_size(Some(65), None).is_err());
+        assert!(Instance::check_size(None, Some(0)).is_err());
+        assert!(Instance::check_size(None, Some(17)).is_err());
+    }
+
+    #[test]
+    fn snapshot_files_include_the_machine_sidecar() {
+        let i: Image = "ubuntu".parse().unwrap();
+        let names: Vec<String> = i
+            .snapshot_files()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "ubuntu-24.04.snapshot.qcow2",
+                "ubuntu-24.04.snapshot.vars.fd",
+                "ubuntu-24.04.snapshot.state",
+                "ubuntu-24.04.snapshot.state.machine",
+            ]
+        );
+    }
+
+    #[test]
     fn parses_image_names() {
         let i: Image = "ubuntu".parse().unwrap();
         assert_eq!((i.os, i.to_string()), (Os::Ubuntu, "ubuntu-24.04".into()));
@@ -908,9 +975,27 @@ mod tests {
         assert_eq!("arch-rolling-x86apps".parse::<Image>().unwrap(), i);
         let i: Image = "arch-rolling-x86apps-20261001".parse().unwrap();
         assert_eq!((i.x86_apps(), i.release()), (true, "rolling"));
-        assert!(super::is_pinned_arch(&i.version));
-        assert!(!super::is_pinned_arch("rolling-x86apps"));
-        assert!(!super::is_pinned_arch("rolling"));
+        assert!(i.pinned());
+        assert!(!super::is_pinned("rolling-x86apps"));
+        assert!(!super::is_pinned("rolling"));
+        assert!(!super::is_pinned("24.04"));
+        assert!(!super::is_pinned("11-25h2"));
+        assert!(super::is_pinned("24.04-20260930"));
+        assert!(!"arch-x86apps".parse::<Image>().unwrap().pinned());
+        // `<os>-x86apps-YYYYMMDD` means the default release's, on both Linux OSes.
+        assert_eq!(
+            "arch-x86apps-20261001"
+                .parse::<Image>()
+                .unwrap()
+                .to_string(),
+            "arch-rolling-x86apps-20261001"
+        );
+        let i: Image = "ubuntu-x86apps-20260930".parse().unwrap();
+        assert_eq!(i.to_string(), "ubuntu-24.04-x86apps-20260930");
+        assert!(i.pinned() && i.x86_apps());
+        assert!("ubuntu-24.04-20260930".parse::<Image>().unwrap().pinned());
+        assert!(!"ubuntu-24.04-x86apps".parse::<Image>().unwrap().pinned());
+        assert!("windows-x86apps-20260930".parse::<Image>().is_err());
         assert!("arch-rolling-x86apps-2026".parse::<Image>().is_err());
         assert!("arch-x86apps-rolling".parse::<Image>().is_err());
         assert!("arch-2024".parse::<Image>().is_err());

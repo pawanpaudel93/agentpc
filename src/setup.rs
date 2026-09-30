@@ -274,9 +274,39 @@ pub fn doctor() -> Result<bool> {
 
     println!("host:");
     check("Apple Silicon", std::env::consts::ARCH == "aarch64", "");
-    check("macOS", std::env::consts::OS == "macos", "");
+    let macos = macos_version();
+    check(
+        &match &macos {
+            Some(v) => format!("macOS {v}"),
+            None => "macOS".into(),
+        },
+        std::env::consts::OS == "macos",
+        "",
+    );
+    // hvf_tso.c needs macOS 15's Hypervisor API; older hosts fall back to FEX's emulation.
+    if let Some(v) = &macos
+        && version_below(v, (15, 0))
+    {
+        println!("  warn x86apps VMs use emulated TSO (hardware TSO needs macOS 15+)");
+    }
     let qemu_ok = edk2().is_ok();
-    check("qemu", qemu_ok, QEMU_HINT);
+    let qemu_version = qemu_ok.then(qemu_version).flatten();
+    check(
+        &match &qemu_version {
+            Some(v) => format!("qemu {v}"),
+            None => "qemu".into(),
+        },
+        qemu_ok,
+        QEMU_HINT,
+    );
+    if let Some(v) = &qemu_version
+        && version_below(v, QEMU_MIN)
+    {
+        println!(
+            "  warn qemu {v} is older than {}.{}; saving and resuming VMs may fail — upgrade with: brew upgrade qemu",
+            QEMU_MIN.0, QEMU_MIN.1
+        );
+    }
     // An x86_64 QEMU (e.g. from a Rosetta brew) can't use HVF here; warn but don't fail.
     if qemu_ok && !qemu_is_arm64() {
         println!(
@@ -317,6 +347,48 @@ pub fn doctor() -> Result<bool> {
         }
     }
     Ok(all_ok)
+}
+
+/// The oldest QEMU `doctor` doesn't warn about. VMs are saved and resumed through `file:`
+/// migration URIs (`migrate`, `-incoming file:`, QEMU 8.1+) and screenshots use
+/// `screendump` PNG output (7.1+); 9.0 is the conservative floor over both, and what
+/// has been tested with HVF.
+const QEMU_MIN: (u32, u32) = (9, 0);
+
+/// The host's macOS version, e.g. "15.7.1".
+fn macos_version() -> Option<String> {
+    let out = Command::new("sysctl")
+        .args(["-n", "kern.osproductversion"])
+        .output()
+        .ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !v.is_empty()).then_some(v)
+}
+
+/// QEMU's version, from the first line of `qemu-system-aarch64 --version`.
+fn qemu_version() -> Option<String> {
+    let bin = crate::qemu::qemu_bin().ok()?;
+    let out = Command::new(bin).arg("--version").output().ok()?;
+    parse_qemu_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// "QEMU emulator version 11.1.1 (Homebrew)\n..." -> "11.1.1".
+fn parse_qemu_version(text: &str) -> Option<String> {
+    let line = text.lines().next()?;
+    let (_, rest) = line.split_once("version ")?;
+    let v = rest.split_whitespace().next()?;
+    v.starts_with(|c: char| c.is_ascii_digit())
+        .then(|| v.to_string())
+}
+
+/// Whether a dotted version (`15.7.1`, `9.2.0`) is below `min` (major, minor). An
+/// unparsable version isn't flagged.
+fn version_below(v: &str, min: (u32, u32)) -> bool {
+    let mut it = v.split(['.', '-']).map(|p| p.parse::<u32>().ok());
+    match (it.next().flatten(), it.next().flatten().unwrap_or(0)) {
+        (Some(major), minor) => (major, minor) < min,
+        (None, _) => false,
+    }
 }
 
 /// True when the QEMU binary is a native arm64 Mach-O (so it can use HVF acceleration).
@@ -429,11 +501,60 @@ fn partial_checkpoint(name: &str, valid: &[String]) -> bool {
         || (name.ends_with(".partial") && !valid.iter().any(|v| v == name))
 }
 
+/// The image a hidden build or snapshot VM (`_build-<image>`, `_snap-<image>`) makes. An
+/// Arch build's VM records the Ubuntu image it runs, so its name is what tells.
+fn scratch_image(name: &str) -> Option<Image> {
+    name.strip_prefix("_build-")
+        .or_else(|| name.strip_prefix("_snap-"))?
+        .parse()
+        .ok()
+}
+
+/// The image a half-written file in `images/` belongs to: `<image>.qcow2.tmp`,
+/// `<image>.snapshot.qcow2.tmp`, `<image>.snapshot.state.tmp` (and its `.machine` sidecar).
+fn tmp_image(name: &str) -> Option<Image> {
+    let s = name.strip_suffix(".machine").unwrap_or(name);
+    let s = s.strip_suffix(".tmp")?;
+    let s = s
+        .strip_suffix(".qcow2")
+        .or_else(|| s.strip_suffix(".state"))?;
+    s.strip_suffix(".snapshot").unwrap_or(s).parse().ok()
+}
+
+/// A file in `~/.agentpc/lib` that `clean` may remove: another build's `hvf-tso-*.dylib`
+/// or a leftover `hvf-tso-*.tmp` from writing one, never this build's `current` library.
+fn stale_tso_lib(name: &str, current: &str) -> bool {
+    name.starts_with("hvf-tso-")
+        && name != current
+        && (name.ends_with(".dylib") || name.ends_with(".tmp") || name.contains(".tmp."))
+}
+
+/// Whether a build, pull or snapshot of `image` holds its lock right now.
+fn image_busy(image: &Image) -> bool {
+    crate::instance::try_image_lock(image).is_none()
+}
+
+/// Whether any image's lock is held: some build may be using the shared downloads.
+fn any_image_busy() -> bool {
+    std::fs::read_dir(crate::instance::images_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_prefix('.')?.strip_suffix(".lock")?.parse().ok()
+        })
+        .any(|i: Image| image_busy(&i))
+}
+
 /// Delete what can be downloaded or rebuilt again, and leftovers of interrupted work.
-/// Images and VMs are never touched; unused images are listed.
+/// Images and VMs are never touched; unused images are listed. Files a running build,
+/// pull or push holds (by its lock) are kept.
 pub fn clean(dry_run: bool) -> Result<String> {
     use crate::instance::{Instance, cache_dir, images_dir, instances_dir};
     let mut targets: Vec<(PathBuf, &str)> = Vec::new();
+    let mut in_use: Vec<PathBuf> = Vec::new();
+    let building = any_image_busy();
     for e in std::fs::read_dir(cache_dir())
         .into_iter()
         .flatten()
@@ -444,10 +565,26 @@ pub fn clean(dry_run: bool) -> Result<String> {
         if name == "novnc" || name.starts_with('.') {
             continue;
         }
-        let why = if name.ends_with(".iso") || name.ends_with(".img") {
+        let pull = name.strip_prefix("pull-").and_then(|i| i.parse().ok());
+        let push = name.strip_prefix("push-").and_then(|i| i.parse().ok());
+        let live = match (&pull, &push) {
+            (Some(i), _) => image_busy(i),
+            (_, Some(i)) => crate::instance::try_lock(&crate::registry::push_lock(i)).is_none(),
+            // Cloud images, ISOs and drivers a running build may be reading.
+            _ => building,
+        };
+        if live {
+            in_use.push(e.path());
+            continue;
+        }
+        let why = if pull.is_some() || push.is_some() {
+            "leftover from an interrupted pull or push"
+        } else if name.ends_with(".iso") || name.ends_with(".img") {
             "download; fetched again when a build needs it"
         } else if name.starts_with("virtio-win") {
             "Windows drivers; fetched again when a build needs them"
+        } else if name == "alarm" {
+            "Arch Linux ARM tarball download; fetched again when a build needs it"
         } else {
             "leftover download or build file"
         };
@@ -463,10 +600,12 @@ pub fn clean(dry_run: bool) -> Result<String> {
         let name = e.file_name().to_string_lossy().into_owned();
         let inst = Instance::load(&name).ok();
         if name.starts_with('_') {
-            let live = inst
-                .as_ref()
-                .is_some_and(|i| crate::instance::try_image_lock(&i.image).is_none());
+            // The image it makes, or the one it runs (an Arch build's helper drops that
+            // one's lock once cloned, so the name is what counts there).
+            let live = scratch_image(&name).is_some_and(|i| image_busy(&i))
+                || inst.as_ref().is_some_and(|i| image_busy(&i.image));
             if live {
+                in_use.push(e.path());
                 continue;
             }
             if let Some(i) = inst.as_ref().filter(|i| i.running()) {
@@ -500,17 +639,56 @@ pub fn clean(dry_run: bool) -> Result<String> {
         }
     }
 
-    // Half-written image files from a crashed build or snapshot (`.qcow2.tmp`, `.state.tmp`).
+    // Half-written image files from a crashed build, pull or snapshot (`.qcow2.tmp`,
+    // `.state.tmp` and its `.tmp.machine` sidecar).
     for e in std::fs::read_dir(images_dir())
         .into_iter()
         .flatten()
         .flatten()
     {
-        if e.file_name().to_string_lossy().ends_with(".tmp") {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".tmp") || name.ends_with(".tmp.machine") {
+            let live = match tmp_image(&name) {
+                Some(i) => image_busy(&i),
+                None => building,
+            };
+            if live {
+                in_use.push(e.path());
+                continue;
+            }
             targets.push((
                 e.path(),
                 "half-written image file from an interrupted build",
             ));
+        }
+    }
+
+    // TSO libraries of other agentpc builds (and stray temps from writing one). A running
+    // x86apps VM, hidden build VMs included, may have one loaded, so leave them all then.
+    let tso_in_use = std::fs::read_dir(instances_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| Instance::load(&e.file_name().to_string_lossy()).ok())
+        .any(|i| i.image.x86_apps() && i.running());
+    let current_tso = crate::qemu::hvf_tso_path();
+    let current_tso = current_tso
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for e in std::fs::read_dir(home().join("lib"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !stale_tso_lib(&name, &current_tso) {
+            continue;
+        }
+        if tso_in_use {
+            in_use.push(e.path());
+        } else {
+            targets.push((e.path(), "TSO library of another agentpc version"));
         }
     }
 
@@ -541,6 +719,14 @@ pub fn clean(dry_run: bool) -> Result<String> {
     } else {
         format!("freed {:.2} GB\n", gb(total))
     };
+    for p in &in_use {
+        let by = if p.starts_with(home().join("lib")) {
+            "an x86apps VM is running"
+        } else {
+            "in use by a running build, pull or push"
+        };
+        out += &format!("kept: {} ({by})\n", p.display());
+    }
     let used: Vec<Image> = Instance::list()?.into_iter().map(|i| i.image).collect();
     let cmd = cmd_name();
     for image in Image::all().into_iter().filter(|i| !used.contains(i)) {
@@ -590,10 +776,16 @@ pub fn uninstall(keep_data: bool, yes: bool) -> Result<()> {
         }
     }
 
-    for inst in crate::instance::Instance::list()? {
+    // Hidden build/snapshot VMs (`_build-*`, `_snap-*`) too: removing the data would orphan them.
+    let all = std::fs::read_dir(crate::instance::instances_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| crate::instance::Instance::load(&e.file_name().to_string_lossy()).ok());
+    for inst in all {
         if inst.running() {
             log!("stopping {}", inst.name);
-            if keep_data {
+            if keep_data && !inst.name.starts_with('_') {
                 crate::qemu::stop(&inst)?;
             } else {
                 crate::qemu::quit(&inst);
@@ -655,6 +847,67 @@ mod tests {
         assert!(!partial_checkpoint("weird.partial", &valid2));
         // An orphaned `<label>.partial` whose checkpoint no longer exists is scratch.
         assert!(partial_checkpoint("gone.partial", &valid));
+    }
+
+    #[test]
+    fn names_the_image_of_scratch_files() {
+        let name = |i: Option<Image>| i.map(|i| i.to_string());
+        assert_eq!(
+            name(scratch_image("_build-arch-rolling-x86apps")),
+            Some("arch-rolling-x86apps".into())
+        );
+        assert_eq!(
+            name(scratch_image("_snap-ubuntu-24.04")),
+            Some("ubuntu-24.04".into())
+        );
+        assert_eq!(name(scratch_image("ubuntu-1")), None);
+        for (file, image) in [
+            ("ubuntu-24.04.qcow2.tmp", "ubuntu-24.04"),
+            ("ubuntu-24.04.snapshot.qcow2.tmp", "ubuntu-24.04"),
+            ("arch-rolling.snapshot.state.tmp", "arch-rolling"),
+            (
+                "windows-11-25h2.snapshot.state.tmp.machine",
+                "windows-11-25h2",
+            ),
+        ] {
+            assert_eq!(name(tmp_image(file)), Some(image.into()), "{file}");
+        }
+        assert_eq!(name(tmp_image("ubuntu-24.04.qcow2")), None);
+        assert_eq!(name(tmp_image("junk.tmp")), None);
+    }
+
+    #[test]
+    fn picks_stale_tso_libraries() {
+        let cur = "hvf-tso-1a2b3c4d.dylib";
+        assert!(stale_tso_lib("hvf-tso-deadbeef.dylib", cur));
+        assert!(stale_tso_lib("hvf-tso-1a2b3c4d.4242.tmp", cur));
+        assert!(stale_tso_lib("hvf-tso-deadbeef.4242.tmp", cur));
+        assert!(!stale_tso_lib(cur, cur));
+        assert!(!stale_tso_lib("other.dylib", cur));
+        assert!(!stale_tso_lib("hvf-tso-notes.txt", cur));
+    }
+
+    #[test]
+    fn reads_versions() {
+        assert_eq!(
+            parse_qemu_version(
+                "QEMU emulator version 11.1.1\nCopyright (c) 2003-2025 Fabrice Bellard"
+            )
+            .as_deref(),
+            Some("11.1.1")
+        );
+        assert_eq!(
+            parse_qemu_version("QEMU emulator version 9.2.0 (Homebrew)").as_deref(),
+            Some("9.2.0")
+        );
+        assert_eq!(parse_qemu_version("garbage"), None);
+        assert!(version_below("8.2.1", QEMU_MIN));
+        assert!(!version_below("9.0.0", QEMU_MIN));
+        assert!(!version_below("11.1.1", QEMU_MIN));
+        assert!(version_below("14.6.1", (15, 0)));
+        assert!(!version_below("15.0", (15, 0)));
+        assert!(!version_below("26.1", (15, 0)));
+        assert!(!version_below("unknown", (15, 0)));
     }
 
     #[test]

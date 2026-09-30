@@ -96,20 +96,26 @@ fn resume_machine(state: &Path) -> String {
 /// CPU's TSO mode for every vCPU so FEX needn't emulate x86 memory ordering.
 const HVF_TSO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hvf-tso.dylib"));
 
-/// The TSO library on disk, named by its hash so an upgrade never rewrites one a running
-/// QEMU has loaded.
-fn hvf_tso() -> Result<PathBuf> {
+/// Where this build's TSO library lives, named by its hash so an upgrade never rewrites one
+/// a running QEMU has loaded (`clean` removes the other builds' copies).
+pub fn hvf_tso_path() -> PathBuf {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(HVF_TSO);
     let name = format!(
         "hvf-tso-{:x}.dylib",
-        u32::from_be_bytes(hash[..4].try_into()?)
+        u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]])
     );
-    let dir = crate::instance::home().join("lib");
-    let path = dir.join(name);
+    crate::instance::home().join("lib").join(name)
+}
+
+/// The TSO library on disk, written on first use.
+fn hvf_tso() -> Result<PathBuf> {
+    let path = hvf_tso_path();
+    let dir = path.parent().context("TSO library path has no parent")?;
     if !path.is_file() {
-        std::fs::create_dir_all(&dir)?;
-        let tmp = path.with_extension("tmp");
+        std::fs::create_dir_all(dir)?;
+        // Per-process temp: parallel launches must not write into each other's file.
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
         std::fs::write(&tmp, HVF_TSO)?;
         std::fs::rename(&tmp, &path)?;
     }
@@ -378,6 +384,9 @@ fn launch(
             );
         }
         if Instant::now() > deadline {
+            // Don't leave a wedged QEMU holding the slot's ports and the disk.
+            let _ = child.kill();
+            let _ = child.wait();
             bail!("qemu did not open its control socket for {}", inst.name);
         }
         std::thread::sleep(Duration::from_millis(20));

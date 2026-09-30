@@ -203,7 +203,8 @@ pub fn ready(inst: &Instance) -> Result<bool> {
     match inst.os {
         Os::Windows => {
             let probe = format!(
-                r#"if (-not (Test-Path C:\OEM\done.txt)) {{ 'wait' }}
+                r#"if (Test-Path C:\OEM\failed.txt) {{ 'failed' }}
+elseif (-not (Test-Path C:\OEM\done.txt)) {{ 'wait' }}
 elseif (Test-Path "{WINDOWS_CUA_DRIVER}") {{ if ((& "{WINDOWS_CUA_DRIVER}" status 2>&1 | Out-String) -match 'daemon is running') {{ 'ready' }} }}
 elseif (Test-Path C:\uv\bin\windows-mcp.exe) {{ 'old' }}
 else {{ 'missing' }}"#
@@ -218,6 +219,11 @@ else {{ 'missing' }}"#
                 {
                     Some("ready") => true,
                     Some("old") => bail!("{}", old_windows_image(inst)),
+                    Some("failed") => bail!(
+                        "{}: Windows setup failed (see C:\\OEM\\failed.txt and C:\\OEM\\setup.log \
+                         in the guest)",
+                        inst.name
+                    ),
                     Some("missing") => bail!(
                         "{}: setup finished but installed no desktop-control server \
                      (see C:\\OEM\\setup.log in the guest)",
@@ -425,6 +431,23 @@ pub fn info(inst: &Instance) -> String {
     )
 }
 
+/// Refuse a VM name that can't be a directory under `instances/` or would pass for a
+/// hidden build VM (`_build-*`) or a dotfile.
+fn check_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || name.starts_with(['_', '.'])
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        bail!(
+            "invalid instance name '{name}' (up to 64 letters, digits, . - _; not starting with . or _)"
+        );
+    }
+    Ok(())
+}
+
 pub fn create(
     image: &Image,
     name: Option<&str>,
@@ -433,6 +456,14 @@ pub fn create(
     offline: bool,
 ) -> Result<String> {
     let os = image.os;
+    // Checked before a download or build that can take minutes; rechecked below for races.
+    Instance::check_size(memory, cpus)?;
+    if let Some(n) = name {
+        check_name(n)?;
+        if crate::instance::instances_dir().join(n).exists() {
+            bail!("instance '{n}' exists");
+        }
+    }
     check_memory(memory.unwrap_or(os.default_size().0))?;
     ensure_free_space(4, "create a VM")?;
     if !image.exists() {
@@ -447,9 +478,6 @@ pub fn create(
             .find(|n| !crate::instance::instances_dir().join(n).exists())
             .unwrap(),
     };
-    if name.is_empty() || name.starts_with(['_', '.']) || name.contains('/') {
-        bail!("invalid instance name '{name}'");
-    }
     if crate::instance::instances_dir().join(&name).exists() {
         bail!("instance '{name}' exists");
     }
@@ -463,12 +491,20 @@ pub fn create(
             }
             Ok(())
         })
-        .and_then(|()| clone_disk(&inst));
+        .and_then(|()| clone_image_disk(&inst));
     if let Err(e) = made {
         let _ = std::fs::remove_dir_all(&inst.dir);
         return Err(e);
     }
     boot(&inst)
+}
+
+/// `clone_disk` under the image lock, so a build, pull or snapshot can't replace the files
+/// it picks and clones mid-way. Take it after `creation_lock` is dropped: builds hold the
+/// image lock and then take `creation_lock` for their scratch VM.
+fn clone_image_disk(inst: &Instance) -> Result<()> {
+    let _lock = crate::instance::image_lock(&inst.image)?;
+    clone_disk(inst)
 }
 
 /// First `create` from an image: fetch it (Ubuntu, Arch), or say how to build it (Windows).
@@ -478,6 +514,17 @@ fn provision_image(image: &Image) -> Result<()> {
             let _lock = crate::instance::image_lock(image)?;
             fetch_image_locked(image)
         }
+        Os::Windows if crate::image::windows_iso_entry(&image.version).is_none() => bail!(
+            "no {image} image, and no known download for windows-{}; build one from your own \
+             ARM64 ISO ({} image build {image} --iso <path>) or use one of: {}",
+            image.version,
+            crate::setup::cmd_name(),
+            crate::image::WINDOWS_ISOS
+                .iter()
+                .map(|w| format!("windows-{}", w.version))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Os::Windows => bail!(
             "no {image} image yet; build it once (~12 min, downloads the ISO from Microsoft): \
              {} image build {image}",
@@ -495,6 +542,10 @@ pub(crate) fn fetch_image_locked(image: &Image) -> Result<()> {
     }
     log!("no {image} image yet; downloading it");
     if let Err(e) = crate::registry::pull_locked(image) {
+        // A dated build exists only in the registry; building here would make today's.
+        if image.pinned() {
+            return Err(e.context(format!("downloading the pinned build {image} failed")));
+        }
         // A failed snapshot leaves a downloaded but unusable image; rebuild it too.
         let what = if image.exists() {
             "setting up the downloaded image"
@@ -827,7 +878,7 @@ pub fn reset(inst: &Instance) -> Result<String> {
     let _lock = inst.lock()?;
     stop_forwards(inst);
     qemu::quit(inst);
-    clone_disk(inst)?;
+    clone_image_disk(inst)?;
     boot_locked(inst)
 }
 
@@ -1032,4 +1083,27 @@ pub fn read_log(inst: &Instance, which: &str, tail: usize) -> Result<String> {
 unsafe extern "C" {
     #[link_name = "kill"]
     fn c_kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn checks_instance_names() {
+        for ok in ["ubuntu-1", "my.vm_2", "A", &"x".repeat(64)] {
+            assert!(super::check_name(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "_build-ubuntu",
+            ".hidden",
+            "a/b",
+            "..",
+            "has space",
+            "semi;colon",
+            "ünïcode",
+            &"x".repeat(65),
+        ] {
+            assert!(super::check_name(bad).is_err(), "{bad}");
+        }
+    }
 }

@@ -232,6 +232,8 @@ struct CreateArgs {
     /// the default, "rolling"; "x86apps" (Arch that also runs x86 Linux programs); or a pinned
     /// download, "rolling-YYYYMMDD" / "rolling-x86apps-YYYYMMDD".
     version: Option<String>,
+    /// VM name: up to 64 letters, digits, ".", "-" or "_" (default "<os>-<n>"). With a name,
+    /// retrying a create that timed out returns the same VM instead of making another.
     name: Option<String>,
     /// Memory in GB (default 8 on Windows, 4 on Ubuntu and Arch). A non-default size boots cold
     /// (~25 s Windows, ~15 s Ubuntu and Arch) instead of resuming the image's snapshot.
@@ -397,22 +399,28 @@ impl Gateway {
             OsArg::Arch => Os::Arch,
         };
         let owner = self.owner_tag(&ctx);
+        let image = match a.version {
+            Some(v) => format!("{os}-{v}"),
+            None => os.to_string(),
+        };
         // Idempotent retry: a create re-sent after a client timeout finds its own VM already
-        // there and returns it, rather than erroring or making a second one.
+        // there (of the image asked for) and returns it, booted, rather than erroring or
+        // making a second one.
         if let Some(name) = &a.name
             && let Ok(inst) = load(name)
             && ops::owner(&inst).as_deref() == Some(owner.as_str())
+            && Image::resolve(&image).is_ok_and(|i| i == inst.image)
         {
             self.owned.lock().unwrap().insert(name.clone());
-            return text(Ok(ops::info(&inst)));
+            if inst.running() {
+                return text(Ok(ops::info(&inst)));
+            }
+            return text(with_progress(&ctx, move || ops::boot(&inst)).await);
         }
+        let requested = a.name.clone();
         let res = with_progress(&ctx, move || {
-            let name = match a.version {
-                Some(v) => format!("{os}-{v}"),
-                None => os.to_string(),
-            };
             ops::create(
-                &Image::resolve(&name)?,
+                &Image::resolve(&image)?,
                 a.name.as_deref(),
                 a.memory_gb,
                 a.cpus,
@@ -420,9 +428,12 @@ impl Gateway {
             )
         })
         .await;
-        // Record who owns it and track it for auto-stop. `info` starts with the VM's name.
+        // Record who owns it and track it for auto-stop. Without a requested name, `info`
+        // starts with the generated one.
         if let Ok(info) = &res
-            && let Some(name) = info.split_whitespace().next()
+            && let Some(name) = requested
+                .as_deref()
+                .or_else(|| info.split_whitespace().next())
         {
             if let Ok(inst) = load(name) {
                 let _ = ops::set_owner(&inst, &owner);
@@ -486,7 +497,11 @@ impl Gateway {
         Parameters(a): Parameters<NameArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        text(self.lifecycle(&a.name, ops::reset, &ctx).await)
+        let r = self.lifecycle(&a.name, ops::reset, &ctx).await;
+        if r.is_ok() {
+            self.owned.lock().unwrap().insert(a.name.clone());
+        }
+        text(r)
     }
 
     #[tool(
@@ -548,13 +563,16 @@ impl Gateway {
         ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
         self.drop_session(&a.name);
-        text(
-            async {
-                let inst = load(&a.name)?;
-                with_progress(&ctx, move || ops::restore(&inst, &a.label)).await
-            }
-            .await,
-        )
+        let name = a.name.clone();
+        let r = async {
+            let inst = load(&a.name)?;
+            with_progress(&ctx, move || ops::restore(&inst, &a.label)).await
+        }
+        .await;
+        if r.is_ok() {
+            self.owned.lock().unwrap().insert(name);
+        }
+        text(r)
     }
 
     #[tool(

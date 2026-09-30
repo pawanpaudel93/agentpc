@@ -46,12 +46,21 @@ pub fn push(image: &Image) -> Result<()> {
     if os == Os::Windows {
         bail!("Windows images can't be redistributed (Microsoft license); users build their own");
     }
+    let cmd = crate::setup::cmd_name();
+    // Its tag already carries a date; pushing would add a second one.
+    if image.pinned() {
+        bail!("{image} is a dated published build; push the image it pins instead");
+    }
     let oras =
         crate::qemu::which("oras").context("oras not found; install it with: brew install oras")?;
-    let cmd = crate::setup::cmd_name();
     if !image.exists() {
         bail!("no {image} image to push; run: {cmd} image build {image}");
     }
+    // Held while the work dir exists, so `clean` leaves a live push's parts alone.
+    let _push = crate::instance::lock(
+        &push_lock(image),
+        Some(&format!("waiting for another push of {image} to finish")),
+    )?;
     let mut info = image::read_info(image).with_context(|| {
         format!("{image} has no version info; run: {cmd} image snapshot {image}")
     })?;
@@ -138,6 +147,15 @@ pub fn push(image: &Image) -> Result<()> {
     Ok(())
 }
 
+/// Held by a push of `image` (`clean` checks it before removing `cache/push-<image>`).
+pub(crate) fn push_lock(image: &Image) -> PathBuf {
+    cache_dir().join(format!(".push-{image}.lock"))
+}
+
+fn pull_dir(image: &Image) -> PathBuf {
+    cache_dir().join(format!("pull-{image}"))
+}
+
 /// Download an image, then capture its RAM snapshot locally.
 pub fn pull(image: &Image) -> Result<()> {
     let _lock = crate::instance::image_lock(image)?;
@@ -155,7 +173,19 @@ pub(crate) fn pull_locked(image: &Image) -> Result<()> {
     if !image.instances()?.is_empty() {
         bail!("VMs of {image} depend on its current copy; rm them first");
     }
-    tokio::runtime::Runtime::new()?.block_on(download(image))?;
+    let got = tokio::runtime::Runtime::new()?.block_on(download(image));
+    if got.is_err() {
+        // Drop the half-joined disk, but keep the verified parts: the next pull resumes
+        // from them (`clean` removes them when no pull is running).
+        let _ = std::fs::remove_file(image.disk().with_extension("qcow2.tmp"));
+        if pull_dir(image).is_dir() {
+            log!(
+                "downloaded parts kept in {}; pull again to resume",
+                pull_dir(image).display()
+            );
+        }
+    }
+    got?;
     image::snapshot_locked(image)
 }
 
@@ -224,12 +254,46 @@ async fn download(image: &Image) -> Result<()> {
         .context("manifest has no layers")?;
     let total: u64 = layers.iter().filter_map(|l| l["size"].as_u64()).sum();
 
-    let work = cache_dir().join(format!("pull-{image}"));
-    let _ = std::fs::remove_dir_all(&work);
+    let blobs: Vec<Blob> = layers.iter().map(Blob::of).collect::<Result<_>>()?;
+
+    // Parts kept from an earlier, interrupted pull are reused when their content still
+    // matches this manifest's digest; anything else there (another manifest's parts,
+    // partial writes) goes.
+    let work = pull_dir(image);
     std::fs::create_dir_all(&work)?;
-    let done = Arc::new(AtomicU64::new(0));
-    log!("downloading {:.2} GB", total as f64 / 1e9);
-    futures::stream::iter(layers.iter().map(|l| {
+    for e in std::fs::read_dir(&work)?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !blobs.iter().any(|b| b.title == name) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    let mut have = 0;
+    let mut todo = Vec::new();
+    for b in blobs {
+        let path = work.join(&b.title);
+        if path.is_file() && file_sha256(&path).is_some_and(|h| h == b.sha256) {
+            have += b.size;
+        } else {
+            let _ = std::fs::remove_file(&path);
+            todo.push(b);
+        }
+    }
+    // Peak use: the parts plus the disk joined from them, less the parts already here.
+    crate::ops::ensure_free_space(
+        (2 * total).saturating_sub(have).div_ceil(1 << 30) + 1,
+        &format!("download {image}"),
+    )?;
+    let done = Arc::new(AtomicU64::new(have));
+    if have > 0 {
+        log!(
+            "resuming: {:.2} of {:.2} GB already downloaded",
+            have as f64 / 1e9,
+            total as f64 / 1e9
+        );
+    } else {
+        log!("downloading {:.2} GB", total as f64 / 1e9);
+    }
+    futures::stream::iter(todo.into_iter().map(|b| {
         let (http, base, work, done, token) = (
             http.clone(),
             base.clone(),
@@ -238,19 +302,12 @@ async fn download(image: &Image) -> Result<()> {
             token.clone(),
         );
         async move {
-            let title = l["annotations"]["org.opencontainers.image.title"]
-                .as_str()
-                .context("layer without title")?;
-            if title.contains('/') {
-                bail!("bad layer title {title}");
-            }
-            let digest = l["digest"].as_str().context("layer without digest")?;
             fetch_blob(
                 &http,
                 &base,
                 token.as_deref(),
-                digest,
-                &work.join(title),
+                &b,
+                &work.join(&b.title),
                 &done,
                 total,
             )
@@ -261,14 +318,12 @@ async fn download(image: &Image) -> Result<()> {
     .try_collect::<Vec<()>>()
     .await?;
 
-    // Reassemble the disk from its parts, in order.
-    let mut parts: Vec<PathBuf> = std::fs::read_dir(&work)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("disk.qcow2.part-"))
-        })
+    // Reassemble the disk from this manifest's parts, in order.
+    let mut parts: Vec<PathBuf> = layers
+        .iter()
+        .filter_map(|l| l["annotations"]["org.opencontainers.image.title"].as_str())
+        .filter(|t| t.starts_with("disk.qcow2.part-"))
+        .map(|t| work.join(t))
         .collect();
     parts.sort();
     if parts.is_empty() || !work.join("vars.fd").is_file() {
@@ -284,16 +339,11 @@ async fn download(image: &Image) -> Result<()> {
     out.flush().await?;
     drop(out);
 
+    // The old snapshot goes with the old disk: it would resume that one's RAM.
+    image.remove_snapshot();
     replace_readonly(&disk_tmp, &image.disk())?;
     replace_readonly(&work.join("vars.fd"), &image.vars())?;
     image::write_info(image, &info)?;
-    for p in [
-        image.snapshot_disk(),
-        image.snapshot_vars(),
-        image.snapshot_state(),
-    ] {
-        let _ = std::fs::remove_file(p);
-    }
     std::fs::remove_dir_all(&work)?;
     log!("{image} downloaded");
     Ok(())
@@ -341,25 +391,77 @@ async fn anonymous_token(http: &reqwest::Client, base: &str, repo: &str) -> Resu
         .map(String::from))
 }
 
+/// One layer of an image manifest: a disk part or the vars.
+struct Blob {
+    title: String,
+    digest: String,
+    /// Hex sha256 the content must have (the digest without its `sha256:` prefix).
+    sha256: String,
+    size: u64,
+}
+
+impl Blob {
+    fn of(l: &Value) -> Result<Self> {
+        let title = l["annotations"]["org.opencontainers.image.title"]
+            .as_str()
+            .context("layer without title")?;
+        if title.is_empty() || title.contains('/') || title.starts_with('.') {
+            bail!("bad layer title {title}");
+        }
+        let digest = l["digest"].as_str().context("layer without digest")?;
+        let sha256 = digest
+            .strip_prefix("sha256:")
+            .context("only sha256 digests are supported")?
+            .to_ascii_lowercase();
+        Ok(Self {
+            title: title.into(),
+            digest: digest.into(),
+            sha256,
+            size: l["size"].as_u64().unwrap_or(0),
+        })
+    }
+}
+
+/// Hex sha256 of a file's content, or `None` if it can't be read.
+fn file_sha256(p: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(p).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        match f.read(&mut buf).ok()? {
+            0 => break,
+            n => hasher.update(&buf[..n]),
+        }
+    }
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
+
+/// Download a blob to `dest` through `dest.part`, so a file at `dest` is always whole.
 async fn fetch_blob(
     http: &reqwest::Client,
     base: &str,
     token: Option<&str>,
-    digest: &str,
+    blob: &Blob,
     dest: &Path,
     done: &AtomicU64,
     total: u64,
 ) -> Result<()> {
-    let want = digest
-        .strip_prefix("sha256:")
-        .context("only sha256 digests are supported")?;
-    let mut req = http.get(format!("{base}/blobs/{digest}"));
+    let want = &blob.sha256;
+    let mut req = http.get(format!("{base}/blobs/{}", blob.digest));
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
     let resp = req.send().await?.error_for_status()?;
     let mut stream = resp.bytes_stream();
-    let mut file = tokio::fs::File::create(dest).await?;
+    let part = dest.with_file_name(format!("{}.part", blob.title));
+    let mut file = tokio::fs::File::create(&part).await?;
     let mut hasher = Sha256::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -378,9 +480,12 @@ async fn fetch_blob(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    if got != want {
+    drop(file);
+    if &got != want {
+        let _ = tokio::fs::remove_file(&part).await;
         bail!("checksum mismatch for {}", dest.display());
     }
+    tokio::fs::rename(&part, dest).await?;
     Ok(())
 }
 
@@ -391,4 +496,47 @@ fn replace_readonly(from: &Path, to: &Path) -> Result<()> {
     perm.set_readonly(true);
     std::fs::set_permissions(to, perm)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_manifest_layers() {
+        let l = serde_json::json!({
+            "digest": "sha256:ABCDEF",
+            "size": 42,
+            "annotations": {"org.opencontainers.image.title": "disk.qcow2.part-aaa"}
+        });
+        let b = Blob::of(&l).unwrap();
+        assert_eq!(b.title, "disk.qcow2.part-aaa");
+        assert_eq!(b.digest, "sha256:ABCDEF");
+        assert_eq!(b.sha256, "abcdef");
+        assert_eq!(b.size, 42);
+        for title in ["../x", "", ".hidden"] {
+            let l = serde_json::json!({
+                "digest": "sha256:ab",
+                "annotations": {"org.opencontainers.image.title": title}
+            });
+            assert!(Blob::of(&l).is_err(), "{title}");
+        }
+        let md5 = serde_json::json!({
+            "digest": "md5:ab",
+            "annotations": {"org.opencontainers.image.title": "vars.fd"}
+        });
+        assert!(Blob::of(&md5).is_err());
+    }
+
+    #[test]
+    fn hashes_files_for_resume() {
+        let p = std::env::temp_dir().join(format!("agentpc-sha-test-{}", std::process::id()));
+        std::fs::write(&p, b"abc").unwrap();
+        assert_eq!(
+            file_sha256(&p).as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(file_sha256(&p), None);
+    }
 }

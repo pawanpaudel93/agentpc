@@ -3,6 +3,8 @@ use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=src/hvf_tso.c");
+    // The compiler comes from $CC; a different one must rebuild the library.
+    println!("cargo:rerun-if-env-changed=CC");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("hvf-tso.dylib");
     let cc = env::var("CC").unwrap_or_else(|_| "cc".into());
     let status = Command::new(&cc)
