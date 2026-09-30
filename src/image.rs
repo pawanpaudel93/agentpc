@@ -60,6 +60,7 @@ pub(crate) const WINDOWS_ISOS: [WinIso; 3] = [
 ];
 
 const UBUNTU_PREPARE: &str = include_str!("../guests/ubuntu/prepare.sh");
+const UBUNTU_X86_APPS: &str = include_str!("../guests/ubuntu/x86apps.sh");
 const WIN_PREPARE: &str = include_str!("../guests/windows/prepare.ps1");
 const WIN_AUTOUNATTEND: &str = include_str!("../guests/windows/Autounattend.xml");
 const WIN_SETUP_COMPLETE: &[u8] = include_bytes!("../guests/windows/SetupComplete.cmd");
@@ -138,6 +139,7 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     // Peak use: the build disk plus its flattened copy, then the image plus its snapshot.
     let need_gb = match os {
         Os::Windows => 35,
+        Os::Ubuntu if image.x86_apps() => 16,
         Os::Ubuntu => 12,
     };
     crate::ops::ensure_free_space(need_gb, &format!("build {image}"))?;
@@ -305,30 +307,44 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
     Ok(())
 }
 
-/// Apply the agent-friendly defaults in `guests/<os>/prepare.*` to a running guest.
+/// Apply the agent-friendly defaults in `guests/<os>/prepare.*` to a running guest, after
+/// `guests/ubuntu/x86apps.sh` on an x86apps image (prepare.sh's cleanup then shrinks both).
 /// It runs at every snapshot, so existing and pulled images get it too.
 fn prepare_guest(inst: &Instance) -> Result<()> {
+    if inst.image.x86_apps() {
+        log!("installing FEX for x86 programs");
+        run_guest_script(inst, UBUNTU_X86_APPS, "x86apps")?;
+    }
     log!("applying agent defaults to {}", inst.os);
-    let (script, name, run) = match inst.os {
+    let script = match inst.os {
+        Os::Ubuntu => UBUNTU_PREPARE,
+        Os::Windows => WIN_PREPARE,
+    };
+    run_guest_script(inst, script, "prepare")
+}
+
+/// Upload `script` and run it as root (Ubuntu) or as the agent user (Windows).
+fn run_guest_script(inst: &Instance, script: &str, what: &str) -> Result<()> {
+    let (name, run) = match inst.os {
         Os::Ubuntu => (
-            UBUNTU_PREPARE,
-            "/tmp/agentpc-prepare.sh",
-            "sudo sh /tmp/agentpc-prepare.sh && rm -f /tmp/agentpc-prepare.sh",
+            format!("/tmp/agentpc-{what}.sh"),
+            format!("sudo sh /tmp/agentpc-{what}.sh && rm -f /tmp/agentpc-{what}.sh"),
         ),
         Os::Windows => (
-            WIN_PREPARE,
-            "agentpc-prepare.ps1",
-            "powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:USERPROFILE\\agentpc-prepare.ps1\"; \
-             Remove-Item \"$env:USERPROFILE\\agentpc-prepare.ps1\"",
+            format!("agentpc-{what}.ps1"),
+            format!(
+                "powershell -NoProfile -ExecutionPolicy Bypass -File \"$env:USERPROFILE\\agentpc-{what}.ps1\"; \
+                 Remove-Item \"$env:USERPROFILE\\agentpc-{what}.ps1\""
+            ),
         ),
     };
-    let local = inst.dir.join("prepare-script");
+    let local = inst.dir.join(format!("{what}-script"));
     std::fs::write(&local, script)?;
-    crate::ops::upload(inst, &local, name)?;
-    let out = ssh(inst, run)?;
+    crate::ops::upload(inst, &local, &name)?;
+    let out = ssh(inst, &run)?;
     if !out.status.success() {
         bail!(
-            "preparing {} failed: {}",
+            "{what} on {} failed: {}",
             inst.os,
             String::from_utf8_lossy(&out.stderr).trim()
         );
@@ -1013,7 +1029,7 @@ fn copy_files(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn build_ubuntu(inst: &Instance) -> Result<()> {
-    let version = &inst.image.version;
+    let version = inst.image.release();
     let file = format!("ubuntu-{version}-server-cloudimg-arm64.img");
     let base = cache_dir().join(&file);
     if !base.is_file() {

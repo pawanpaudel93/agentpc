@@ -137,6 +137,10 @@
                   <td>Any release on cloud-images.ubuntu.com, e.g. <code translate="no">22.04</code> or <code translate="no">26.04</code>. <code translate="no">image build ubuntu-22.04</code>, or <code translate="no">image pull</code> if published.</td>
                 </tr>
                 <tr>
+                  <td><code translate="no">ubuntu-x86apps</code></td>
+                  <td>Ubuntu 24.04 that also runs x86_64 Linux programs, through FEX translation. Built automatically on first <code translate="no">create</code>, or <code translate="no">image build ubuntu-x86apps</code>.</td>
+                </tr>
+                <tr>
                   <td><code translate="no">windows-11-25h2</code></td>
                   <td>Windows 11 25H2 (Home/Pro), 7.3 GB ISO from Microsoft. <code translate="no">image build windows</code>.</td>
                 </tr>
@@ -281,6 +285,16 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
               The guest is Windows 11 ARM64. x64 and x86 programs (installers, desktop apps, CLIs) run
               through Windows' built-in Prism emulation, roughly 2–4× slower than native. x64 drivers,
               kernel-mode software and anti-cheat don't run. Prefer an ARM64 build when one exists.
+            </p>
+            <h3>x86_64 Linux programs</h3>
+            <p>
+              The Ubuntu guest is arm64. Create a VM from <code translate="no">ubuntu-x86apps</code>
+              (<code translate="no">create_vm</code> with <code translate="no">version: "x86apps"</code>) and x86_64
+              programs run through <a href="https://fex-emu.com">FEX</a>, which translates each one to arm64:
+              about 2× slower, JIT runtimes such as Node 6–7×, and much faster from the second start on
+              thanks to FEX's code cache. Go programs work (the image sets
+              <code translate="no">GODEBUG=asyncpreemptoff=1</code> for them). x86 containers and kernel
+              modules don't: it's translation, not an x86 machine.
             </p>
             <h3>Hardware limits</h3>
             <p>Guests have a fixed 1280×800 display, a 2D-only GPU (no 3D acceleration; WebGL is software-rendered or unavailable) and no audio device.</p>

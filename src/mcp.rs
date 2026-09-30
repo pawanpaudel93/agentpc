@@ -41,7 +41,8 @@ on Ubuntu; the guest login is agent/agent. create_vm takes an optional version (
 like \"22.04\"; Windows \"11-25h2\", \"11-24h2\", \"11-23h2\"); list_vms shows which images exist.
 The first create of an image can take minutes (download/build); after that it's seconds.
 Both guests are ARM64. On Windows, x64 and x86 programs run through Prism emulation (slower;
-no x64 drivers), so prefer an ARM64 build when one exists.
+no x64 drivers), so prefer an ARM64 build when one exists. For x86_64 Linux programs, create
+ubuntu with version \"x86apps\": they run through FEX translation, about 2x slower.
 
 Desktop tools come from cua-driver on both OSes: launch_app returns a pid and window_ids;
 get_window_state(pid, window_id) returns numbered elements and a snapshot_id to pass with
@@ -207,7 +208,8 @@ enum OsArg {
 #[derive(Deserialize, JsonSchema)]
 struct CreateArgs {
     os: OsArg,
-    /// Default: ubuntu 24.04, windows 11. Ubuntu: any release, e.g. "22.04", "26.04".
+    /// Default: ubuntu 24.04, windows 11. Ubuntu: any release, e.g. "22.04", "26.04";
+    /// "x86apps" (or "24.04-x86apps") is Ubuntu that also runs x86_64 Linux programs.
     /// Windows: "11-25h2", "11-24h2" or "11-23h2". Omitted, Windows uses 25H2, or the newest
     /// installed Windows 11 image if 25H2 isn't built.
     version: Option<String>,

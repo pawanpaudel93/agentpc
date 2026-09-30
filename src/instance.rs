@@ -75,11 +75,21 @@ pub struct Image {
     pub version: String,
 }
 
+/// The Ubuntu image variant that also runs x86_64 and i386 Linux programs (through FEX):
+/// `ubuntu-24.04-x86apps`, or `ubuntu-x86apps` for the default release.
+const X86_APPS: &str = "x86apps";
+
 impl Image {
     pub fn new(os: Os, version: Option<&str>) -> Result<Self> {
         let mut version = version.unwrap_or(os.default_version()).to_ascii_lowercase();
         if os == Os::Windows && version == "11" {
             version = os.default_version().into();
+        }
+        if version == X86_APPS {
+            version = format!("{}-{X86_APPS}", os.default_version());
+        }
+        if os == Os::Windows && version.ends_with(X86_APPS) {
+            bail!("Windows runs x64 and x86 apps through Prism already; use a plain windows image");
         }
         // It becomes part of file names and registry tags.
         if version.is_empty()
@@ -107,6 +117,18 @@ impl Image {
             }
         }
         Ok(image)
+    }
+
+    /// Whether VMs of this image run x86 Linux programs (`guests/ubuntu/x86apps.sh`).
+    pub fn x86_apps(&self) -> bool {
+        self.os == Os::Ubuntu && self.version.ends_with(&format!("-{X86_APPS}"))
+    }
+
+    /// The OS release the image installs: its version without a variant suffix.
+    pub fn release(&self) -> &str {
+        self.version
+            .strip_suffix(&format!("-{X86_APPS}"))
+            .unwrap_or(&self.version)
     }
 
     /// Installed images, sorted by name.
@@ -802,5 +824,15 @@ mod tests {
         );
         assert!("ubuntu-../x".parse::<Image>().is_err());
         assert!("macos".parse::<Image>().is_err());
+
+        let i: Image = "ubuntu-x86apps".parse().unwrap();
+        assert_eq!(i.to_string(), "ubuntu-24.04-x86apps");
+        assert!(i.x86_apps());
+        assert_eq!(i.release(), "24.04");
+        let i: Image = "ubuntu-22.04-x86apps".parse().unwrap();
+        assert_eq!((i.x86_apps(), i.release()), (true, "22.04"));
+        let i: Image = "ubuntu-22.04".parse().unwrap();
+        assert_eq!((i.x86_apps(), i.release()), (false, "22.04"));
+        assert!("windows-x86apps".parse::<Image>().is_err());
     }
 }

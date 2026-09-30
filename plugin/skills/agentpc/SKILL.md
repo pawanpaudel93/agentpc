@@ -144,6 +144,10 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 - Don't create VMs you won't use. Each running VM uses 4 GB (Ubuntu) or 8 GB (Windows) of RAM.
 - The first `create_vm ubuntu` downloads the Ubuntu image (~1.2 GB). Another Ubuntu release
   (`version: "22.04"`, `"26.04"`, ...) is fetched or built the same way (~3 min).
+- **x86_64 Linux programs** need `create_vm(os: "ubuntu", version: "x86apps")`: FEX translates
+  them to arm64, about 2x slower (JIT runtimes like Node ~6x); run them directly (`./tool`).
+  Go programs work (the image sets `GODEBUG=asyncpreemptoff=1` for them); x86 containers
+  don't. The first create builds the image locally.
 - Windows images can't be downloaded. If `list_vms` shows no Windows image, ask the user to
   build one once (~12 min) and don't start it yourself:
   `agentpc image build windows` (downloads the official ISO from Microsoft, 7.3 GB). Other

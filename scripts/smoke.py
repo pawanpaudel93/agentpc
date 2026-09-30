@@ -6,6 +6,7 @@ Run after changing an image, a guest script or the desktop driver:
     cargo build --release
     scripts/smoke.py --bin target/release/agentpc            # ubuntu and windows
     scripts/smoke.py --bin target/release/agentpc --os ubuntu
+    scripts/smoke.py --bin target/release/agentpc --os x86apps  # ubuntu-x86apps (not a default)
 
 Each OS gets its own throwaway VM (deleted afterwards). Checks that the guest isn't blocked
 by first-run dialogs, that the desktop tools read and type, and that the gateway explains
@@ -220,6 +221,51 @@ def ubuntu(m, vm, r):
     )
 
 
+def x86apps(m, vm, r):
+    """ubuntu-x86apps: downloaded x86_64 programs run through FEX, GUI ones included."""
+    def sh(command, timeout=300):
+        return m.tool("run_command", name=vm, command=command, timeout=timeout)
+
+    ok, out = sh(
+        "cd /tmp && curl -fsSL https://nodejs.org/dist/v22.20.0/node-v22.20.0-linux-x64.tar.xz"
+        " | tar xJ && node-v22.20.0-linux-x64/bin/node -p process.arch"
+    )
+    r.check("an x86_64 Node runs (a JIT under translation)", ok and out.strip().endswith("x64"), out[-300:])
+
+    # Go's signal-based preemption crashes under FEX unless GODEBUG=asyncpreemptoff=1,
+    # which the image's FEX config sets for x86 programs.
+    ok, out = sh(
+        "cd /tmp && curl -fsSL https://github.com/cli/cli/releases/download/v2.60.1/gh_2.60.1_linux_amd64.tar.gz"
+        " | tar xz && for i in 1 2 3; do gh_2.60.1_linux_amd64/bin/gh --version >/dev/null || exit 1; done; echo ok"
+    )
+    r.check("an x86_64 Go program runs (3/3)", ok and out.strip().endswith("ok"), out[-300:])
+
+    ok, out = sh("du -sk ~/.cache/fex-emu | cut -f1")
+    kb = out.strip().splitlines()[-1] if out.strip() else ""
+    r.check("FEX caches translated code on disk", ok and kb.isdigit() and int(kb) > 0, out[-200:])
+
+    ok, out = sh(
+        "cd /tmp && curl -fsSL 'https://download.mozilla.org/?product=firefox-latest&os=linux64&lang=en-US'"
+        " | tar xJ && file -L firefox/firefox-bin | grep -o x86-64",
+        timeout=600,
+    )
+    if not r.check("the x86_64 Firefox downloads", ok and "x86-64" in out, out[-300:]):
+        return
+    ok, app = m.desktop(
+        vm, "launch_app", name="/tmp/firefox/firefox", additional_arguments=["https://example.com"]
+    )
+    pid = app.get("pid") if isinstance(app, dict) else None
+    if not r.check("launch_app starts the x86_64 Firefox", ok and pid, str(app)[:200]):
+        return
+
+    def page_window():
+        _, w = m.desktop(vm, "list_windows")
+        wins = w.get("windows", []) if isinstance(w, dict) else []
+        return next((x for x in wins if "Example Domain" in x.get("title", "")), None)
+
+    r.check("the x86_64 Firefox shows the page", poll(page_window, 120, 5) is not None)
+
+
 def windows(m, vm, r):
     ok, out = m.tool("run_command", name=vm, command="$PSVersionTable.PSEdition")
     r.check("run_command runs PowerShell", ok and "Desktop" in out, out[:200])
@@ -280,7 +326,7 @@ def windows(m, vm, r):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--bin", default="agentpc", help="agentpc binary to test")
-    ap.add_argument("--os", default="ubuntu,windows", help="comma-separated: ubuntu,windows")
+    ap.add_argument("--os", default="ubuntu,windows", help="comma-separated: ubuntu,windows,x86apps")
     a = ap.parse_args()
 
     failed = 0
@@ -291,9 +337,12 @@ def main():
         r = Report()
         start = time.time()
         try:
-            ok, out = m.tool("create_vm", os=os_name, name=vm)
+            if os_name == "x86apps":
+                ok, out = m.tool("create_vm", os="ubuntu", version="x86apps", name=vm)
+            else:
+                ok, out = m.tool("create_vm", os=os_name, name=vm)
             if r.check("create_vm", ok, out[:300]):
-                {"ubuntu": ubuntu, "windows": windows}[os_name](m, vm, r)
+                {"ubuntu": ubuntu, "windows": windows, "x86apps": x86apps}[os_name](m, vm, r)
         except Exception as e:  # report and keep going to cleanup
             r.check("no unexpected error", False, repr(e)[:300])
         finally:
