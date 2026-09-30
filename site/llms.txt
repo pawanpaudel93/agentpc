@@ -1,8 +1,8 @@
 # agentpc
 
-agentpc gives AI agents instant, resettable Windows and Ubuntu desktop VMs on an Apple Silicon Mac, through one MCP server (`agentpc mcp`).
+agentpc gives AI agents instant, resettable Windows, Ubuntu and Arch Linux ARM desktop VMs on an Apple Silicon Mac, through one MCP server (`agentpc mcp`).
 
-The VMs are ARM64. x64 Windows apps run through Prism; x86_64 Linux programs and amd64 containers run in the `ubuntu-x86apps` image, through FEX.
+The VMs are ARM64. x64 Windows apps run through Prism; x86_64 Linux programs and amd64 containers run in the `ubuntu-x86apps` image, through FEX. The `arch` guest (Arch Linux ARM) is like Ubuntu, with Chromium as its browser and pacman (`sudo pacman -Syu --noconfirm <pkg>`) for packages.
 
 ## Links
 

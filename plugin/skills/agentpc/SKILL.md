@@ -1,13 +1,13 @@
 ---
 name: agentpc
-description: Use agentpc to get an instant, resettable Windows or Ubuntu desktop VM on the user's Mac. Use it when a task needs a real, clean Windows or Linux machine, such as testing an installer, script or app on a fresh OS, reproducing a platform-specific bug, operating a GUI application, or taking screenshots of a desktop, and when the user mentions agentpc or asks for a Windows or Ubuntu VM.
+description: Use agentpc to get an instant, resettable Windows, Ubuntu or Arch Linux desktop VM on the user's Mac. Use it when a task needs a real, clean Windows or Linux machine, such as testing an installer, script or app on a fresh OS, reproducing a platform-specific bug, operating a GUI application, or taking screenshots of a desktop, and when the user mentions agentpc or asks for a Windows, Ubuntu or Arch Linux VM.
 ---
 
 # agentpc: instant, resettable desktops
 
-agentpc runs Windows 11 and Ubuntu (24.04 by default, or another release)
+agentpc runs Windows 11, Ubuntu (24.04 by default, or another release) and Arch Linux ARM
 VMs locally and exposes them through the `agentpc` MCP server. A new VM is ready in about 1 s
-(Ubuntu) or 4 s (Windows) and can be reset to a clean install just as fast, so treat VMs as
+(Ubuntu, Arch) or 4 s (Windows) and can be reset to a clean install just as fast, so treat VMs as
 throwaway sandboxes.
 
 ## If the tools are missing
@@ -24,13 +24,13 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 | Tool | Use |
 | --- | --- |
 | `list_vms` | VMs (state, size, checkpoints) and the available images with OS versions. Start here. |
-| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New VM (`ubuntu` or `windows`, optionally a version such as `22.04`); returns when the desktop is ready. `offline: true` cuts it off from the internet and this Mac |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New VM (`ubuntu`, `windows` or `arch`, optionally a version such as `22.04`); returns when the desktop is ready. `offline: true` cuts it off from the internet and this Mac |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down |
 | `reset_vm(name)` | Discard all changes: back to a clean install |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save the VM's disk and memory; go back to that state in seconds; or drop one checkpoint |
 | `delete_vm(name)` | Delete a VM with its disk and checkpoints |
 | `take_screenshot(name, save_to?)` | PNG screenshot; works even while booting or hung. `save_to` also writes it to a Mac path |
-| `run_command(name, command, timeout?, background?)` | Shell command: PowerShell on Windows, bash on Ubuntu. Returns `exit code: N` plus stdout and stderr, each trimmed to its first and last 10,000 characters. Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` (servers, long jobs) returns a job id to poll with `get_job_status` |
+| `run_command(name, command, timeout?, background?)` | Shell command: PowerShell on Windows, bash on Ubuntu and Arch. Returns `exit code: N` plus stdout and stderr, each trimmed to its first and last 10,000 characters. Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` (servers, long jobs) returns a job id to poll with `get_job_status` |
 | `get_job_status(name, id, tail_lines?)` | Background job's state (running, or exited with its code) plus its log tail |
 | `upload_file` / `download_file` | Copy files or folders between this Mac and a VM |
 | `forward_port(name, guest_port, host_port?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). SSH tunnel: reaches a server on the guest's own `127.0.0.1`; lasts until the VM stops |
@@ -105,6 +105,15 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   (the reply then says so): run `browser_prepare` again. `launch_app` with `urls` returns no
   pid; don't use the legacy `page` tool.
 
+## Arch (Arch Linux ARM: like Ubuntu, with pacman and Chromium)
+
+- Arch Linux ARM is a community port of Arch. The desktop, `run_command` and desktop tools
+  work as on Ubuntu.
+- The browser is Chromium: use `name: "chromium"` wherever Ubuntu uses `"google-chrome"`;
+  the browser tools work the same.
+- Install packages with `sudo pacman -Syu --noconfirm <pkg>`: Arch doesn't support partial
+  upgrades, and an image's package lists age.
+
 ## Guest tips
 
 - **Reaching the Mac / other VMs.** From a guest, `10.0.2.2` is the Mac host (a Mac dev server
@@ -125,7 +134,7 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   CLIs) run through Windows' built-in Prism emulation, roughly 2–4× slower than native. x64
   drivers, kernel-mode software and anti-cheat don't. Prefer an ARM64 build when one exists.
 - **Proxy / corporate CA.** The guest inherits no Mac proxy; set `HTTP(S)_PROXY` inside it and
-  import a corporate root with `Import-Certificate` (Windows) or `update-ca-certificates` (Ubuntu).
+  import a corporate root with `Import-Certificate` (Windows) or `update-ca-certificates` (Ubuntu) or `trust anchor` (Arch).
   Mac VPNs apply automatically (the VM's NAT rides the Mac's network).
 - **No GPU acceleration** (2D virtio GPU: WebGL is software or off), **no audio device**, fixed
   1280x800.
@@ -141,9 +150,11 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   cold (~25 s Windows, ~15 s Ubuntu) instead of resuming in seconds.
 - Output that needs more than 10,000 characters from each end: write it to a file in the VM
   and `download_file` it.
-- Don't create VMs you won't use. Each running VM uses 4 GB (Ubuntu) or 8 GB (Windows) of RAM.
+- Don't create VMs you won't use. Each running VM uses 4 GB (Ubuntu, Arch) or 8 GB (Windows) of RAM.
 - The first `create_vm ubuntu` downloads the Ubuntu image (~1.2 GB). Another Ubuntu release
   (`version: "22.04"`, `"26.04"`, ...) is fetched or built the same way (~3 min).
+- `create_vm arch` (rolling release; no version needed) pulls the Arch image on first use, or
+  builds it locally (~6 min) if none is published.
 - **x86_64 Linux programs** need `create_vm(os: "ubuntu", version: "x86apps")`: FEX translates
   them to arm64, about 2x slower (JIT runtimes like Node ~6x); run them directly (`./tool`).
   Go programs work (the image sets `GODEBUG=asyncpreemptoff=1` for them). A missing x86

@@ -7,6 +7,7 @@ Run after changing an image, a guest script or the desktop driver:
     scripts/smoke.py --bin target/release/agentpc            # ubuntu and windows
     scripts/smoke.py --bin target/release/agentpc --os ubuntu
     scripts/smoke.py --bin target/release/agentpc --os x86apps  # ubuntu-x86apps (not a default)
+    scripts/smoke.py --bin target/release/agentpc --os arch     # Arch Linux ARM (not a default)
 
 Each OS gets its own throwaway VM (deleted afterwards). Checks that the guest isn't blocked
 by first-run dialogs, that the desktop tools read and type, and that the gateway explains
@@ -145,17 +146,26 @@ def gateway_checks(m, vm, r):
 
 
 def ubuntu(m, vm, r):
+    linux(m, vm, r, "google-chrome", "Chrome")
+
+
+def arch(m, vm, r):
+    """Arch Linux ARM has no Google Chrome build; its browser is Chromium."""
+    linux(m, vm, r, "chromium", "Chromium")
+
+
+def linux(m, vm, r, browser, label):
     ok, out = m.tool("run_command", name=vm, command="uname -sm")
     r.check("run_command runs bash", ok and "Linux" in out, out[:200])
     gateway_checks(m, vm, r)
 
-    # Reading a page: Chrome must open straight to it (no Terms of Service dialog) and
-    # expose its content to the accessibility tree.
+    # Reading a page: the browser must open straight to it (no first-run or Terms of
+    # Service dialog) and expose its content to the accessibility tree.
     ok, app = m.desktop(
-        vm, "launch_app", name="google-chrome", additional_arguments=["https://example.com"]
+        vm, "launch_app", name=browser, additional_arguments=["https://example.com"]
     )
     pid = app.get("pid") if isinstance(app, dict) else None
-    r.check("launch_app starts Chrome", ok and pid, str(app)[:200])
+    r.check(f"launch_app starts {label}", ok and pid, str(app)[:200])
     if not pid:
         return
 
@@ -168,11 +178,11 @@ def ubuntu(m, vm, r):
     _, all_windows = m.desktop(vm, "list_windows")
     titles = [w.get("title", "") for w in all_windows.get("windows", [])] if isinstance(all_windows, dict) else []
     r.check(
-        "no Chrome first-run dialog",
+        f"no {label} first-run dialog",
         not any("Terms of Service" in t for t in titles),
         str(titles),
     )
-    r.check("Chrome shows the page", win is not None, str(titles))
+    r.check(f"{label} shows the page", win is not None, str(titles))
     if win:
         def page_text():
             _, s = m.desktop(
@@ -354,7 +364,7 @@ def windows(m, vm, r):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--bin", default="agentpc", help="agentpc binary to test")
-    ap.add_argument("--os", default="ubuntu,windows", help="comma-separated: ubuntu,windows,x86apps")
+    ap.add_argument("--os", default="ubuntu,windows", help="comma-separated: ubuntu,windows,x86apps,arch")
     a = ap.parse_args()
 
     failed = 0
@@ -370,7 +380,9 @@ def main():
             else:
                 ok, out = m.tool("create_vm", os=os_name, name=vm)
             if r.check("create_vm", ok, out[:300]):
-                {"ubuntu": ubuntu, "windows": windows, "x86apps": x86apps}[os_name](m, vm, r)
+                {"ubuntu": ubuntu, "windows": windows, "x86apps": x86apps, "arch": arch}[os_name](
+                    m, vm, r
+                )
         except Exception as e:  # report and keep going to cleanup
             r.check("no unexpected error", False, repr(e)[:300])
         finally:

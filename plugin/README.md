@@ -1,6 +1,6 @@
 # agentpc plugin for Claude
 
-Gives Claude instant, resettable Windows and Ubuntu desktops on your Mac. Claude can create a VM
+Gives Claude instant, resettable Windows, Ubuntu and Arch Linux desktops on your Mac. Claude can create a VM
 in seconds, click, type, take screenshots and run commands in it, then reset it to a
 clean install.
 
@@ -34,7 +34,8 @@ The first Ubuntu VM downloads the Ubuntu image (~1.2 GB). Windows images can't b
 redistributed, so build yours once with `agentpc image build windows`, which downloads the
 official ISO from Microsoft. Other versions work side by side, e.g. `ubuntu-22.04` or
 `windows-11-23h2`. For x86_64 Linux programs and amd64 containers, use `ubuntu-x86apps`
-(translated by FEX); on Windows, x64 apps run through Prism.
+(translated by FEX); on Windows, x64 apps run through Prism. `arch` is Arch Linux ARM with
+Chromium and pacman, pulled or built locally (~6 min) on first use.
 
 ## More
 

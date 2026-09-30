@@ -1,6 +1,6 @@
 # agentpc — instructions for coding agents
 
-This repo runs instant, resettable Windows and Ubuntu desktop VMs on an Apple Silicon Mac and
+This repo runs instant, resettable Windows, Ubuntu and Arch Linux desktop VMs on an Apple Silicon Mac and
 exposes them to you through one MCP server, `agentpc` (`agentpc mcp`). It is
 preconfigured for Claude Code (`.mcp.json`), Codex (`.codex/config.toml`), Gemini CLI
 (`.gemini/settings.json`), Cursor (`.cursor/mcp.json`) and VS Code (`.vscode/mcp.json`),
@@ -12,11 +12,11 @@ can run `agentpc mcp-install` (or install first: see README.md).
 | Tool | Use |
 | --- | --- |
 | `list_vms` | VMs (owner, state, size, checkpoints, viewer) and the images (with OS version) they come from. Start here. |
-| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New clone: ubuntu ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready; retrying in the same session returns the VM it already made. `memory_gb` 2–64, `cpus` 1–16. `offline` cuts off the internet. |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New clone: ubuntu/arch ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready; retrying in the same session returns the VM it already made. `memory_gb` 2–64, `cpus` 1–16. `offline` cuts off the internet. |
 | `start_vm` / `stop_vm` / `reset_vm` / `delete_vm` | Lifecycle. `reset_vm` = back to a clean install. |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save disk + memory before a risky step; restore in seconds; or drop one checkpoint. |
 | `take_screenshot(name, save_to?)` | Hypervisor screenshot; works even while booting or hung. `save_to` also writes the PNG to a Mac path. |
-| `run_command(name, command, timeout?, background?)` | Shell over SSH: PowerShell on windows, bash on ubuntu. Returns exit code, stdout, stderr (long output trimmed). Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id you poll with `get_job_status`. |
+| `run_command(name, command, timeout?, background?)` | Shell over SSH: PowerShell on windows, bash on ubuntu and arch. Returns exit code, stdout, stderr (long output trimmed). Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id you poll with `get_job_status`. |
 | `get_job_status(name, id, tail_lines?)` | State of a background job (running, or exited with its code) plus its log tail. |
 | `upload_file` / `download_file` | Copy files or folders between the Mac and a VM. |
 | `forward_port(name, guest_port, host_port?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). SSH tunnel: reaches a server on the guest's own `127.0.0.1`; lasts until the VM stops. |
@@ -39,6 +39,11 @@ tools need `"delivery_mode": "foreground"`. `launch_app` takes a command name su
 `xfce4-terminal`. Google Chrome is installed: `launch_app` `google-chrome` with the URL in
 `additional_arguments`, then `get_window_state`, reads a page; the `browser_*` tools drive one
 (the MCP server's instructions and the plugin skill give the call sequence).
+
+**Arch** (Arch Linux ARM, a community port of Arch; same XFCE desktop and tools as Ubuntu):
+the browser is Chromium, so `launch_app` `chromium` where Ubuntu uses `google-chrome`.
+Install packages with `sudo pacman -Syu --noconfirm <pkg>` (Arch doesn't support partial
+upgrades, and an image's package lists age).
 
 `list_desktop_tools` shows each tool's required arguments, and a call with wrong arguments returns
 the tool's argument list. If `get_window_state` comes back "degraded" with no elements, act by
@@ -70,15 +75,17 @@ Rules:
   instead of repairing a broken one. Don't reset, stop, restore or delete a VM you didn't
   create unless the user asks.
 - Don't create instances you won't use, and `delete_vm` your instances when done.
-  Each running VM takes 4 GB (ubuntu) or 8 GB (windows) of RAM.
+  Each running VM takes 4 GB (ubuntu, arch) or 8 GB (windows) of RAM.
 - `create_vm ubuntu` downloads the Ubuntu image on first use (~1.2 GB); pass `version`
   (e.g. "22.04") for another release, or `version: "x86apps"` for Ubuntu that also runs
-  x86_64 Linux programs (through FEX; ~2x slower; built locally on first use, ~8 min). A Windows image must be built by the user once:
+  x86_64 Linux programs (through FEX; ~2x slower; built locally on first use, ~8 min).
+  `create_vm arch` (`arch-rolling`, the only version) pulls the Arch image on first use, or
+  builds it locally (~6 min) if none is published. A Windows image must be built by the user once:
   `agentpc image build windows` (downloads the ISO; ~12 min), or another version
   (`windows-11-24h2`, `windows-11-23h2`; `agentpc image build --help` lists them).
   If `list_vms` shows no windows image, ask the user to run that. Don't start a build
   yourself unless asked.
-- The login for both guests is `agent` / `agent`. Everything binds to 127.0.0.1.
+- The login for every guest is `agent` / `agent`. Everything binds to 127.0.0.1.
 - VMs you create or start over MCP are stopped (never deleted) when the session ends, unless
   `AGENTPC_KEEP_RUNNING=1`.
 
@@ -94,8 +101,11 @@ Rules:
 - Guest assets in `guests/` are embedded in the binary. A Windows build writes them to a
   FAT `setup.img`: `Autounattend.xml` drives Setup, `SetupComplete.cmd` runs after it, and
   `oem/setup.ps1` runs at first logon; `guests/ubuntu/user-data` is the Ubuntu cloud-init.
+  An Arch build runs `guests/arch/build.sh` in a clone of the Ubuntu image, installing Arch
+  Linux ARM onto a blank second disk (`/dev/vdb`) that becomes the image.
   `guests/<os>/prepare.*` runs in the guest every time a snapshot is captured (agent defaults:
-  no pop-ups or updates, Chrome on Ubuntu), so it also upgrades existing and pulled images.
+  no pop-ups or updates, Chrome on Ubuntu, Chromium flags on Arch), so it also upgrades
+  existing and pulled images.
   On `ubuntu-<release>-x86apps` images, `guests/ubuntu/x86apps.sh` runs first: FEX (version
   pinned there) built static-pie from source with `guests/ubuntu/fex.patch` (so x86 containers
   work; bumping the pin may need the patch rebased), its x86 root filesystem,

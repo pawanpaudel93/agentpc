@@ -6,7 +6,7 @@
 ![Platform: macOS on Apple Silicon](https://img.shields.io/badge/platform-macOS%20%7C%20Apple%20Silicon-lightgrey)
 ![MCP server](https://img.shields.io/badge/MCP-server-8A2BE2)
 
-**Instant, resettable Windows and Ubuntu desktops for AI agents, on your Mac.**
+**Instant, resettable Windows, Ubuntu and Arch Linux desktops for AI agents, on your Mac.**
 
 Website: <https://agentpc.pawanpaudel.com.np>
 
@@ -35,18 +35,19 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 ## Features
 
 - **Instant VMs.** New VMs resume from a saved snapshot of a running desktop: ready in
-  ~1 s (Ubuntu) or ~4 s (Windows). `reset` returns a VM to a clean state just as fast.
+  ~1 s (Ubuntu, Arch) or ~4 s (Windows). `reset` returns a VM to a clean state just as fast.
 - **Checkpoints.** Save a running VM (disk and memory) before a risky step and return to that
   exact state in seconds.
-- **Real desktops.** Windows 11 (ARM) and Ubuntu 24.04 or another release (XFCE), each with a
-  desktop-control server agents can drive: [cua-driver](https://github.com/trycua/cua) on both.
+- **Real desktops.** Windows 11 (ARM), Ubuntu 24.04 or another release (XFCE), and Arch Linux
+  ARM (XFCE), each with a desktop-control server agents can drive:
+  [cua-driver](https://github.com/trycua/cua) on all of them.
 - **One MCP server for everything.** Agents create, drive, screenshot and delete VMs
   themselves. Works with any MCP client; `agentpc mcp-install` sets up the popular ones.
 - **Shell and screen access.** Run PowerShell or bash over SSH; take PNG screenshots straight
   from the hypervisor in ~40 ms, even while a guest is booting or hung.
 - **Files and ports.** Copy files and folders between your Mac and a VM, and reach servers
   running inside a VM from your Mac.
-- **Agent-ready guests.** 1280x800 desktops with a browser (Edge on Windows, Chrome on Ubuntu)
+- **Agent-ready guests.** 1280x800 desktops with a browser (Edge on Windows, Chrome on Ubuntu, Chromium on Arch)
   and the pop-ups, update restarts and background jobs that interrupt unattended work turned off.
 - **Watch along.** Every VM has a browser viewer, so you can see what the agent is doing.
 - **Any version, side by side.** Run Ubuntu 22.04, 24.04 and 26.04, or several Windows 11
@@ -60,8 +61,8 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 | Hardware | Apple Silicon Mac (M1 or later; tested on M4) |
 | OS | A macOS version QEMU supports: the current one and, for up to two years, the previous one (tested on macOS 15) |
 | Runtime | [QEMU](https://www.qemu.org) from Homebrew (the installer handles it, installing Homebrew too if needed) |
-| Memory | 4 GB per running Ubuntu VM, 8 GB per running Windows VM |
-| Disk | ~10 GB per Ubuntu image, ~30 GB per Windows image (each including its snapshot) |
+| Memory | 4 GB per running Ubuntu or Arch VM, 8 GB per running Windows VM |
+| Disk | ~10 GB per Ubuntu or Arch image, ~30 GB per Windows image (each including its snapshot) |
 
 ## Installation
 
@@ -95,6 +96,12 @@ To build from source instead, see [Development](#development).
 
 ```sh
 agentpc create ubuntu        # first run: downloads (~1.2 GB) and prepares the image; then ~1 s per VM
+```
+
+**Arch Linux ARM:**
+
+```sh
+agentpc create arch          # first run: pulls the image, or builds it (~6 min); then ~1 s per VM
 ```
 
 **Windows:** Microsoft's license doesn't allow redistributing Windows images, so each Mac
@@ -167,7 +174,7 @@ pick the server up automatically.
 | `delete_checkpoint` | Delete one checkpoint by label; the VM is untouched |
 | `delete_vm` | Delete a VM with its disk and checkpoints |
 | `take_screenshot` | PNG screenshot from the hypervisor; `save_to` also writes it to a path on your Mac |
-| `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu); returns exit code, stdout and stderr. A foreground run is killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id for `get_job_status` |
+| `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu and Arch); returns exit code, stdout and stderr. A foreground run is killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id for `get_job_status` |
 | `get_job_status` | Check a background job by its id: still running or exited (with its code), plus the tail of its log |
 | `upload_file` / `download_file` | Copy files or folders between your Mac and a VM |
 | `forward_port` | Reach a server running in a VM from your Mac (SSH tunnel; works even for servers bound to the guest's own `127.0.0.1`) |
@@ -198,6 +205,7 @@ files on your Mac. The VMs themselves are throwaway: `reset_vm` undoes anything 
 | --- | --- | --- |
 | Windows | Windows 11 (ARM64), 1280x800, Edge | [cua-driver](https://github.com/trycua/cua) (over SSH) |
 | Ubuntu | Ubuntu 24.04 or another release, XFCE on X11, 1280x800, Google Chrome | [cua-driver](https://github.com/trycua/cua) (over SSH) |
+| Arch | Arch Linux ARM (rolling), XFCE on X11, 1280x800, Chromium; `sudo pacman -Syu --noconfirm <pkg>` | [cua-driver](https://github.com/trycua/cua) (over SSH) |
 
 [AGENTS.md](AGENTS.md) has usage tips for agents.
 
@@ -211,7 +219,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 
 | Command | Description |
 | --- | --- |
-| `agentpc create <image> [name] [--memory GB] [--cpus N] [--offline]` | Create a VM from `ubuntu`, `windows` or a version such as `ubuntu-22.04`; fetches Ubuntu images if missing. `--memory` is 2–64 GB, `--cpus` 1–16; a non-default size boots cold instead of resuming. `--offline`: no internet or access to this Mac |
+| `agentpc create <image> [name] [--memory GB] [--cpus N] [--offline]` | Create a VM from `ubuntu`, `windows`, `arch` or a version such as `ubuntu-22.04`; fetches Ubuntu and Arch images if missing. `--memory` is 2–64 GB, `--cpus` 1–16; a non-default size boots cold instead of resuming. `--offline`: no internet or access to this Mac |
 | `agentpc list [--json]` (`ls`) | VMs and images; `--json` gives the same data as the MCP `list_vms` tool |
 | `agentpc info <name>` | Viewer URL (with the VNC password), SSH and VNC details, and checkpoints |
 | `agentpc start <name>… \| --all` | Boot stopped VMs |
@@ -229,13 +237,13 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 
 | Command | Description |
 | --- | --- |
-| `agentpc image pull <image>` | Download a published Ubuntu image, e.g. `ubuntu` or `ubuntu-22.04` |
-| `agentpc image build <image> [--iso <path>]` | Build an image locally (Ubuntu ~3 min, Windows ~12 min + ISO download) |
+| `agentpc image pull <image>` | Download a published image, e.g. `ubuntu`, `ubuntu-22.04` or `arch` |
+| `agentpc image build <image> [--iso <path>]` | Build an image locally (Ubuntu ~3 min, Arch ~6 min, Windows ~12 min + ISO download) |
 | `agentpc image ls` (`list`) | List local images with their OS versions |
 | `agentpc image info <image>` | Version, source, build date and desktop server of an image |
 | `agentpc image rm <image>…` (`delete`) | Delete local images |
 | `agentpc image snapshot <image>` | Recapture the snapshot VMs resume from (build and pull do this) |
-| `agentpc image push <image>` | Maintainers: publish an Ubuntu image to ghcr.io |
+| `agentpc image push <image>` | Maintainers: publish an Ubuntu or Arch image to ghcr.io |
 
 ### Setup
 
@@ -256,8 +264,8 @@ An **image** is a read-only disk with the OS, desktop and agent tools installed.
 copy-on-write clone of an image, so a VM starts from a clean install and costs only a few MB.
 
 Images are named `<os>-<version>`, and several can be installed side by side; each VM
-remembers which one it came from. A bare `ubuntu` means `ubuntu-24.04`, and a bare `windows`
-(or `windows-11`) means `windows-11-25h2`. To save a 12-minute build, `create` and
+remembers which one it came from. A bare `ubuntu` means `ubuntu-24.04`, a bare `arch` means
+`arch-rolling`, and a bare `windows` (or `windows-11`) means `windows-11-25h2`. To save a 12-minute build, `create` and
 `image info` fall back to your newest installed Windows 11 image if 25H2 isn't built. Pin the
 full name when the release matters, e.g. in test harnesses.
 
@@ -266,6 +274,7 @@ full name when the release matters, e.g. in test harnesses.
 | `ubuntu` = `ubuntu-24.04` | Official Ubuntu 24.04 cloud image | `image pull` (automatic on first `create`) or `image build` |
 | `ubuntu-<release>` | Any release in [cloud-images.ubuntu.com/releases](https://cloud-images.ubuntu.com/releases/), e.g. `22.04`, `26.04` | `image build ubuntu-22.04`, or `image pull` if published |
 | `ubuntu-x86apps` = `ubuntu-24.04-x86apps` | Ubuntu 24.04 that also runs x86_64 Linux programs (see [x86_64 Linux programs](#x86_64-linux-programs)) | Built on first `create` (~8 min), or `image build ubuntu-x86apps` |
+| `arch` = `arch-rolling` | [Arch Linux ARM](https://archlinuxarm.org) (a community port of Arch), installed from its aarch64 tarball in an Ubuntu helper VM | `image pull` once published, else built on first `create` (~6 min), or `image build arch` |
 | `windows-11-25h2` (`windows`) | Windows 11 25H2 (Home/Pro), 7.3 GB ISO from Microsoft | `image build windows` |
 | `windows-11-24h2`, `windows-11-23h2` | Earlier Windows 11 releases (Home/Pro) | `image build windows-11-23h2` |
 | `windows-<name>` | Your own Windows 11 ARM64 Home/Pro ISO | `image build windows-<name> --iso <path>` |
@@ -311,7 +320,8 @@ Each image records what it is (`agentpc image info <image>`):
 ```
 
 Published images live in one package, `ghcr.io/pawanpaudel93/agentpc`, tagged by image
-name. Only Ubuntu is published (Windows images can't be redistributed):
+name. Ubuntu is published, and Arch will be under `arch-rolling` (also tagged `arch`); Windows
+images can't be redistributed:
 
 | Tag | Meaning | Pull with |
 | --- | --- | --- |
@@ -362,7 +372,7 @@ The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
   trusted. The guest clock follows the Mac's time zone. SSH keepalives hold long calls open, a
   desktop tool call gives up after 120 s, and a viewer that won't start no longer fails a VM
   start. The browser viewer (noVNC) is downloaded against a pinned checksum.
-- **Image distribution.** Ubuntu images are OCI artifacts on GitHub Container Registry: a
+- **Image distribution.** Ubuntu and Arch images are OCI artifacts on GitHub Container Registry: a
   compressed qcow2 split into 64 MB parts, downloaded in parallel and checksum-verified.
 - **Windows build.** agentpc writes a small setup disk next to the ISO: an unattended-install
   answer file (adapted from [dockur/windows-arm](https://github.com/dockur/windows-arm)), Red
@@ -370,9 +380,13 @@ The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
   Windows Setup then runs in QEMU with no clicks.
 - **Ubuntu build.** The official cloud image is provisioned with cloud-init: XFCE on X11,
   auto-login, and cua-driver (pinned, so tool names match these docs; telemetry off). cloud-init is then disabled so clones don't re-provision. To opt in to cua-driver's telemetry, run `cua-driver telemetry enable` in the VM.
+- **Arch build.** A clone of the Ubuntu image gets a blank second disk, and a script installs
+  the Arch Linux ARM tarball onto it: systemd-boot, XFCE on X11 with auto-login, Chromium and
+  the same pinned cua-driver. That disk becomes the image.
 - **Agent-ready guests.** Each time a snapshot is captured, a prepare script turns off what
   interrupts unattended work (Windows SmartScreen, updates, first-run and tip pop-ups; Ubuntu's
-  background apt jobs) and installs Google Chrome on Ubuntu for cua-driver's browser tools.
+  background apt jobs; Arch's pacman timers) and installs Google Chrome on Ubuntu for
+  cua-driver's browser tools (Arch's image ships Chromium).
 
 ## Troubleshooting & guest tips
 
@@ -405,7 +419,7 @@ Mac's network (a VPN or proxy configured on the Mac applies to a VM's outbound t
   ports you forward from the Mac still reach them.
 - **Corporate proxy / CA:** a guest inherits no proxy settings from the Mac. Set `HTTP_PROXY`
   and `HTTPS_PROXY` inside the guest, and import your corporate root CA with
-  `Import-Certificate` (Windows) or `update-ca-certificates` (Ubuntu).
+  `Import-Certificate` (Windows), `update-ca-certificates` (Ubuntu) or `trust anchor` (Arch).
 
 ### Guest reboots
 

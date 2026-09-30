@@ -82,8 +82,8 @@
                 <tr><td>Hardware</td><td>Apple Silicon Mac, M1 or later (tested on M4).</td></tr>
                 <tr><td>macOS</td><td>A version QEMU supports: the current one and, for up to two years, the previous one (tested on macOS 15).</td></tr>
                 <tr><td>Runtime</td><td>QEMU from Homebrew. The installer handles it, installing Homebrew too if needed.</td></tr>
-                <tr><td>Memory</td><td>4 GB per running Ubuntu VM, 8 GB per running Windows VM.</td></tr>
-                <tr><td>Disk</td><td>~10 GB per Ubuntu image, ~30 GB per Windows image, each including its snapshot.</td></tr>
+                <tr><td>Memory</td><td>4 GB per running Ubuntu or Arch VM, 8 GB per running Windows VM.</td></tr>
+                <tr><td>Disk</td><td>~10 GB per Ubuntu or Arch image, ~30 GB per Windows image, each including its snapshot.</td></tr>
               </tbody>
             </table>
           </section>
@@ -119,7 +119,8 @@
             <p>
               Every VM is a copy-on-write clone of a read-only image, so it starts from a clean
               install and costs only a few MB. A bare <code translate="no">ubuntu</code> means
-              <code translate="no">ubuntu-24.04</code>, and a bare <code translate="no">windows</code>
+              <code translate="no">ubuntu-24.04</code>, a bare <code translate="no">arch</code> means
+              <code translate="no">arch-rolling</code>, and a bare <code translate="no">windows</code>
               means <code translate="no">windows-11-25h2</code>. Pin the full name when the release
               matters, for example in test harnesses.
             </p>
@@ -139,6 +140,10 @@
                 <tr>
                   <td><code translate="no">ubuntu-x86apps</code></td>
                   <td>Ubuntu 24.04 that also runs x86_64 Linux programs, through FEX translation. Built automatically on first <code translate="no">create</code>, or <code translate="no">image build ubuntu-x86apps</code>.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">arch</code> = <code translate="no">arch-rolling</code></td>
+                  <td>Arch Linux ARM (a community port of Arch) with XFCE and Chromium; install packages with <code translate="no">sudo pacman -Syu --noconfirm &lt;pkg&gt;</code>. <code translate="no">image pull</code> once published, else built on first <code translate="no">create</code> in an Ubuntu helper VM (~6 min), or <code translate="no">image build arch</code>.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">windows-11-25h2</code></td>
@@ -187,8 +192,8 @@
               <li><strong>Instant start.</strong> After building or downloading an image, agentpc boots it once, waits until the desktop and its control server are running, and saves the VM's memory. New VMs resume from that state instead of booting: ~1 s / ~4 s instead of ~14 s / ~25 s.</li>
               <li><strong>Checkpoints.</strong> A checkpoint pauses the VM for a few seconds, writes its memory to a file and clones its disk with an APFS copy-on-write clone.</li>
               <li><strong>Snapshots stay local.</strong> A memory snapshot depends on the Mac's chip and QEMU version, so only the disk is published; the snapshot is recaptured after each pull (about a minute).</li>
-              <li><strong>Image distribution.</strong> Ubuntu images are OCI artifacts on GitHub Container Registry: a compressed qcow2 split into 64 MB parts, downloaded in parallel and checksum-verified.</li>
-              <li><strong>Agent-ready guests.</strong> Each snapshot capture turns off what interrupts unattended work (SmartScreen, updates, first-run pop-ups, Ubuntu's background apt jobs) and installs Chrome on Ubuntu.</li>
+              <li><strong>Image distribution.</strong> Ubuntu and Arch images are OCI artifacts on GitHub Container Registry: a compressed qcow2 split into 64 MB parts, downloaded in parallel and checksum-verified.</li>
+              <li><strong>Agent-ready guests.</strong> Each snapshot capture turns off what interrupts unattended work (SmartScreen, updates, first-run pop-ups, Ubuntu's background apt jobs, Arch's pacman timers) and installs Chrome on Ubuntu.</li>
             </ul>
           </section>
 

@@ -11,7 +11,7 @@
     <meta property="og:title" content="agentpc MCP" />
     <meta
       property="og:description"
-      content="One MCP server that lets agents create, drive, screenshot and reset Windows and Ubuntu VMs on a Mac."
+      content="One MCP server that lets agents create, drive, screenshot and reset Windows, Ubuntu and Arch Linux VMs on a Mac."
     />
     <meta property="og:type" content="website" />
     <meta property="og:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
@@ -161,12 +161,13 @@ tool_timeout_sec = 900</code></pre>
                 <tr>
                   <td><code translate="no">create_vm</code></td>
                   <td>
-                    New clone, returned once its desktop is ready: Ubuntu ~1 s, Windows ~4 s (the first
-                    create of an image can take minutes). Takes <code translate="no">os</code>, and optionally
+                    New clone, returned once its desktop is ready: Ubuntu or Arch ~1 s, Windows ~4 s (the first
+                    create of an image can take minutes). Takes <code translate="no">os</code>
+                    (<code translate="no">ubuntu</code>, <code translate="no">windows</code> or <code translate="no">arch</code>), and optionally
                     <code translate="no">version</code> (Ubuntu <code translate="no">"22.04"</code>, or <code translate="no">"x86apps"</code> to also run x86_64 Linux programs; Windows
                     <code translate="no">"11-25h2"</code>, <code translate="no">"11-24h2"</code>,
-                    <code translate="no">"11-23h2"</code>), <code translate="no">name</code>,
-                    <code translate="no">memory_gb</code> (2–64, default 8 Windows / 4 Ubuntu),
+                    <code translate="no">"11-23h2"</code>; Arch is rolling, so <code translate="no">"rolling"</code> only), <code translate="no">name</code>,
+                    <code translate="no">memory_gb</code> (2–64, default 8 Windows / 4 Ubuntu and Arch),
                     <code translate="no">cpus</code> (1–16, default 4) and <code translate="no">offline</code>.
                     A non-default size boots cold (~25 s / ~15 s). Retrying in the same session returns the
                     VM it already made.
@@ -217,7 +218,7 @@ tool_timeout_sec = 900</code></pre>
                 <tr>
                   <td><code translate="no">run_command</code></td>
                   <td>
-                    PowerShell on Windows, bash on Ubuntu, over SSH. Returns the exit code, stdout and
+                    PowerShell on Windows, bash on Ubuntu and Arch, over SSH. Returns the exit code, stdout and
                     stderr, each trimmed to its first and last 10,000 characters. A foreground run is
                     killed at <code translate="no">timeout</code> (default 120 s) with partial output;
                     <code translate="no">background: true</code> returns a job id.
@@ -313,6 +314,16 @@ tool_timeout_sec = 900</code></pre>
                     <code translate="no">browser_*</code> tools after <code translate="no">browser_prepare</code>.
                   </td>
                 </tr>
+                <tr>
+                  <td>Arch</td>
+                  <td>
+                    Arch Linux ARM, with the same XFCE desktop and tools as Ubuntu. The browser is Chromium:
+                    use <code translate="no">chromium</code> wherever Ubuntu uses
+                    <code translate="no">google-chrome</code>. Install packages with
+                    <code translate="no">sudo pacman -Syu --noconfirm &lt;pkg&gt;</code> (Arch doesn't support
+                    partial upgrades).
+                  </td>
+                </tr>
               </tbody>
             </table>
             <p>Open Notepad on Windows and type into it, as three <code translate="no">use_desktop_tool</code> calls. The <code translate="no">pid</code> and <code translate="no">window_id</code> come from <code translate="no">launch_app</code>; the <code translate="no">snapshot_id</code> and <code translate="no">element_index</code> from <code translate="no">get_window_state</code>:</p>
@@ -369,7 +380,7 @@ forward_port    { "name": "ubuntu-1", "guest_port": 3000 }  <span class="comment
             <ul>
               <li>VMs a session created or started are <strong>stopped, never deleted</strong>, when the session ends. Set <code translate="no">AGENTPC_KEEP_RUNNING=1</code> to keep them running.</li>
               <li><code translate="no">list_vms</code> shows each VM's owner. Agents should create their own uniquely named VM per task, and never reset, restore or delete one they didn't create.</li>
-              <li>Each running VM takes 4 GB (Ubuntu) or 8 GB (Windows) of RAM, so delete VMs when done.</li>
+              <li>Each running VM takes 4 GB (Ubuntu, Arch) or 8 GB (Windows) of RAM, so delete VMs when done.</li>
               <li>The guest login is <code translate="no">agent</code> / <code translate="no">agent</code>.</li>
             </ul>
           </section>

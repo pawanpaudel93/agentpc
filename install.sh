@@ -163,6 +163,7 @@ Next steps:
   agentpc image build windows   # once, ~12 min + 7.3 GB download
   Other versions (ubuntu-22.04, windows-11-23h2, ...): agentpc image build --help
   x86_64 Linux programs and amd64 containers: agentpc create ubuntu-x86apps
+  Arch Linux ARM (Chromium, pacman): agentpc create arch
 
 Remove it again with: agentpc uninstall
 Docs: https://github.com/$REPO

@@ -6,12 +6,12 @@
     <title>agentpc CLI</title>
     <meta
       name="description"
-      content="agentpc CLI reference: create, checkpoint, reset and control Windows and Ubuntu desktop VMs from your Mac's terminal."
+      content="agentpc CLI reference: create, checkpoint, reset and control Windows, Ubuntu and Arch Linux desktop VMs from your Mac's terminal."
     />
     <meta property="og:title" content="agentpc CLI" />
     <meta
       property="og:description"
-      content="Create, checkpoint, reset and control Windows and Ubuntu VMs from your terminal."
+      content="Create, checkpoint, reset and control Windows, Ubuntu and Arch Linux VMs from your terminal."
     />
     <meta property="og:type" content="website" />
     <meta property="og:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
@@ -103,10 +103,11 @@
                 <tr>
                   <td><code translate="no">agentpc create &lt;image&gt; [name]</code></td>
                   <td>
-                    Create a VM from <code translate="no">ubuntu</code>, <code translate="no">windows</code> or a
+                    Create a VM from <code translate="no">ubuntu</code>, <code translate="no">windows</code>,
+                    <code translate="no">arch</code> or a
                     version such as <code translate="no">ubuntu-22.04</code>, or <code translate="no">ubuntu-x86apps</code> for x86_64
-                    Linux programs; fetches Ubuntu images if missing.
-                    <code translate="no">--memory</code> 2–64 GB (default 8 Windows, 4 Ubuntu) and
+                    Linux programs; fetches Ubuntu and Arch images if missing.
+                    <code translate="no">--memory</code> 2–64 GB (default 8 Windows, 4 Ubuntu and Arch) and
                     <code translate="no">--cpus</code> 1–16 (default 4); a non-default size boots cold instead of
                     resuming. <code translate="no">--offline</code>: no internet and no access to this Mac (SSH,
                     the viewer and forwarded ports still work). The default name is
@@ -180,7 +181,7 @@
               <tbody>
                 <tr>
                   <td><code translate="no">agentpc ssh &lt;name&gt; [command]</code></td>
-                  <td>Run a command (PowerShell on Windows, bash on Ubuntu), or open an interactive shell with no command.</td>
+                  <td>Run a command (PowerShell on Windows, bash on Ubuntu and Arch), or open an interactive shell with no command.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc screenshot &lt;name&gt; [file]</code></td>
@@ -212,11 +213,11 @@
               <tbody>
                 <tr>
                   <td><code translate="no">agentpc image pull &lt;image&gt;</code></td>
-                  <td>Download a published image, e.g. <code translate="no">ubuntu</code> or <code translate="no">ubuntu-22.04</code>. Ubuntu only; Windows can't be redistributed.</td>
+                  <td>Download a published image, e.g. <code translate="no">ubuntu</code>, <code translate="no">ubuntu-22.04</code> or <code translate="no">arch</code>. Windows can't be redistributed.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc image build &lt;image&gt; [--iso &lt;path&gt;]</code></td>
-                  <td>Build an image locally: Ubuntu ~3 min, Windows ~12 min plus the ISO download.</td>
+                  <td>Build an image locally: Ubuntu ~3 min, Arch ~6 min (in an Ubuntu helper VM), Windows ~12 min plus the ISO download.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc image ls</code></td>
