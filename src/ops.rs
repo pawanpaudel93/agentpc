@@ -387,12 +387,13 @@ pub fn run(cmd: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// How FEX gets x86's memory ordering in an x86apps VM: from the CPU, or by emulating it.
-fn x86_memory_ordering(inst: &Instance) -> &'static str {
+/// How FEX gets x86's memory ordering (TSO) in an x86apps VM: "hardware" when every vCPU
+/// runs in TSO mode, else "emulated".
+fn x86_tso(inst: &Instance) -> &'static str {
     if qemu::hardware_tso(inst) {
-        "hardware (TSO)"
+        "hardware"
     } else {
-        "emulated (slower; hardware TSO needs macOS 15+)"
+        "emulated"
     }
 }
 
@@ -404,10 +405,11 @@ pub fn info(inst: &Instance) -> String {
         format!("\n  checkpoints: {}", cps.join(", "))
     };
     let x86 = if inst.image.x86_apps() {
-        format!(
-            "\n  x86 programs: FEX, memory ordering {}",
-            x86_memory_ordering(inst)
-        )
+        match x86_tso(inst) {
+            "hardware" => "\n  x86 programs: FEX, hardware TSO".to_string(),
+            _ => "\n  x86 programs: FEX, emulated TSO (slower; hardware TSO needs macOS 15+)"
+                .to_string(),
+        }
     } else {
         String::new()
     };
@@ -554,11 +556,7 @@ fn boot_from(inst: &Instance, state: Option<&Path>) -> Result<String> {
 /// so it stops emulating x86 memory ordering only when that's safe. Every boot, since a
 /// snapshot or checkpoint may come from a run in the other mode.
 fn set_fex_memory_model(inst: &Instance) {
-    let mode = if qemu::hardware_tso(inst) {
-        "hardware"
-    } else {
-        "emulate"
-    };
+    let mode = x86_tso(inst);
     match ssh(
         inst,
         &format!("sudo /usr/local/sbin/agentpc-fex-tso {mode}"),
@@ -855,7 +853,7 @@ pub fn list_json() -> Result<String> {
             if running {
                 obj["viewer"] = json!(viewer::url(i));
                 if i.image.x86_apps() {
-                    obj["x86_memory_ordering"] = json!(x86_memory_ordering(i));
+                    obj["x86_tso"] = json!(x86_tso(i));
                 }
             }
             obj

@@ -254,6 +254,11 @@ def x86apps(m, vm, r):
     # needn't emulate x86 memory ordering.
     ok, out = sh("FEXGetConfig --tso-emulation-info | grep 'TSO Emulation:'")
     r.check("hardware TSO: FEX doesn't emulate memory ordering", ok and "Disabled" in out, out[-300:])
+    ok, listing = m.tool("list_vms")
+    vm_entry = next(
+        (i for i in json.loads(listing).get("instances", []) if i.get("name") == vm), {}
+    ) if ok else {}
+    r.check("list_vms reports x86_tso", vm_entry.get("x86_tso") == "hardware", str(vm_entry)[:300])
 
     # x86 containers run through the image's static FEX.
     ok, out = sh(

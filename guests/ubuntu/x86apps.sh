@@ -12,7 +12,7 @@ export DEBIAN_FRONTEND=noninteractive
 # atomics, RCpc loads), which every Apple Silicon chip has; the default would tune for the
 # build machine's CPU and could crash on an older one. Bump deliberately.
 fex_version=2609.1
-if [ "$(cat /usr/share/fex-emu/agentpc-build 2>/dev/null)" != "$fex_version" ]; then
+if [ "$(cat /var/lib/agentpc/fex-version 2>/dev/null)" != "$fex_version" ]; then
     # Images from before the pin had FEX from its PPA.
     if dpkg -s fex-emu-armv8.4 >/dev/null 2>&1; then
         dpkg-divert --quiet --local --rename --remove /usr/bin/FEX 2>/dev/null || true
@@ -35,7 +35,8 @@ if [ "$(cat /usr/share/fex-emu/agentpc-build 2>/dev/null)" != "$fex_version" ]; 
     ninja -C "$src/build" install >/dev/null
     rm -rf "$src"
     apt-get purge -y -q --autoremove $build_deps >/dev/null
-    echo "$fex_version" > /usr/share/fex-emu/agentpc-build
+    mkdir -p /var/lib/agentpc
+    echo "$fex_version" > /var/lib/agentpc/fex-version
     # binfmt_misc's F flag holds the interpreter open: re-register the new one.
     systemctl restart systemd-binfmt
 fi
@@ -63,21 +64,21 @@ rm -rf "/usr/share/fex-emu/RootFS/$name"
 # programs crash under FEX when the runtime preempts goroutines with signals; Env sets
 # GODEBUG for translated programs only. agentpc runs this helper after every boot: with
 # "hardware" when QEMU put every vCPU in TSO mode, so FEX can stop emulating x86 memory
-# ordering (up to ~40% faster), else "emulate". The image keeps "emulate", which is always safe.
+# ordering (up to ~40% faster), else "emulated". The image keeps "emulated", which is always safe.
 cat > /usr/local/sbin/agentpc-fex-tso <<EOF
 #!/bin/sh
 set -eu
 case "\${1:-}" in
     hardware) tso=', "TSOEnabled": "0"' ;;
-    emulate) tso= ;;
-    *) echo "usage: agentpc-fex-tso hardware|emulate" >&2; exit 2 ;;
+    emulated) tso= ;;
+    *) echo "usage: agentpc-fex-tso hardware|emulated" >&2; exit 2 ;;
 esac
 printf '{"Config": {"RootFS": "%s", "DiskCache": "1", "Env": "GODEBUG=asyncpreemptoff=1"%s}}\n' \\
     "$rootfs" "\$tso" > /usr/share/fex-emu/Config.json.tmp
 mv /usr/share/fex-emu/Config.json.tmp /usr/share/fex-emu/Config.json
 EOF
 chmod 755 /usr/local/sbin/agentpc-fex-tso
-/usr/local/sbin/agentpc-fex-tso emulate
+/usr/local/sbin/agentpc-fex-tso emulated
 
 # x86 libraries a program needs beyond the RootFS: `sudo apt install libfoo:amd64` (or an
 # amd64 .deb). FEX looks in the RootFS first, then the real filesystem, so they load from
