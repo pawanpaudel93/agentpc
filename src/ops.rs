@@ -468,7 +468,8 @@ fn provision_image(image: &Image) -> Result<()> {
                 } else {
                     "download"
                 };
-                log!("{what} failed ({e:#}); building it locally instead (~3 min)");
+                let minutes = if image.x86_apps() { 8 } else { 3 };
+                log!("{what} failed ({e:#}); building it locally instead (~{minutes} min)");
                 crate::image::build_locked(image, None)?;
             }
             Ok(())
@@ -525,8 +526,34 @@ fn boot_from(inst: &Instance, state: Option<&Path>) -> Result<String> {
     let took = wait_ready(inst, Duration::from_secs(inst.os.boot_timeout()))?;
     // Set the clock (a resumed guest keeps its stale snapshot clock) and time zone.
     sync_clock(inst);
+    if inst.image.x86_apps() {
+        set_fex_memory_model(inst);
+    }
     log!("{} ready in {:.1}s", inst.name, took.as_secs_f32());
     Ok(info(inst))
+}
+
+/// Tell FEX in an x86apps guest whether this run's CPU is in TSO mode (qemu::hardware_tso),
+/// so it stops emulating x86 memory ordering only when that's safe. Every boot, since a
+/// snapshot or checkpoint may come from a run in the other mode.
+fn set_fex_memory_model(inst: &Instance) {
+    let mode = if qemu::hardware_tso(inst) {
+        "hardware"
+    } else {
+        "emulate"
+    };
+    match ssh(
+        inst,
+        &format!("sudo /usr/local/sbin/agentpc-fex-tso {mode}"),
+    ) {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => log!(
+            "{}: setting FEX's memory model failed: {}",
+            inst.name,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => log!("{}: setting FEX's memory model failed: {e:#}", inst.name),
+    }
 }
 
 fn checkpoint_dir(inst: &Instance, label: &str) -> Result<PathBuf> {

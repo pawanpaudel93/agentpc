@@ -73,7 +73,7 @@ Rules:
   Each running VM takes 4 GB (ubuntu) or 8 GB (windows) of RAM.
 - `create_vm ubuntu` downloads the Ubuntu image on first use (~1.2 GB); pass `version`
   (e.g. "22.04") for another release, or `version: "x86apps"` for Ubuntu that also runs
-  x86_64 Linux programs (through FEX; ~2x slower; built locally on first use). A Windows image must be built by the user once:
+  x86_64 Linux programs (through FEX; ~2x slower; built locally on first use, ~8 min). A Windows image must be built by the user once:
   `agentpc image build windows` (downloads the ISO; ~12 min), or another version
   (`windows-11-24h2`, `windows-11-23h2`; `agentpc image build --help` lists them).
   If `list_vms` shows no windows image, ask the user to run that. Don't start a build
@@ -96,8 +96,10 @@ Rules:
   `oem/setup.ps1` runs at first logon; `guests/ubuntu/user-data` is the Ubuntu cloud-init.
   `guests/<os>/prepare.*` runs in the guest every time a snapshot is captured (agent defaults:
   no pop-ups or updates, Chrome on Ubuntu), so it also upgrades existing and pulled images.
-  On `ubuntu-<release>-x86apps` images, `guests/ubuntu/x86apps.sh` runs first (FEX, its x86
-  root filesystem and config).
+  On `ubuntu-<release>-x86apps` images, `guests/ubuntu/x86apps.sh` runs first: FEX rebuilt
+  static-pie with `guests/ubuntu/fex.patch` (so x86 containers work), its x86 root filesystem,
+  amd64 apt sources, and `agentpc-fex-tso`. QEMU for those VMs loads `src/hvf_tso.c` (built by
+  `build.rs`) to turn on the CPU's TSO mode; after each boot `ops` tells FEX which mode it got.
   Changes take effect on the next `agentpc image build`, which refuses while VMs of that image exist.
 - Images are `<os>-<version>` (`Image` in `instance.rs`); a bare OS means its default version.
 - State (images, keys, instances) lives in `~/.agentpc` (`AGENTPC_HOME` overrides).

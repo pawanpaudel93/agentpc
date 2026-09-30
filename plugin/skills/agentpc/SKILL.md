@@ -147,10 +147,9 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 - **x86_64 Linux programs** need `create_vm(os: "ubuntu", version: "x86apps")`: FEX translates
   them to arm64, about 2x slower (JIT runtimes like Node ~6x); run them directly (`./tool`).
   Go programs work (the image sets `GODEBUG=asyncpreemptoff=1` for them). A missing x86
-  library: `sudo apt install libfoo:amd64`. x86 containers need Docker's qemu emulator
-  (`docker run --privileged --rm tonistiigi/binfmt --install amd64`), which then handles every
-  x86 program in that VM, more slowly. x86 Electron/Chromium apps (VS Code, Slack, ...) need
-  `--no-sandbox`. The first create builds the image locally.
+  library: `sudo apt install libfoo:amd64`. x86 containers work too
+  (`sudo apt install docker.io`, then `docker run --platform linux/amd64 ...`). x86 Electron/Chromium apps (VS Code, Slack, ...) need
+  `--no-sandbox`. The first create builds the image locally (~8 min).
 - Windows images can't be downloaded. If `list_vms` shows no Windows image, ask the user to
   build one once (~12 min) and don't start it yourself:
   `agentpc image build windows` (downloads the official ISO from Microsoft, 7.3 GB). Other

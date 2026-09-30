@@ -92,6 +92,44 @@ fn resume_machine(state: &Path) -> String {
 }
 
 /// Boot an instance in the background. `extra` adds install media for image builds.
+/// src/hvf_tso.c, built by build.rs: injected into QEMU for x86apps VMs, it turns on the
+/// CPU's TSO mode for every vCPU so FEX needn't emulate x86 memory ordering.
+const HVF_TSO: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hvf-tso.dylib"));
+
+/// The TSO library on disk, named by its hash so an upgrade never rewrites one a running
+/// QEMU has loaded.
+fn hvf_tso() -> Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(HVF_TSO);
+    let name = format!(
+        "hvf-tso-{:x}.dylib",
+        u32::from_be_bytes(hash[..4].try_into()?)
+    );
+    let dir = crate::instance::home().join("lib");
+    let path = dir.join(name);
+    if !path.is_file() {
+        std::fs::create_dir_all(&dir)?;
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, HVF_TSO)?;
+        std::fs::rename(&tmp, &path)?;
+    }
+    Ok(path)
+}
+
+/// Whether QEMU turned on TSO for every vCPU of this run (hvf_tso.c logs each one).
+pub fn hardware_tso(inst: &Instance) -> bool {
+    let log = std::fs::read_to_string(inst.dir.join("qemu.log")).unwrap_or_default();
+    tso_on_every_vcpu(&log, inst.size().1)
+}
+
+fn tso_on_every_vcpu(log: &str, cpus: u32) -> bool {
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.starts_with("agentpc-tso:"))
+        .collect();
+    lines.len() == cpus as usize && lines.iter().all(|l| l.ends_with("TSO on"))
+}
+
 pub fn start(inst: &Instance, extra: &[String]) -> Result<()> {
     launch(inst, extra, None, false)
 }
@@ -257,6 +295,14 @@ fn launch(
     }
     let log_file = std::fs::File::create(d.join("qemu.log"))?;
     let mut cmd = Command::new(qemu_bin()?);
+    if inst.image.x86_apps() {
+        match hvf_tso() {
+            Ok(lib) => {
+                cmd.env("DYLD_INSERT_LIBRARIES", lib);
+            }
+            Err(e) => log!("{}: no hardware TSO ({e:#})", inst.name),
+        }
+    }
     cmd.args(["-machine", &format!("{machine},highmem=on")])
         .args(["-accel", "hvf", "-cpu", "host"])
         .args(&args)
@@ -508,5 +554,27 @@ impl Qmp {
             Some(json!({"keys": [{"type": "qcode", "data": qcode}]})),
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tso_on_every_vcpu;
+
+    #[test]
+    fn hardware_tso_needs_every_vcpu() {
+        let on = |n| format!("agentpc-tso: vcpu {n} TSO on\n");
+        let four: String = (0..4).map(on).collect();
+        assert!(tso_on_every_vcpu(&four, 4));
+        assert!(tso_on_every_vcpu(&format!("qemu warning: x\n{four}"), 4));
+        // One vCPU short, or a failure, must leave FEX emulating TSO.
+        assert!(!tso_on_every_vcpu(&four, 5));
+        let failed = format!(
+            "{}agentpc-tso: vcpu 3 TSO unavailable\n",
+            (0..3).map(on).collect::<String>()
+        );
+        assert!(!tso_on_every_vcpu(&failed, 4));
+        // No library loaded (a hardened QEMU, say): no lines at all.
+        assert!(!tso_on_every_vcpu("", 4));
     }
 }

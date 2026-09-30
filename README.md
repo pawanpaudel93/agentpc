@@ -265,7 +265,7 @@ full name when the release matters, e.g. in test harnesses.
 | --- | --- | --- |
 | `ubuntu` = `ubuntu-24.04` | Official Ubuntu 24.04 cloud image | `image pull` (automatic on first `create`) or `image build` |
 | `ubuntu-<release>` | Any release in [cloud-images.ubuntu.com/releases](https://cloud-images.ubuntu.com/releases/), e.g. `22.04`, `26.04` | `image build ubuntu-22.04`, or `image pull` if published |
-| `ubuntu-x86apps` = `ubuntu-24.04-x86apps` | Ubuntu 24.04 that also runs x86_64 Linux programs (see [x86_64 Linux programs](#x86_64-linux-programs)) | Built on first `create` (~4 min), or `image build ubuntu-x86apps` |
+| `ubuntu-x86apps` = `ubuntu-24.04-x86apps` | Ubuntu 24.04 that also runs x86_64 Linux programs (see [x86_64 Linux programs](#x86_64-linux-programs)) | Built on first `create` (~8 min), or `image build ubuntu-x86apps` |
 | `windows-11-25h2` (`windows`) | Windows 11 25H2 (Home/Pro), 7.3 GB ISO from Microsoft | `image build windows` |
 | `windows-11-24h2`, `windows-11-23h2` | Earlier Windows 11 releases (Home/Pro) | `image build windows-11-23h2` |
 | `windows-<name>` | Your own Windows 11 ARM64 Home/Pro ISO | `image build windows-<name> --iso <path>` |
@@ -448,8 +448,10 @@ The Ubuntu guest is arm64. For x86_64 (and i386) Linux programs, create a VM fro
 to arm64 as it runs; the kernel and desktop stay native. Run the program directly (`./tool`).
 
 - **Speed.** Most code runs about 2× slower than native, JIT runtimes such as Node about
-  6–7×. FEX keeps translated code in `~/.cache/fex-emu`, so a program's second start is
-  several times faster than its first.
+  6–7×. On macOS 15 or later, agentpc also switches these VMs' CPUs to TSO, x86's
+  memory ordering, so FEX needn't emulate it: multithreaded code runs up to ~40% faster, and
+  native arm64 code isn't slowed. FEX keeps translated code in `~/.cache/fex-emu`, so a
+  program's second start is several times faster than its first.
 - **Libraries.** x86 programs find the common libraries (libc, libstdc++, GTK, ...) in an x86
   Ubuntu tree the image ships. For anything else, install the amd64 package:
   `sudo apt install libfoo:amd64` (the image has amd64 package sources set up), or an amd64
@@ -460,11 +462,8 @@ to arm64 as it runs; the kernel and desktop stay native. Run the program directl
 - **x86 Electron and Chromium apps** (VS Code, Slack, Chrome, ...) abort at launch with a
   `zygote_host` error: FEX can't create the namespaces Chromium's sandbox uses. Launch them
   with `--no-sandbox` (e.g. `code --no-sandbox`).
-- **x86 containers** (`docker run --platform linux/amd64`) don't run under FEX, which can't
-  work inside a container. Docker's own emulator can take over instead:
-  `docker run --privileged --rm tonistiigi/binfmt --install amd64`. Until you undo it with
-  `--uninstall qemu-x86_64`, every x86 program in that VM goes through qemu: containers work,
-  but other x86 programs run about 2× slower and can't use the image's x86 libraries.
+- **x86 containers** work: install Docker or Podman and run
+  `docker run --platform linux/amd64 <image>`. FEX runs them from the image's own x86 files.
 - **Not covered:** x86 kernel modules and drivers. It's translation, not an x86 machine.
 
 ### Hardware limits

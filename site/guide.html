@@ -292,12 +292,12 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
               (<code translate="no">create_vm</code> with <code translate="no">version: "x86apps"</code>) and x86_64
               programs run through <a href="https://fex-emu.com">FEX</a>, which translates each one to arm64:
               about 2× slower, JIT runtimes such as Node 6–7×, and much faster from the second start on
-              thanks to FEX's code cache. Go programs work (the image sets
+              thanks to FEX's code cache. On macOS 15 or later the VM's CPUs also run in TSO mode, x86's memory
+              ordering, which makes multithreaded x86 code up to ~40% faster. Go programs work (the image sets
               <code translate="no">GODEBUG=asyncpreemptoff=1</code> for them). x86 Electron and Chromium apps need
               <code translate="no">--no-sandbox</code>. A missing x86 library installs with
-              <code translate="no">sudo apt install libfoo:amd64</code>. x86 containers need Docker's qemu emulator
-              (<code translate="no">tonistiigi/binfmt --install amd64</code>), which then handles every x86 program in
-              that VM, more slowly. x86 kernel modules don't run: it's translation, not an x86 machine.
+              <code translate="no">sudo apt install libfoo:amd64</code>. x86 containers work too:
+              <code translate="no">docker run --platform linux/amd64 &lt;image&gt;</code>. x86 kernel modules don't run: it's translation, not an x86 machine.
             </p>
             <h3>Hardware limits</h3>
             <p>Guests have a fixed 1280×800 display, a 2D-only GPU (no 3D acceleration; WebGL is software-rendered or unavailable) and no audio device.</p>

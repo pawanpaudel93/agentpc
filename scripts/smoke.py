@@ -250,6 +250,19 @@ def x86apps(m, vm, r):
     )
     r.check("apt install <lib>:amd64 gives x86 programs the library", ok and "loaded" in out.split(), out[-300:])
 
+    # agentpc turns on the CPU's TSO mode for x86apps VMs (macOS 15+) and then tells FEX it
+    # needn't emulate x86 memory ordering.
+    ok, out = sh("FEXGetConfig --tso-emulation-info | grep 'TSO Emulation:'")
+    r.check("hardware TSO: FEX doesn't emulate memory ordering", ok and "Disabled" in out, out[-300:])
+
+    # x86 containers run through the image's static FEX.
+    ok, out = sh(
+        "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io >/dev/null 2>&1"
+        " && sudo docker run --rm --platform linux/amd64 alpine uname -m 2>/dev/null",
+        timeout=600,
+    )
+    r.check("an amd64 container runs", ok and "x86_64" in out.split(), out[-300:])
+
     ok, out = sh("du -sk ~/.cache/fex-emu | cut -f1")
     kb = out.strip().splitlines()[-1] if out.strip() else ""
     r.check("FEX caches translated code on disk", ok and kb.isdigit() and int(kb) > 0, out[-200:])

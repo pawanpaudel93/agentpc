@@ -61,6 +61,7 @@ pub(crate) const WINDOWS_ISOS: [WinIso; 3] = [
 
 const UBUNTU_PREPARE: &str = include_str!("../guests/ubuntu/prepare.sh");
 const UBUNTU_X86_APPS: &str = include_str!("../guests/ubuntu/x86apps.sh");
+const FEX_PATCH: &str = include_str!("../guests/ubuntu/fex.patch");
 const WIN_PREPARE: &str = include_str!("../guests/windows/prepare.ps1");
 const WIN_AUTOUNATTEND: &str = include_str!("../guests/windows/Autounattend.xml");
 const WIN_SETUP_COMPLETE: &[u8] = include_bytes!("../guests/windows/SetupComplete.cmd");
@@ -313,6 +314,9 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
 fn prepare_guest(inst: &Instance) -> Result<()> {
     if inst.image.x86_apps() {
         log!("installing FEX for x86 programs");
+        let patch = inst.dir.join("fex.patch");
+        std::fs::write(&patch, FEX_PATCH)?;
+        crate::ops::upload(inst, &patch, "/tmp/agentpc-fex.patch")?;
         run_guest_script(inst, UBUNTU_X86_APPS, "x86apps")?;
     }
     log!("applying agent defaults to {}", inst.os);
@@ -617,6 +621,10 @@ pub fn remove(image: &Image) -> Result<String> {
     for p in files {
         let _ = std::fs::remove_file(p);
     }
+    // The machine-type sidecar qemu::save_state writes next to the snapshot state.
+    let mut sidecar = image.snapshot_state().into_os_string();
+    sidecar.push(".machine");
+    let _ = std::fs::remove_file(sidecar);
     Ok(format!("removed {image}"))
 }
 
