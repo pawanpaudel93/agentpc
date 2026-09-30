@@ -12,17 +12,26 @@ Run after changing an image, a guest script or the desktop driver:
 
 Each OS gets its own throwaway VM (deleted afterwards). Checks that the guest isn't blocked
 by first-run dialogs, that the desktop tools read and type, and that the gateway explains
-bad arguments. Needs internet in the guest (example.com). Exits 1 if any check fails.
+bad arguments. On ubuntu and arch it also walks the lifecycle an agent uses: background
+jobs, timeouts, file copies, port forwards, checkpoints, reset, and (in two more short-lived
+VMs) offline mode and a non-default size. Needs internet in the guest (example.com). Exits 1 if any check fails.
 Standard library only.
 """
 
 import argparse
+import hashlib
 import json
 import os
-import select
+import platform
+import queue
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+import urllib.request
 
 CALL_TIMEOUT = 900  # create_vm of a Windows image that needs a snapshot can take minutes
 
@@ -36,6 +45,10 @@ class Mcp:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
+        # A reader thread hands each line over a queue, so no reply sits unseen in a buffer
+        # (select() on a buffered pipe misses a second line already read into it).
+        self.lines = queue.Queue()
+        threading.Thread(target=self.read_lines, daemon=True).start()
         self.next_id = 0
         self.calls = 0
         self.request(
@@ -47,6 +60,11 @@ class Mcp:
             },
         )
         self.notify("notifications/initialized")
+
+    def read_lines(self):
+        for line in self.proc.stdout:
+            self.lines.put(line)
+        self.lines.put(None)  # EOF
 
     def send(self, msg):
         self.proc.stdin.write((json.dumps(msg) + "\n").encode())
@@ -60,13 +78,12 @@ class Mcp:
         want = self.next_id
         self.send({"jsonrpc": "2.0", "id": want, "method": method, "params": params})
         deadline = time.time() + CALL_TIMEOUT
-        out = self.proc.stdout
         while time.time() < deadline:
-            ready, _, _ = select.select([out], [], [], deadline - time.time())
-            if not ready:
+            try:
+                line = self.lines.get(timeout=max(0, deadline - time.time()))
+            except queue.Empty:
                 break
-            line = out.readline()
-            if not line:
+            if line is None:
                 raise RuntimeError("agentpc mcp exited")
             msg = json.loads(line)
             if msg.get("id") == want:  # skip progress and other notifications
@@ -148,11 +165,13 @@ def gateway_checks(m, vm, r):
 
 def ubuntu(m, vm, r):
     linux(m, vm, r, "google-chrome", "Chrome")
+    lifecycle(m, vm, r, "ubuntu")
 
 
 def arch(m, vm, r):
     """Arch Linux ARM has no Google Chrome build; its browser is Chromium."""
     linux(m, vm, r, "chromium", "Chromium")
+    lifecycle(m, vm, r, "arch")
 
 
 def linux(m, vm, r, browser, label):
@@ -232,6 +251,112 @@ def linux(m, vm, r, browser, label):
     )
 
 
+def lifecycle(m, vm, r, guest):
+    """Jobs, files, forwards, checkpoints and reset on `vm`, then offline mode and a
+    non-default size in two more VMs (each deleted as soon as it's checked). Guest paths
+    are under the home directory: /tmp on Arch is a tmpfs, cleared at every boot."""
+    def sh(command, name=vm, **kw):
+        return m.tool("run_command", name=name, command=command, **kw)
+
+    ok, out = sh("sleep 2; echo smoke-job-done", background=True)
+    job = re.search(r"\(id (\d+)", out)
+    if r.check("background run_command returns a job id", ok and job, out[:300]):
+        def job_done():
+            _, st = m.tool("get_job_status", name=vm, id=int(job.group(1)), tail_lines=5)
+            return st if "STATE: exited 0" in st and "smoke-job-done" in st else None
+        r.check("get_job_status reports the exit code and log tail", poll(job_done, 30))
+
+    ok, out = sh("sleep 60; echo late", timeout=3)
+    r.check(
+        "a foreground run is killed at its timeout",
+        not ok and "timed out after 3s" in out and "late" not in out,
+        out[:300],
+    )
+
+    tmp = tempfile.mkdtemp(prefix="agentpc-smoke-")
+    try:
+        up = os.path.join(tmp, "up.txt")
+        with open(up, "w") as f:
+            f.write("hello from the mac\n" * 1000)
+        with open(up, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        ok, out = m.tool("upload_file", name=vm, host_path=up, guest_path="smoke-up.txt")
+        r.check("upload_file", ok, out[:200])
+        ok, out = sh("sha256sum ~/smoke-up.txt")
+        r.check("the uploaded file's content matches", ok and digest in out, out[:200])
+
+        sh("mkdir -p ~/smoke-dir/sub && echo x > ~/smoke-dir/sub/f && echo y > ~/smoke-dir/g")
+        down = os.path.join(tmp, "down")
+        ok, out = m.tool("download_file", name=vm, guest_path="smoke-dir", host_path=down)
+        got = [os.path.join(down, "sub", "f"), os.path.join(down, "smoke-dir", "sub", "f")]
+        r.check("download_file copies a folder", ok and any(map(os.path.isfile, got)), out[:300])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # A server on the guest's own 127.0.0.1, reached from the Mac through forward_port.
+    # python3 where the image has it, else perl (both images have perl).
+    sh(
+        "mkdir -p ~/smoke-www && echo smoke-served > ~/smoke-www/index.html && cd ~/smoke-www && "
+        "if command -v python3 >/dev/null; then exec python3 -m http.server 8765 --bind 127.0.0.1; fi; "
+        "exec perl -MIO::Socket::INET -e '$s = IO::Socket::INET->new(LocalAddr => \"127.0.0.1\", "
+        "LocalPort => 8765, Listen => 5, ReuseAddr => 1) or die; while ($c = $s->accept) "
+        "{ while (<$c>) { last if /^\\r?$/ } print $c \"HTTP/1.0 200 OK\\r\\nContent-Length: 13"
+        "\\r\\n\\r\\nsmoke-served\\n\"; close $c }'",
+        background=True,
+    )
+    ok, out = m.tool("forward_port", name=vm, guest_port=8765)
+    fwd = re.search(r"127\.0\.0\.1:(\d+)", out) if ok else None
+    if r.check("forward_port picks a host port", fwd, out[:200]):
+        port = int(fwd.group(1))
+
+        def fetch():
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as resp:
+                    return resp.read().decode()
+            except Exception:
+                return ""
+        r.check("the forward reaches a server on the guest's 127.0.0.1", "smoke-served" in poll(fetch, 20))
+        ok, out = m.tool("list_forwards", name=vm)
+        r.check("list_forwards lists it", ok and f"127.0.0.1:{port}" in out, out[:200])
+        ok, out = m.tool("delete_forward", name=vm, host_port=port)
+        _, listing = m.tool("list_forwards", name=vm)
+        r.check("delete_forward removes it", ok and f"127.0.0.1:{port}" not in listing, f"{out[:150]} | {listing[:150]}")
+
+    sh("echo before > ~/smoke-marker")
+    ok, out = m.tool("checkpoint_vm", name=vm, label="smoke")
+    if r.check("checkpoint_vm", ok, out[:200]):
+        sh("echo after > ~/smoke-marker")
+        ok, out = m.tool("restore_vm", name=vm, label="smoke")
+        _, marker = sh("cat ~/smoke-marker")
+        r.check("restore_vm returns to the checkpoint", ok and "before" in marker and "after" not in marker, f"{out[:150]} | {marker[:100]}")
+        ok, out = m.tool("delete_checkpoint", name=vm, label="smoke")
+        r.check("delete_checkpoint", ok, out[:200])
+
+    ok, out = m.tool("reset_vm", name=vm)
+    _, left = sh("ls -d ~/smoke-* 2>/dev/null; echo listed")
+    r.check("reset_vm returns to a clean install", ok and left.split()[-1:] == ["listed"] and "smoke-" not in left, f"{out[:150]} | {left[:150]}")
+
+    # Extra VMs one at a time, so at most two run at once.
+    extra = f"{vm}-offline"
+    try:
+        ok, out = m.tool("create_vm", os=guest, name=extra, offline=True)
+        if r.check("create_vm offline", ok, out[:200]):
+            ok, out = sh("curl -sS -m 8 -o /dev/null https://example.com && echo reached || echo blocked", name=extra, timeout=30)
+            r.check("an offline VM has no internet", ok and "blocked" in out and "reached" not in out, out[:200])
+    finally:
+        m.tool("delete_vm", name=extra)
+
+    extra = f"{vm}-sized"
+    try:
+        ok, out = m.tool("create_vm", os=guest, name=extra, memory_gb=6, cpus=2)
+        if r.check("create_vm memory_gb=6 cpus=2 (cold boot)", ok, out[:200]):
+            ok, out = sh("nproc; awk '/MemTotal/ {print int($2 / 1048576 + 0.5)}' /proc/meminfo", name=extra)
+            nums = [w for w in out.split() if w.isdigit()]
+            r.check("the guest sees 2 CPUs and ~6 GB", ok and nums[-2:] == ["2", "6"], out[:200])
+    finally:
+        m.tool("delete_vm", name=extra)
+
+
 def x86apps(m, vm, r, guest="ubuntu"):
     """ubuntu-x86apps / arch-x86apps: downloaded x86_64 programs run through FEX, GUI ones
     included. `guest` is the OS, "ubuntu" or "arch"."""
@@ -269,19 +394,50 @@ def x86apps(m, vm, r, guest="ubuntu"):
     else:
         ok, out = sh("sudo fex-pacman -Sy --noconfirm --needed zeromq >/dev/null 2>&1" + load)
         r.check("fex-pacman gives x86 programs the library", ok and "loaded" in out.split(), out[-300:])
+        # fex-pacman leaves nothing behind: no mounts under the tree, no chroot marker, and
+        # FEX still sees the guest's own user.
+        rootfs = "/usr/share/fex-emu/RootFS/ArchLinux"
+        ok, out = sh(f"findmnt -rn -o TARGET -R {rootfs} | grep -vx {rootfs}; true")
+        r.check("fex-pacman unmounts its chroot", ok and not out.strip(), out[-300:])
+        ok, out = sh(f"test -e {rootfs}/run/.containerenv && echo present || echo absent")
+        r.check("fex-pacman removes the .containerenv marker", ok and out.strip() == "absent", out[-300:])
+        ok, out = sh("FEXBash -c 'id -un'")
+        r.check("FEXBash runs as agent after fex-pacman", ok and out.strip().splitlines()[-1:] == ["agent"], out[-300:])
+
+    # The FEX build in the image is the one guests/<os>/x86apps.sh pins.
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "guests", guest, "x86apps.sh")
+    with open(script) as f:
+        pinned = re.search(r"^fex_version=(\S+)", f.read(), re.M).group(1)
+    ok, out = sh("cat /var/lib/agentpc/fex-version")
+    r.check(f"FEX {pinned} (the pinned version) is installed", ok and out.strip() == pinned, out[-300:])
 
     # agentpc turns on the CPU's TSO mode for x86apps VMs (macOS 15+) and then tells FEX it
-    # needn't emulate x86 memory ordering.
+    # needn't emulate x86 memory ordering; on older macOS FEX emulates it.
+    mac = platform.mac_ver()[0]
+    hw = bool(mac) and int(mac.split(".")[0]) >= 15
+    tso, emulation = ("hardware", "Disabled") if hw else ("emulated", "Enabled")
     ok, out = sh("FEXGetConfig --tso-emulation-info | grep 'TSO Emulation:'")
-    r.check("hardware TSO: FEX doesn't emulate memory ordering", ok and "Disabled" in out, out[-300:])
+    r.check(f"{tso} TSO: FEX emulation {emulation.lower()}", ok and emulation in out, out[-300:])
     ok, listing = m.tool("list_vms")
     vm_entry = next(
         (i for i in json.loads(listing).get("instances", []) if i.get("name") == vm), {}
     ) if ok else {}
-    r.check("list_vms reports x86_tso", vm_entry.get("x86_tso") == "hardware", str(vm_entry)[:300])
+    r.check(f"list_vms reports x86_tso {tso}", vm_entry.get("x86_tso") == tso, str(vm_entry)[:300])
 
     # x86 containers run through the image's static FEX.
-    docker = install("docker") + " && sudo systemctl start docker" if guest == "arch" else install("docker.io")
+    if guest == "arch":
+        ok, out = sh(install("docker"), timeout=600)
+        r.check("pacman installs docker", ok, out[-300:])
+        # -Syu may have upgraded the kernel, whose modules docker needs: reboot into it.
+        ok, out = sh("test -d /usr/lib/modules/$(uname -r) && echo present || echo missing")
+        if ok and out.strip() == "missing":
+            ok, out = m.tool("stop_vm", name=vm)
+            if ok:
+                ok, out = m.tool("start_vm", name=vm)
+            r.check("reboot into the upgraded kernel", ok, out[-300:])
+        docker = "sudo systemctl start docker"
+    else:
+        docker = install("docker.io")
     ok, out = sh(
         docker
         + " && sudo docker run --rm --platform linux/amd64 alpine uname -m 2>/dev/null",
@@ -298,6 +454,11 @@ def x86apps(m, vm, r, guest="ubuntu"):
         " | tar xJ && file -L firefox/firefox-bin | grep -o x86-64",
         timeout=600,
     )
+    if guest == "arch":
+        # /tmp is a tmpfs on Arch: the x86 downloads above must leave room in it.
+        _, df = sh("df -Pk /tmp | awk 'NR == 2 {print $4}'")
+        free = df.split()[-1] if df.split() else ""
+        r.check("/tmp keeps 512 MB free after the x86 downloads", free.isdigit() and int(free) >= 512 * 1024, df[-200:])
     if not r.check("the x86_64 Firefox downloads", ok and "x86-64" in out, out[-300:]):
         return
     ok, app = m.desktop(

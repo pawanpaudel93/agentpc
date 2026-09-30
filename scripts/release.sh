@@ -113,9 +113,11 @@ subst Cargo.toml "1,/^version = /s/^version = \"$OLD_RE\"/version = \"$VERSION\"
 subst plugin/.claude-plugin/plugin.json "s/\"version\": \"$OLD_RE\"/\"version\": \"$VERSION\"/"
 subst .claude-plugin/marketplace.json "s/\"version\": \"$OLD_RE\"/\"version\": \"$VERSION\"/"
 subst server.json "s/\"version\": \"$OLD_RE\"/\"version\": \"$VERSION\"/; s#/v$OLD_RE/agentpc-$OLD_RE\.mcpb#/$TAG/agentpc-$VERSION.mcpb#"
-# The site's nav badge: any old version, so a missed bump can't stick.
-for f in site/index.html site/cli.html site/guide.html site/mcp.html; do
-  subst "$f" "s#<span class=\"version\" translate=\"no\">v[0-9.]*</span>#<span class=\"version\" translate=\"no\">$TAG</span>#"
+# The site's nav badge: any old version (prereleases too), so a missed bump can't stick.
+SITE_FILES="site/index.html site/cli.html site/guide.html site/mcp.html"
+for f in $SITE_FILES; do
+  subst "$f" "s#<span class=\"version\" translate=\"no\">v[0-9A-Za-z.+-]*</span>#<span class=\"version\" translate=\"no\">$TAG</span>#"
+  grep -qF "<span class=\"version\" translate=\"no\">$TAG</span>" "$f" || die "$f: nav version badge not updated to $TAG."
 done
 cargo update --quiet --offline --workspace
 
@@ -167,8 +169,8 @@ mkdir -p "$BUNDLE/server"
 jq --arg v "$VERSION" '.version = $v' packaging/mcpb/manifest.json >"$BUNDLE/manifest.json"
 cp "$BIN" "$BUNDLE/server/agentpc"
 cp LICENSE README.md "$BUNDLE/"
-npx -y @anthropic-ai/mcpb@2 validate "$BUNDLE/manifest.json"
-npx -y @anthropic-ai/mcpb@2 pack "$BUNDLE" "$DIST/$MCPB"
+npx -y @anthropic-ai/mcpb@2.1.2 validate "$BUNDLE/manifest.json"
+npx -y @anthropic-ai/mcpb@2.1.2 pack "$BUNDLE" "$DIST/$MCPB"
 (cd "$DIST" && shasum -a 256 "$MCPB" >"$MCPB.sha256")
 
 say "Filling dist/server.json"
