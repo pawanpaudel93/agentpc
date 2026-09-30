@@ -42,7 +42,7 @@ struct Cli {
 enum Cmd {
     /// Create a VM from an image and boot it (default name: <os>-<n>); gets the image if missing
     Create {
-        /// ubuntu, windows, arch, or a version: ubuntu-22.04, ubuntu-x86apps, windows-11-23h2 (see image build --help)
+        /// ubuntu, windows, arch, or a version: ubuntu-22.04, ubuntu-x86apps, arch-x86apps, windows-11-23h2 (see image build --help)
         image: String,
         /// VM name (default: <os>-<n>)
         name: Option<String>,
@@ -63,7 +63,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Viewer URL, SSH and VNC details, and checkpoints
+    /// Viewer URL, SSH and VNC details, checkpoints, and on x86apps VMs how x86 programs run
+    /// ("x86 programs: FEX, hardware|emulated TSO")
     Info {
         /// VM name
         name: String,
@@ -203,7 +204,8 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ImageCmd {
-    /// Build an image locally by installing the OS (Ubuntu ~3 min, Arch ~6 min, Windows ~12 min)
+    /// Build an image locally by installing the OS (Ubuntu ~3 min, Arch ~6 min, x86apps ~8 min,
+    /// arch-x86apps ~10 min, Windows ~12 min)
     #[command(after_help = "\
 Images are <os>-<version>; a bare os means the default version.
   ubuntu-<release>            any release at cloud-images.ubuntu.com/releases (default 24.04)
@@ -212,6 +214,10 @@ Images are <os>-<version>; a bare os means the default version.
   windows-11-24h2             Windows 11 24H2 Home/Pro (archive mirror)
   windows-11-23h2             Windows 11 23H2 Home/Pro (archive mirror)
   arch-rolling                Arch Linux ARM (default: arch), installed from an Ubuntu helper VM
+  arch-rolling-x86apps        Arch that also runs x86_64/i386 Linux programs, through FEX (arch-x86apps)
+Dated Arch builds (arch-rolling-YYYYMMDD, arch-rolling-x86apps-YYYYMMDD) can only be pulled.
+Build and rm refuse while a running build uses the image (an Arch build runs in a clone of
+the Ubuntu image).
 ISOs are checksum-verified. --iso installs your own: it must match a release name above,
 or use any other name (windows-custom).")]
     Build {
@@ -222,9 +228,11 @@ or use any other name (windows-custom).")]
         #[arg(long)]
         iso: Option<PathBuf>,
     },
-    /// Download a published image, e.g. ubuntu-22.04 or arch (Windows can't be redistributed)
+    /// Download a published image, e.g. ubuntu-22.04, ubuntu-x86apps, arch or arch-x86apps
+    /// (Windows can't be redistributed)
     Pull {
-        /// Image, e.g. ubuntu, ubuntu-22.04 or arch
+        /// Image, e.g. ubuntu, ubuntu-22.04, ubuntu-x86apps, arch, arch-x86apps, or a pinned
+        /// build such as arch-rolling-YYYYMMDD
         image: String,
     },
     /// Publish a local image to the registry (maintainers; needs `oras login`)
@@ -240,7 +248,7 @@ or use any other name (windows-custom).")]
         /// Image, e.g. ubuntu-24.04 or windows
         image: String,
     },
-    /// Delete local images
+    /// Delete local images (refused while VMs or a running build use one)
     #[command(visible_alias = "delete")]
     Rm {
         /// Images, e.g. windows-11-24h2

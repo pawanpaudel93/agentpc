@@ -88,16 +88,24 @@ pub struct Image {
     pub version: String,
 }
 
-/// The Ubuntu image variant that also runs x86_64 and i386 Linux programs (through FEX):
-/// `ubuntu-24.04-x86apps`, or `ubuntu-x86apps` for the default release.
+/// The Ubuntu or Arch image variant that also runs x86_64 and i386 Linux programs (through
+/// FEX): `ubuntu-24.04-x86apps` / `arch-rolling-x86apps`, or `ubuntu-x86apps` / `arch-x86apps`
+/// for the default version. A published build pins it with a date: `…-x86apps-YYYYMMDD`.
 const X86_APPS: &str = "x86apps";
 
-/// `rolling-YYYYMMDD`: a published Arch build, downloaded by its dated registry tag.
+/// Whether `s` is a registry build date, `YYYYMMDD`.
+fn is_date(s: &str) -> bool {
+    s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `rolling-YYYYMMDD` or `rolling-x86apps-YYYYMMDD`: a published Arch build, downloaded by
+/// its dated registry tag.
 pub fn is_pinned_arch(version: &str) -> bool {
     version
         .strip_prefix(ARCH_VERSION)
         .and_then(|d| d.strip_prefix('-'))
-        .is_some_and(|d| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()))
+        .map(|d| d.strip_prefix("x86apps-").unwrap_or(d))
+        .is_some_and(is_date)
 }
 
 impl Image {
@@ -109,16 +117,20 @@ impl Image {
         if version == X86_APPS {
             version = format!("{}-{X86_APPS}", os.default_version());
         }
-        if os == Os::Windows && version.ends_with(X86_APPS) {
+        if os == Os::Windows && version.split('-').any(|p| p == X86_APPS) {
             bail!("Windows runs x64 and x86 apps through Prism already; use a plain windows image");
         }
-        if os == Os::Arch && version.ends_with(X86_APPS) {
-            bail!("x86 apps are only available on ubuntu images (ubuntu-x86apps)");
-        }
-        // Arch is rolling: one version, plus the dated tags of published builds (pinned pulls).
-        if os == Os::Arch && version != ARCH_VERSION && !is_pinned_arch(&version) {
+        // Arch is rolling: one version (plain or x86apps), plus the dated tags of published
+        // builds (pinned pulls).
+        let arch_x86 = format!("{ARCH_VERSION}-{X86_APPS}");
+        if os == Os::Arch
+            && version != ARCH_VERSION
+            && version != arch_x86
+            && !is_pinned_arch(&version)
+        {
             bail!(
-                "arch is a rolling release: use arch (arch-{ARCH_VERSION}), or arch-{ARCH_VERSION}-YYYYMMDD to download one published build"
+                "arch is a rolling release: use arch (arch-{ARCH_VERSION}) or arch-x86apps (arch-{arch_x86}), \
+                 or add -YYYYMMDD to download one published build"
             );
         }
         // It becomes part of file names and registry tags.
@@ -149,16 +161,17 @@ impl Image {
         Ok(image)
     }
 
-    /// Whether VMs of this image run x86 Linux programs (`guests/ubuntu/x86apps.sh`).
+    /// Whether VMs of this image run x86 Linux programs (`guests/<os>/x86apps.sh`), pinned
+    /// published builds (`ubuntu-24.04-x86apps-YYYYMMDD`) included.
     pub fn x86_apps(&self) -> bool {
-        self.os == Os::Ubuntu && self.version.ends_with(&format!("-{X86_APPS}"))
+        matches!(self.os, Os::Ubuntu | Os::Arch) && self.version.split('-').any(|p| p == X86_APPS)
     }
 
-    /// The OS release the image installs: its version without a variant suffix.
+    /// The OS release the image installs: its version up to the x86apps variant, if any.
     pub fn release(&self) -> &str {
         self.version
-            .strip_suffix(&format!("-{X86_APPS}"))
-            .unwrap_or(&self.version)
+            .split_once(&format!("-{X86_APPS}"))
+            .map_or(&self.version, |(r, _)| r)
     }
 
     /// Installed images, sorted by name.
@@ -881,13 +894,25 @@ mod tests {
         let i: Image = "ubuntu-22.04".parse().unwrap();
         assert_eq!((i.x86_apps(), i.release()), (false, "22.04"));
         assert!("windows-x86apps".parse::<Image>().is_err());
+        assert!("windows-11-25h2-x86apps".parse::<Image>().is_err());
+        let i: Image = "ubuntu-24.04-x86apps-20260930".parse().unwrap();
+        assert_eq!((i.x86_apps(), i.release()), (true, "24.04"));
 
         let i: Image = "arch".parse().unwrap();
         assert_eq!((i.os, i.to_string()), (Os::Arch, "arch-rolling".into()));
         assert_eq!("arch-rolling".parse::<Image>().unwrap(), i);
         assert!(!i.x86_apps());
-        assert!("arch-x86apps".parse::<Image>().is_err());
-        assert!("arch-rolling-x86apps".parse::<Image>().is_err());
+        let i: Image = "arch-x86apps".parse().unwrap();
+        assert_eq!(i.to_string(), "arch-rolling-x86apps");
+        assert_eq!((i.x86_apps(), i.release()), (true, "rolling"));
+        assert_eq!("arch-rolling-x86apps".parse::<Image>().unwrap(), i);
+        let i: Image = "arch-rolling-x86apps-20261001".parse().unwrap();
+        assert_eq!((i.x86_apps(), i.release()), (true, "rolling"));
+        assert!(super::is_pinned_arch(&i.version));
+        assert!(!super::is_pinned_arch("rolling-x86apps"));
+        assert!(!super::is_pinned_arch("rolling"));
+        assert!("arch-rolling-x86apps-2026".parse::<Image>().is_err());
+        assert!("arch-x86apps-rolling".parse::<Image>().is_err());
         assert!("arch-2024".parse::<Image>().is_err());
         assert!("arch-latest".parse::<Image>().is_err());
         assert_eq!(

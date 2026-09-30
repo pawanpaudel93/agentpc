@@ -502,6 +502,7 @@ pub(crate) fn fetch_image_locked(image: &Image) -> Result<()> {
             "download"
         };
         let minutes = match image.os {
+            Os::Arch if image.x86_apps() => 10,
             Os::Arch => 6,
             _ if image.x86_apps() => 8,
             _ => 3,

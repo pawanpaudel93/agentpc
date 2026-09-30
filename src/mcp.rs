@@ -38,13 +38,18 @@ use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance
 install; checkpoint_vm/restore_vm save and return to any point in seconds (disk and memory) --
 checkpoint before a risky or slow-to-redo step. run_command runs PowerShell on Windows and bash
 on Ubuntu and Arch; the guest login is agent/agent. create_vm takes an optional version (Ubuntu
-release like \"22.04\"; Windows \"11-25h2\", \"11-24h2\", \"11-23h2\"; Arch is rolling, no version);
+release like \"22.04\"; Windows \"11-25h2\", \"11-24h2\", \"11-23h2\"; Arch is rolling: no version,
+or \"rolling-YYYYMMDD\" to pin a published build; \"x86apps\" on Ubuntu or Arch, see below);
 list_vms shows which images exist.
 The first create of an image can take minutes (download/build); after that it's seconds.
 All guests are ARM64. On Windows, x64 and x86 programs run through Prism emulation (slower;
-no x64 drivers), so prefer an ARM64 build when one exists. For x86_64 Linux programs, create
-ubuntu with version \"x86apps\": they run through FEX translation, about 2x slower; amd64
-containers (docker run --platform linux/amd64) work there too.
+no x64 drivers), so prefer an ARM64 build when one exists. For x86_64 and i386 Linux programs,
+create ubuntu or arch with version \"x86apps\": they run through FEX translation, about 2x slower
+(Node 6-7x). Go programs work; amd64 containers work with docker run --platform linux/amd64 (on
+Arch first: sudo pacman -Syu --noconfirm docker && sudo systemctl start docker); x86
+Electron/Chromium apps need --no-sandbox. On Ubuntu, x86 libraries install with sudo apt install
+libfoo:amd64; Arch has no multiarch, so x86 programs use the x86 Arch tree FEX runs them in.
+list_vms shows x86_tso: hardware (fast; needs macOS 15+) or emulated.
 An Arch Linux ARM guest (os \"arch\") works like Ubuntu (XFCE, bash, the same desktop tools), but
 packages come from pacman (sudo pacman -Syu --noconfirm <pkg>: Arch doesn't support partial
 upgrades, and an image's package lists age; the first -Syu may upgrade everything, so give
@@ -57,7 +62,9 @@ get_window_state(pid, window_id) returns numbered elements and a snapshot_id to 
 element_index to click/type_text. On Ubuntu and Arch, keyboard/mouse input needs \"delivery_mode\":
 \"foreground\"; on Windows, typing into the focused field, scroll, drag and right-click often do.
 list_desktop_tools shows each tool's required arguments; a call with wrong arguments returns
-the tool's argument list.
+the tool's argument list, and a wrong tool name returns close matches (\"did you mean ...\").
+If a reply starts with a reconnect note (the VM or its driver restarted), snapshot ids and browser
+sessions are gone: take a new snapshot and run browser_prepare again.
 
 If get_window_state comes back \"degraded\" (no elements), act by pixels instead: pass x/y read
 from the screenshot of a get_window_state call that included one (the default).
@@ -218,10 +225,11 @@ enum OsArg {
 struct CreateArgs {
     os: OsArg,
     /// Default: ubuntu 24.04, windows 11, arch rolling. Ubuntu: any release, e.g. "22.04", "26.04";
-    /// "x86apps" (or "24.04-x86apps") is Ubuntu that also runs x86_64 Linux programs.
-    /// Windows: "11-25h2", "11-24h2" or "11-23h2". Omitted, Windows uses 25H2, or the newest
-    /// installed Windows 11 image if 25H2 isn't built. Arch: only the default, "rolling", or a
-    /// pinned download, "rolling-YYYYMMDD".
+    /// "x86apps" (or "<release>-x86apps", e.g. "22.04-x86apps") is Ubuntu that also runs
+    /// x86_64 and i386 Linux programs. Windows: "11-25h2", "11-24h2" or "11-23h2". Omitted,
+    /// Windows uses 25H2, or the newest installed Windows 11 image if 25H2 isn't built. Arch:
+    /// the default, "rolling"; "x86apps" (Arch that also runs x86 Linux programs); or a pinned
+    /// download, "rolling-YYYYMMDD" / "rolling-x86apps-YYYYMMDD".
     version: Option<String>,
     name: Option<String>,
     /// Memory in GB (default 8 on Windows, 4 on Ubuntu and Arch). A non-default size boots cold
@@ -357,8 +365,8 @@ fn default_log_tail() -> usize {
 impl Gateway {
     #[tool(
         title = "List VMs",
-        description = "List VM instances (name, image, state, size, checkpoints, owner, viewer URL) and which\n\
-                          images exist. Each VM shows its owner; only reset/delete/restore a VM you created,\n\
+        description = "List VM instances (name, image, state, size, checkpoints, owner, viewer URL and, for\n\
+                          running x86apps VMs, x86_tso: hardware|emulated) and which images exist. Each VM shows its owner; only reset/delete/restore a VM you created,\n\
                           unless the user asks otherwise.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
@@ -717,10 +725,19 @@ impl Gateway {
                     lines.join("\n")
                 ));
             };
-            let t = tools
-                .iter()
-                .find(|t| t.name == want)
-                .ok_or_else(|| anyhow!("no tool '{want}' in {}", a.name))?;
+            let Some(t) = tools.iter().find(|t| t.name == want) else {
+                let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+                let near = similar(&want, &names);
+                bail!(
+                    "no tool '{want}' in {}{}",
+                    a.name,
+                    if near.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (did you mean {}?)", near.join(", "))
+                    }
+                );
+            };
             Ok(serde_json::to_string_pretty(
                 &json!({"name": t.name, "description": t.description, "input_schema": t.input_schema}),
             )?)
@@ -731,7 +748,8 @@ impl Gateway {
     #[tool(
         title = "Use desktop tool",
         description = "Call a desktop-control tool inside an instance (see list_desktop_tools for names and schemas).\n\
-                          Screenshots and other content are returned as-is.",
+                          Screenshots and other content are returned as-is. A wrong tool name returns close\n\
+                          matches; wrong arguments return the tool's argument list.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,

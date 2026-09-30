@@ -8,6 +8,7 @@ Run after changing an image, a guest script or the desktop driver:
     scripts/smoke.py --bin target/release/agentpc --os ubuntu
     scripts/smoke.py --bin target/release/agentpc --os x86apps  # ubuntu-x86apps (not a default)
     scripts/smoke.py --bin target/release/agentpc --os arch     # Arch Linux ARM (not a default)
+    scripts/smoke.py --bin target/release/agentpc --os arch-x86apps  # (not a default)
 
 Each OS gets its own throwaway VM (deleted afterwards). Checks that the guest isn't blocked
 by first-run dialogs, that the desktop tools read and type, and that the gateway explains
@@ -231,10 +232,16 @@ def linux(m, vm, r, browser, label):
     )
 
 
-def x86apps(m, vm, r):
-    """ubuntu-x86apps: downloaded x86_64 programs run through FEX, GUI ones included."""
+def x86apps(m, vm, r, guest="ubuntu"):
+    """ubuntu-x86apps / arch-x86apps: downloaded x86_64 programs run through FEX, GUI ones
+    included. `guest` is the OS, "ubuntu" or "arch"."""
     def sh(command, timeout=300):
         return m.tool("run_command", name=vm, command=command, timeout=timeout)
+
+    def install(pkg):
+        if guest == "arch":
+            return f"sudo pacman -Syu --noconfirm --needed {pkg} >/dev/null 2>&1"
+        return f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q {pkg} >/dev/null 2>&1"
 
     ok, out = sh(
         "cd /tmp && curl -fsSL https://nodejs.org/dist/v22.20.0/node-v22.20.0-linux-x64.tar.xz"
@@ -253,12 +260,14 @@ def x86apps(m, vm, r):
     ok, out = sh("sudo /tmp/node-v22.20.0-linux-x64/bin/node -p process.arch")
     r.check("x86 programs run as root too", ok and out.strip().endswith("x64"), out[-300:])
 
-    # Multiarch: x86 libraries the RootFS lacks come from apt, and FEX finds them.
-    ok, out = sh(
-        "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q libzmq5:amd64 >/dev/null 2>&1"
-        " && FEXBash -c 'python3 -c \"import ctypes; ctypes.CDLL(\\\"libzmq.so.5\\\"); print(\\\"loaded\\\")\"'"
-    )
-    r.check("apt install <lib>:amd64 gives x86 programs the library", ok and "loaded" in out.split(), out[-300:])
+    # Multiarch: x86 libraries the RootFS lacks come from apt, and FEX finds them. Arch has
+    # no multiarch: x86 programs use only the libraries in the x86 root filesystem.
+    if guest == "ubuntu":
+        ok, out = sh(
+            install("libzmq5:amd64")
+            + " && FEXBash -c 'python3 -c \"import ctypes; ctypes.CDLL(\\\"libzmq.so.5\\\"); print(\\\"loaded\\\")\"'"
+        )
+        r.check("apt install <lib>:amd64 gives x86 programs the library", ok and "loaded" in out.split(), out[-300:])
 
     # agentpc turns on the CPU's TSO mode for x86apps VMs (macOS 15+) and then tells FEX it
     # needn't emulate x86 memory ordering.
@@ -271,9 +280,10 @@ def x86apps(m, vm, r):
     r.check("list_vms reports x86_tso", vm_entry.get("x86_tso") == "hardware", str(vm_entry)[:300])
 
     # x86 containers run through the image's static FEX.
+    docker = install("docker") + " && sudo systemctl start docker" if guest == "arch" else install("docker.io")
     ok, out = sh(
-        "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker.io >/dev/null 2>&1"
-        " && sudo docker run --rm --platform linux/amd64 alpine uname -m 2>/dev/null",
+        docker
+        + " && sudo docker run --rm --platform linux/amd64 alpine uname -m 2>/dev/null",
         timeout=600,
     )
     r.check("an amd64 container runs", ok and "x86_64" in out.split(), out[-300:])
@@ -364,7 +374,7 @@ def windows(m, vm, r):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--bin", default="agentpc", help="agentpc binary to test")
-    ap.add_argument("--os", default="ubuntu,windows", help="comma-separated: ubuntu,windows,x86apps,arch")
+    ap.add_argument("--os", default="ubuntu,windows", help="comma-separated: ubuntu,windows,x86apps,arch,arch-x86apps")
     a = ap.parse_args()
 
     failed = 0
@@ -377,12 +387,18 @@ def main():
         try:
             if os_name == "x86apps":
                 ok, out = m.tool("create_vm", os="ubuntu", version="x86apps", name=vm)
+            elif os_name == "arch-x86apps":
+                ok, out = m.tool("create_vm", os="arch", version="x86apps", name=vm)
             else:
                 ok, out = m.tool("create_vm", os=os_name, name=vm)
             if r.check("create_vm", ok, out[:300]):
-                {"ubuntu": ubuntu, "windows": windows, "x86apps": x86apps, "arch": arch}[os_name](
-                    m, vm, r
-                )
+                {
+                    "ubuntu": ubuntu,
+                    "windows": windows,
+                    "x86apps": x86apps,
+                    "arch": arch,
+                    "arch-x86apps": lambda m, vm, r: x86apps(m, vm, r, "arch"),
+                }[os_name](m, vm, r)
         except Exception as e:  # report and keep going to cleanup
             r.check("no unexpected error", False, repr(e)[:300])
         finally:

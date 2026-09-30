@@ -63,6 +63,7 @@ const UBUNTU_PREPARE: &str = include_str!("../guests/ubuntu/prepare.sh");
 const ARCH_PREPARE: &str = include_str!("../guests/arch/prepare.sh");
 const ARCH_BUILD: &str = include_str!("../guests/arch/build.sh");
 const UBUNTU_X86_APPS: &str = include_str!("../guests/ubuntu/x86apps.sh");
+const ARCH_X86_APPS: &str = include_str!("../guests/arch/x86apps.sh");
 const FEX_PATCH: &str = include_str!("../guests/ubuntu/fex.patch");
 const WIN_PREPARE: &str = include_str!("../guests/windows/prepare.ps1");
 const WIN_AUTOUNATTEND: &str = include_str!("../guests/windows/Autounattend.xml");
@@ -167,7 +168,7 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     // Peak use: the build disk plus its flattened copy, then the image plus its snapshot.
     let need_gb = match os {
         Os::Windows => 35,
-        Os::Ubuntu if image.x86_apps() => 16,
+        Os::Ubuntu | Os::Arch if image.x86_apps() => 16,
         Os::Ubuntu | Os::Arch => 12,
     };
     crate::ops::ensure_free_space(need_gb, &format!("build {image}"))?;
@@ -380,7 +381,9 @@ fn build_arch(image: &Image, name: &str) -> Result<()> {
             ),
         ],
     )?;
-    log!("building Arch Linux ARM (~6 min)");
+    // The x86 part comes at the snapshot, from prepare_guest.
+    let minutes = if image.x86_apps() { 10 } else { 6 };
+    log!("building Arch Linux ARM (~{minutes} min in all)");
     let took = wait_ready(inst, Duration::from_secs(Os::Ubuntu.boot_timeout()))?;
     log!("{} ready in {}s", inst.name, took.as_secs());
     let script = inst.dir.join("build.sh");
@@ -485,15 +488,20 @@ fn run_arch_build(inst: &Instance) -> Result<Option<String>> {
 }
 
 /// Apply the agent-friendly defaults in `guests/<os>/prepare.*` to a running guest, after
-/// `guests/ubuntu/x86apps.sh` on an x86apps image (prepare.sh's cleanup then shrinks both).
+/// `guests/<os>/x86apps.sh` on an x86apps image (prepare.sh's cleanup then shrinks both).
 /// It runs at every snapshot, so existing and pulled images get it too.
 fn prepare_guest(inst: &Instance) -> Result<()> {
     if inst.image.x86_apps() {
         log!("installing FEX for x86 programs");
+        // Both OSes build the same FEX, with the same patch.
         let patch = inst.dir.join("fex.patch");
         std::fs::write(&patch, FEX_PATCH)?;
         crate::ops::upload(inst, &patch, "/tmp/agentpc-fex.patch")?;
-        run_guest_script(inst, UBUNTU_X86_APPS, "x86apps")?;
+        let script = match inst.os {
+            Os::Arch => ARCH_X86_APPS,
+            _ => UBUNTU_X86_APPS,
+        };
+        run_guest_script(inst, script, "x86apps")?;
     }
     log!("applying agent defaults to {}", inst.os);
     let script = match inst.os {
