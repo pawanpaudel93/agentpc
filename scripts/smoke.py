@@ -240,6 +240,16 @@ def x86apps(m, vm, r):
     )
     r.check("an x86_64 Go program runs (3/3)", ok and out.strip().endswith("ok"), out[-300:])
 
+    ok, out = sh("sudo /tmp/node-v22.20.0-linux-x64/bin/node -p process.arch")
+    r.check("x86 programs run as root too", ok and out.strip().endswith("x64"), out[-300:])
+
+    # Multiarch: x86 libraries the RootFS lacks come from apt, and FEX finds them.
+    ok, out = sh(
+        "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q libzmq5:amd64 >/dev/null 2>&1"
+        " && FEXBash -c 'python3 -c \"import ctypes; ctypes.CDLL(\\\"libzmq.so.5\\\"); print(\\\"loaded\\\")\"'"
+    )
+    r.check("apt install <lib>:amd64 gives x86 programs the library", ok and "loaded" in out.split(), out[-300:])
+
     ok, out = sh("du -sk ~/.cache/fex-emu | cut -f1")
     kb = out.strip().splitlines()[-1] if out.strip() else ""
     r.check("FEX caches translated code on disk", ok and kb.isdigit() and int(kb) > 0, out[-200:])
