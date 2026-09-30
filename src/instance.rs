@@ -36,17 +36,30 @@ pub fn ssh_key() -> PathBuf {
 pub enum Os {
     Windows,
     Ubuntu,
+    /// Arch Linux ARM: an XFCE desktop set up like the Ubuntu guest, but with pacman and
+    /// Chromium.
+    Arch,
 }
 
-impl Os {
-    pub const ALL: [Os; 2] = [Os::Windows, Os::Ubuntu];
+/// Arch is a rolling release, so it has one version: a bare `arch` means `arch-rolling`.
+pub const ARCH_VERSION: &str = "rolling";
 
-    /// The version a bare `ubuntu` or `windows` means: the newest release agentpc knows.
+impl Os {
+    pub const ALL: [Os; 3] = [Os::Windows, Os::Ubuntu, Os::Arch];
+
+    /// The version a bare `ubuntu`, `windows` or `arch` means: the newest release agentpc knows.
     pub fn default_version(self) -> &'static str {
         match self {
             Os::Windows => "11-25h2",
             Os::Ubuntu => "24.04",
+            Os::Arch => ARCH_VERSION,
         }
+    }
+
+    /// A Linux guest: X11 desktop, bash over SSH, the SMBIOS SSH-key service and
+    /// cua-driver in `~/.local/bin`.
+    pub fn is_linux(self) -> bool {
+        matches!(self, Os::Ubuntu | Os::Arch)
     }
 
     /// Memory (GB) and CPUs a VM gets unless created with others. Image snapshots are
@@ -54,7 +67,7 @@ impl Os {
     pub fn default_size(self) -> (u32, u32) {
         match self {
             Os::Windows => (8, 4),
-            Os::Ubuntu => (4, 4),
+            Os::Ubuntu | Os::Arch => (4, 4),
         }
     }
 
@@ -62,7 +75,7 @@ impl Os {
     pub fn boot_timeout(self) -> u64 {
         match self {
             Os::Windows => 300,
-            Os::Ubuntu => 180,
+            Os::Ubuntu | Os::Arch => 180,
         }
     }
 }
@@ -90,6 +103,9 @@ impl Image {
         }
         if os == Os::Windows && version.ends_with(X86_APPS) {
             bail!("Windows runs x64 and x86 apps through Prism already; use a plain windows image");
+        }
+        if os == Os::Arch && version.ends_with(X86_APPS) {
+            bail!("x86 apps are only available on ubuntu images (ubuntu-x86apps)");
         }
         // It becomes part of file names and registry tags.
         if version.is_empty()
@@ -227,6 +243,7 @@ impl fmt::Display for Os {
         f.pad(match self {
             Os::Windows => "windows",
             Os::Ubuntu => "ubuntu",
+            Os::Arch => "arch",
         })
     }
 }
@@ -237,7 +254,8 @@ impl FromStr for Os {
         match s {
             "windows" => Ok(Os::Windows),
             "ubuntu" => Ok(Os::Ubuntu),
-            _ => bail!("unknown os '{s}' (windows|ubuntu)"),
+            "arch" => Ok(Os::Arch),
+            _ => bail!("unknown os '{s}' (windows|ubuntu|arch)"),
         }
     }
 }
@@ -820,7 +838,7 @@ mod tests {
         }
         assert_eq!(
             "Ubuntu-22.04".parse::<Image>().err().map(|e| e.to_string()),
-            Some("unknown os 'Ubuntu' (windows|ubuntu)".into())
+            Some("unknown os 'Ubuntu' (windows|ubuntu|arch)".into())
         );
         assert!("ubuntu-../x".parse::<Image>().is_err());
         assert!("macos".parse::<Image>().is_err());
@@ -834,5 +852,12 @@ mod tests {
         let i: Image = "ubuntu-22.04".parse().unwrap();
         assert_eq!((i.x86_apps(), i.release()), (false, "22.04"));
         assert!("windows-x86apps".parse::<Image>().is_err());
+
+        let i: Image = "arch".parse().unwrap();
+        assert_eq!((i.os, i.to_string()), (Os::Arch, "arch-rolling".into()));
+        assert_eq!("arch-rolling".parse::<Image>().unwrap(), i);
+        assert!(!i.x86_apps());
+        assert!("arch-x86apps".parse::<Image>().is_err());
+        assert!("arch-rolling-x86apps".parse::<Image>().is_err());
     }
 }

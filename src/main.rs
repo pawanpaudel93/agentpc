@@ -1,4 +1,4 @@
-//! agentpc: instant, resettable Windows and Ubuntu desktop VMs for AI agents on Apple Silicon Macs.
+//! agentpc: instant, resettable Windows, Ubuntu and Arch Linux desktop VMs for AI agents on Apple Silicon Macs.
 
 mod image;
 mod instance;
@@ -31,7 +31,7 @@ macro_rules! log {
 #[command(
     name = "agentpc",
     version,
-    about = "Instant, resettable Windows and Ubuntu desktops for AI agents"
+    about = "Instant, resettable Windows, Ubuntu and Arch Linux desktops for AI agents"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -42,11 +42,11 @@ struct Cli {
 enum Cmd {
     /// Create a VM from an image and boot it (default name: <os>-<n>); gets the image if missing
     Create {
-        /// ubuntu, windows, or a version: ubuntu-22.04, ubuntu-x86apps, windows-11-23h2 (see image build --help)
+        /// ubuntu, windows, arch, or a version: ubuntu-22.04, ubuntu-x86apps, windows-11-23h2 (see image build --help)
         image: String,
         /// VM name (default: <os>-<n>)
         name: Option<String>,
-        /// Memory in GB (default 8 Windows, 4 Ubuntu); a non-default size cold-boots
+        /// Memory in GB (default 8 Windows, 4 Ubuntu and Arch); a non-default size cold-boots
         #[arg(long)]
         memory: Option<u32>,
         /// CPUs (default 4); a non-default count cold-boots
@@ -116,7 +116,7 @@ enum Cmd {
         /// Checkpoint name (agentpc info <name> lists them)
         label: String,
     },
-    /// Shell into a VM, or run a command (PowerShell on Windows, bash on Ubuntu)
+    /// Shell into a VM, or run a command (PowerShell on Windows, bash on Ubuntu and Arch)
     Ssh {
         /// VM name
         name: String,
@@ -211,6 +211,7 @@ Images are <os>-<version>; a bare os means the default version.
   windows-11-25h2             Windows 11 25H2 Home/Pro (default: windows, windows-11)
   windows-11-24h2             Windows 11 24H2 Home/Pro (archive mirror)
   windows-11-23h2             Windows 11 23H2 Home/Pro (archive mirror)
+  arch-rolling                Arch Linux ARM (default: arch); pull it, building isn't supported yet
 ISOs are checksum-verified. --iso installs your own: it must match a release name above,
 or use any other name (windows-custom).")]
     Build {
@@ -221,9 +222,9 @@ or use any other name (windows-custom).")]
         #[arg(long)]
         iso: Option<PathBuf>,
     },
-    /// Download a published image, e.g. ubuntu-22.04 (Ubuntu only; Windows can't be redistributed)
+    /// Download a published image, e.g. ubuntu-22.04 or arch (Windows can't be redistributed)
     Pull {
-        /// Image, e.g. ubuntu or ubuntu-22.04
+        /// Image, e.g. ubuntu, ubuntu-22.04 or arch
         image: String,
     },
     /// Publish a local image to the registry (maintainers; needs `oras login`)

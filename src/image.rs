@@ -60,6 +60,7 @@ pub(crate) const WINDOWS_ISOS: [WinIso; 3] = [
 ];
 
 const UBUNTU_PREPARE: &str = include_str!("../guests/ubuntu/prepare.sh");
+const ARCH_PREPARE: &str = include_str!("../guests/arch/prepare.sh");
 const UBUNTU_X86_APPS: &str = include_str!("../guests/ubuntu/x86apps.sh");
 const FEX_PATCH: &str = include_str!("../guests/ubuntu/fex.patch");
 const WIN_PREPARE: &str = include_str!("../guests/windows/prepare.ps1");
@@ -127,9 +128,19 @@ impl Drop for BuildGuard {
     }
 }
 
+/// Why an Arch image can't be built here: Arch Linux ARM images come from the registry for now.
+pub(crate) const ARCH_BUILD_UNSUPPORTED: &str =
+    "building Arch Linux ARM images isn't supported yet";
+
 /// `build`, for a caller already holding the image lock.
 pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     let os = image.os;
+    if os == Os::Arch {
+        bail!(
+            "{ARCH_BUILD_UNSUPPORTED}; pull one instead: {} image pull {image}",
+            crate::setup::cmd_name()
+        );
+    }
     if !image.instances()?.is_empty() {
         bail!("VMs of {image} depend on it; rm them first");
     }
@@ -142,6 +153,7 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
         Os::Windows => 35,
         Os::Ubuntu if image.x86_apps() => 16,
         Os::Ubuntu => 12,
+        Os::Arch => unreachable!("arch images aren't built here"),
     };
     crate::ops::ensure_free_space(need_gb, &format!("build {image}"))?;
 
@@ -158,7 +170,7 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
             log!("installing from {}", iso.display());
             Some(iso)
         }
-        Os::Ubuntu => None,
+        Os::Ubuntu | Os::Arch => None,
     };
     let guard = BuildGuard::new(Instance::create_scratch(&name, image)?);
     match &iso_path {
@@ -233,7 +245,7 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
     // Let post-logon startup finish so clones don't all redo it after resuming.
     let settle = match os {
         Os::Windows => 45,
-        Os::Ubuntu => 10,
+        Os::Ubuntu | Os::Arch => 10,
     };
     log!("{os} ready in {}s; settling {settle}s", took.as_secs());
     // Guest-reported fields refresh; build-time ones (base, built, ISO checksum) are kept.
@@ -322,15 +334,16 @@ fn prepare_guest(inst: &Instance) -> Result<()> {
     log!("applying agent defaults to {}", inst.os);
     let script = match inst.os {
         Os::Ubuntu => UBUNTU_PREPARE,
+        Os::Arch => ARCH_PREPARE,
         Os::Windows => WIN_PREPARE,
     };
     run_guest_script(inst, script, "prepare")
 }
 
-/// Upload `script` and run it as root (Ubuntu) or as the agent user (Windows).
+/// Upload `script` and run it as root (Linux) or as the agent user (Windows).
 fn run_guest_script(inst: &Instance, script: &str, what: &str) -> Result<()> {
     let (name, run) = match inst.os {
-        Os::Ubuntu => (
+        Os::Ubuntu | Os::Arch => (
             format!("/tmp/agentpc-{what}.sh"),
             format!("sudo sh /tmp/agentpc-{what}.sh && rm -f /tmp/agentpc-{what}.sh"),
         ),
@@ -405,6 +418,14 @@ echo "arch=$(dpkg --print-architecture)"
 echo "serial=$(sed -n 's/^serial: *//p' /etc/cloud/build.info 2>/dev/null)"
 echo "server=$(~/.local/bin/cua-driver --version 2>/dev/null | awk '{print $NF}')""#
         }
+        // Arch Linux ARM's os-release has no VERSION_ID (it's rolling); BUILD_ID says so.
+        Os::Arch => {
+            r#". /etc/os-release
+echo "version=$PRETTY_NAME"
+echo "version_id=${VERSION_ID:-${BUILD_ID:-}}"
+echo "arch=$(uname -m)"
+echo "server=$(~/.local/bin/cua-driver --version 2>/dev/null | awk '{print $NF}')""#
+        }
         // ProductName still says "Windows 10" on Windows 11; the WMI caption doesn't.
         Os::Windows => {
             r#"$v = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
@@ -443,6 +464,20 @@ $cua = "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin\cua-driver.exe"
             ),
             format!("cua-driver {server}"),
         ),
+        Os::Arch => {
+            let id = get("version_id");
+            let id = if id.is_empty() {
+                crate::instance::ARCH_VERSION.to_string()
+            } else {
+                id
+            };
+            (
+                get("version"),
+                id,
+                String::new(), // described by whoever made the disk; kept from the pulled info
+                format!("cua-driver {server}"),
+            )
+        }
         Os::Windows => {
             let caption = get("caption");
             let major = if caption.contains("Windows 11") {

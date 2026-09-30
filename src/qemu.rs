@@ -271,7 +271,7 @@ fn launch(
                 ["-device", "scsi-hd,drive=data,bus=scsi0.0,bootindex=3"].map(String::from),
             );
         }
-        Os::Ubuntu => {
+        Os::Ubuntu | Os::Arch => {
             // Images are shared (ghcr), so the guest can't have this Mac's key baked in; it
             // reads it from this SMBIOS OEM string at boot (agentpc-ssh-key.service).
             crate::image::ensure_ssh_key()?;

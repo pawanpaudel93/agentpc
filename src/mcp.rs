@@ -30,24 +30,28 @@ use crate::instance::{Image, Instance, Os};
 use crate::{ops, qemu};
 
 const INSTRUCTIONS: &str = "\
-Controls instant, resettable Windows and Ubuntu desktop VMs on this Mac. Treat VMs as
+Controls instant, resettable Windows, Ubuntu and Arch Linux desktop VMs on this Mac. Treat VMs as
 throwaway sandboxes.
 
 Flow: list_vms -> create_vm (or start_vm on one you created) -> take_screenshot -> list_desktop_tools ->
 use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance to a clean
 install; checkpoint_vm/restore_vm save and return to any point in seconds (disk and memory) --
 checkpoint before a risky or slow-to-redo step. run_command runs PowerShell on Windows and bash
-on Ubuntu; the guest login is agent/agent. create_vm takes an optional version (Ubuntu release
-like \"22.04\"; Windows \"11-25h2\", \"11-24h2\", \"11-23h2\"); list_vms shows which images exist.
+on Ubuntu and Arch; the guest login is agent/agent. create_vm takes an optional version (Ubuntu
+release like \"22.04\"; Windows \"11-25h2\", \"11-24h2\", \"11-23h2\"; Arch is rolling, no version);
+list_vms shows which images exist.
 The first create of an image can take minutes (download/build); after that it's seconds.
-Both guests are ARM64. On Windows, x64 and x86 programs run through Prism emulation (slower;
+All guests are ARM64. On Windows, x64 and x86 programs run through Prism emulation (slower;
 no x64 drivers), so prefer an ARM64 build when one exists. For x86_64 Linux programs, create
 ubuntu with version \"x86apps\": they run through FEX translation, about 2x slower; amd64
 containers (docker run --platform linux/amd64) work there too.
+An Arch Linux ARM guest (os \"arch\") works like Ubuntu (XFCE, bash, the same desktop tools), but
+packages come from pacman (sudo pacman -S --needed --noconfirm <pkg>) and its browser is Chromium:
+launch_app {\"name\": \"chromium\", \"additional_arguments\": [\"<url>\"]} where Ubuntu uses google-chrome.
 
-Desktop tools come from cua-driver on both OSes: launch_app returns a pid and window_ids;
+Desktop tools come from cua-driver on every OS: launch_app returns a pid and window_ids;
 get_window_state(pid, window_id) returns numbered elements and a snapshot_id to pass with
-element_index to click/type_text. On Ubuntu, keyboard/mouse input needs \"delivery_mode\":
+element_index to click/type_text. On Ubuntu and Arch, keyboard/mouse input needs \"delivery_mode\":
 \"foreground\"; on Windows, typing into the focused field, scroll, drag and right-click often do.
 list_desktop_tools shows each tool's required arguments; a call with wrong arguments returns
 the tool's argument list.
@@ -55,7 +59,7 @@ the tool's argument list.
 If get_window_state comes back \"degraded\" (no elements), act by pixels instead: pass x/y read
 from the screenshot of a get_window_state call that included one (the default).
 
-Web pages on Ubuntu (Google Chrome):
+Web pages on Ubuntu (Google Chrome) and Arch (Chromium: use \"chromium\" for \"google-chrome\"):
 - To read a page: launch_app {\"name\": \"google-chrome\", \"additional_arguments\": [\"<url>\"]},
   then get_window_state on its window; the page's text, links and fields are in the tree.
 - To drive a page with the browser_* tools: browser_prepare {\"allow_launch\": true, \"profile\":
@@ -204,6 +208,7 @@ struct NameArgs {
 enum OsArg {
     Windows,
     Ubuntu,
+    Arch,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -212,10 +217,11 @@ struct CreateArgs {
     /// Default: ubuntu 24.04, windows 11. Ubuntu: any release, e.g. "22.04", "26.04";
     /// "x86apps" (or "24.04-x86apps") is Ubuntu that also runs x86_64 Linux programs.
     /// Windows: "11-25h2", "11-24h2" or "11-23h2". Omitted, Windows uses 25H2, or the newest
-    /// installed Windows 11 image if 25H2 isn't built.
+    /// installed Windows 11 image if 25H2 isn't built. Arch: rolling release, "rolling" (the
+    /// default) only.
     version: Option<String>,
     name: Option<String>,
-    /// Memory in GB (default 8 on Windows, 4 on Ubuntu). A non-default size boots cold
+    /// Memory in GB (default 8 on Windows, 4 on Ubuntu and Arch). A non-default size boots cold
     /// (~25 s Windows, ~15 s Ubuntu) instead of resuming the image's snapshot.
     #[schemars(range(min = 2, max = 64))]
     memory_gb: Option<u32>,
@@ -258,7 +264,7 @@ struct UploadArgs {
     /// File or directory on this Mac (absolute, or relative to the server's working directory).
     host_path: String,
     /// Destination in the VM; relative paths are under the agent user's home
-    /// (e.g. "Downloads/" on Windows, "/tmp/" on Ubuntu).
+    /// (e.g. "Downloads/" on Windows, "/tmp/" on Ubuntu and Arch).
     guest_path: String,
 }
 
@@ -376,6 +382,7 @@ impl Gateway {
         let os = match a.os {
             OsArg::Windows => Os::Windows,
             OsArg::Ubuntu => Os::Ubuntu,
+            OsArg::Arch => Os::Arch,
         };
         let owner = self.owner_tag(&ctx);
         // Idempotent retry: a create re-sent after a client timeout finds its own VM already
@@ -583,7 +590,7 @@ impl Gateway {
 
     #[tool(
         title = "Run command",
-        description = "Run a shell command in the instance over SSH: PowerShell on windows, bash on ubuntu.\n\
+        description = "Run a shell command in the instance over SSH: PowerShell on windows, bash on ubuntu and arch.\n\
                           Returns the exit code, stdout and stderr; each stream is trimmed to its first and\n\
                           last 10,000 characters (write big output to a file and download_file it).\n\
                           Foreground runs are killed at `timeout` seconds (default 120) with their partial\n\
@@ -1019,8 +1026,8 @@ async fn connect(name: &str) -> Result<RunningService<RoleClient, ()>> {
                 });
                 Ok(().serve(TokioChildProcess::new(cmd)?).await?)
             }
-            Os::Ubuntu => {
-                let remote = format!("{} ~/.local/bin/cua-driver mcp", ops::UBUNTU_SESSION_ENV);
+            Os::Ubuntu | Os::Arch => {
+                let remote = format!("{} ~/.local/bin/cua-driver mcp", ops::LINUX_SESSION_ENV);
                 let cmd = tokio::process::Command::new("ssh").configure(|c| {
                     c.args(ops::ssh_args(&inst, &remote));
                 });
@@ -1078,10 +1085,10 @@ async fn exec(name: &str, command: &str, timeout: u64, desktop_env: bool) -> Res
     }
     // A foreground bash command needs the logged-in desktop session's env to reach the display
     // (xdotool, GUI apps); the background path sets it itself, so it opts out.
-    let command = match (inst.os, desktop_env) {
-        (Os::Ubuntu, true) => format!("export {}; {command}", ops::UBUNTU_SESSION_ENV),
-        (Os::Ubuntu, false) => command.to_string(),
-        (Os::Windows, _) => ops::windows_command(command),
+    let command = match (inst.os.is_linux(), desktop_env) {
+        (true, true) => format!("export {}; {command}", ops::LINUX_SESSION_ENV),
+        (true, false) => command.to_string(),
+        (false, _) => ops::windows_command(command),
     };
     let mut child = tokio::process::Command::new("ssh")
         .args(ops::ssh_args(&inst, &command))
@@ -1155,14 +1162,14 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
         // Separate lines: `a && b &` would background the whole list, and that shell would
         // hold the SSH session open. The wrapper records the exit code in <id>.exit so
         // get_job_status can report it after the job ends.
-        Os::Ubuntu => format!(
+        Os::Ubuntu | Os::Arch => format!(
             "d=~/agentpc-bg; mkdir -p $d && echo {b64} | base64 -d > $d/{id}.sh || exit 1\n\
              {env} setsid nohup bash -c 'bash \"$0\"; echo $? > \"$1\"' \
              $d/{id}.sh $d/{id}.exit > $d/{id}.log 2>&1 < /dev/null &\n\
              echo \"started in the background (id {id}, pid $!). \
              Poll it with get_job_status name={name} id={id}. \
              Output: $HOME/agentpc-bg/{id}.log. Stop it with: kill $!\"",
-            env = ops::UBUNTU_SESSION_ENV
+            env = ops::LINUX_SESSION_ENV
         ),
         Os::Windows => format!(
             r#"$d = "$env:USERPROFILE\agentpc-bg"; New-Item -ItemType Directory -Force $d | Out-Null
@@ -1192,7 +1199,7 @@ async fn job_status(name: &str, id: u64, tail_lines: usize) -> Result<String> {
         bail!("VM {name} is not running; start_vm first");
     }
     let script = match inst.os {
-        Os::Ubuntu => format!(
+        Os::Ubuntu | Os::Arch => format!(
             "d=~/agentpc-bg\n\
              if [ ! -f $d/{id}.log ]; then echo 'STATE: no such job'; exit 0; fi\n\
              if [ -f $d/{id}.exit ]; then echo \"STATE: exited $(cat $d/{id}.exit)\"; \

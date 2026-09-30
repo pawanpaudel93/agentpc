@@ -10,8 +10,9 @@ use anyhow::{Context, Result, bail};
 use crate::instance::{Image, Instance, Os, ssh_key};
 use crate::{log, qemu, viewer};
 
-/// Session env for cua-driver: the Ubuntu autologin X session and its AT-SPI bus.
-pub const UBUNTU_SESSION_ENV: &str = "DISPLAY=:0 XAUTHORITY=/home/agent/.Xauthority \
+/// Session env for cua-driver: the Linux guests' autologin X session (the `agent` user,
+/// uid 1000) and its AT-SPI bus.
+pub const LINUX_SESSION_ENV: &str = "DISPLAY=:0 XAUTHORITY=/home/agent/.Xauthority \
      XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus";
 
 pub const SSH_OPTS: [&str; 16] = [
@@ -226,11 +227,11 @@ else {{ 'missing' }}"#
                 },
             )
         }
-        Os::Ubuntu => Ok(ssh(
+        Os::Ubuntu | Os::Arch => Ok(ssh(
             inst,
             &format!(
                 "test -f /var/lib/cloud/agent-ready && pgrep -x xfce4-session >/dev/null && \
-                 {UBUNTU_SESSION_ENV} ~/.local/bin/cua-driver --version"
+                 {LINUX_SESSION_ENV} ~/.local/bin/cua-driver --version"
             ),
         )
         .is_ok_and(|o| o.status.success())),
@@ -470,9 +471,27 @@ pub fn create(
     boot(&inst)
 }
 
-/// First `create` from an image: fetch it (Ubuntu), or say how to build it (Windows).
+/// First `create` from an image: fetch it (Ubuntu, Arch), or say how to build it (Windows).
 fn provision_image(image: &Image) -> Result<()> {
     match image.os {
+        Os::Arch => {
+            let _lock = crate::instance::image_lock(image)?;
+            if image.exists() {
+                return Ok(());
+            }
+            log!("no {image} image yet; downloading it");
+            // No local build to fall back on: say so unless the download itself worked.
+            crate::registry::pull_locked(image).map_err(|e| {
+                if image.exists() {
+                    e.context(format!("setting up the downloaded {image} image"))
+                } else {
+                    e.context(format!(
+                        "downloading {image} failed, and {}",
+                        crate::image::ARCH_BUILD_UNSUPPORTED
+                    ))
+                }
+            })
+        }
         Os::Ubuntu => {
             let _lock = crate::instance::image_lock(image)?;
             // Another create may have fetched it while this one waited for the lock.
@@ -706,7 +725,7 @@ fn sync_clock(inst: &Instance) {
         Os::Windows => format!(
             "Set-Date -Date ([DateTimeOffset]::FromUnixTimeMilliseconds({ms}).LocalDateTime) | Out-Null"
         ),
-        Os::Ubuntu => format!("sudo date -s @{}.{:03} >/dev/null", ms / 1000, ms % 1000),
+        Os::Ubuntu | Os::Arch => format!("sudo date -s @{}.{:03} >/dev/null", ms / 1000, ms % 1000),
     };
     if let Err(e) = ssh(inst, &cmd).and_then(|o| {
         o.status
@@ -732,7 +751,7 @@ fn sync_timezone(inst: &Instance) {
         return;
     }
     let cmd = match inst.os {
-        Os::Ubuntu => format!("sudo timedatectl set-timezone {tz}"),
+        Os::Ubuntu | Os::Arch => format!("sudo timedatectl set-timezone {tz}"),
         // Windows PowerShell 5.1 (.NET Framework) can't map IANA ids, but Windows ships ICU.
         Os::Windows => windows_command(&format!(
             r#"Add-Type -TypeDefinition @"
