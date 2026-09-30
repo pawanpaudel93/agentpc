@@ -367,7 +367,7 @@ fn build_arch(image: &Image, name: &str) -> Result<()> {
             "-f",
             "qcow2",
             &target.to_string_lossy(),
-            "20G",
+            "40G",
         ],
     )?;
     // Added after the helper's own virtio disk (vda), so the guest sees it as /dev/vdb.
