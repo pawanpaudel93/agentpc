@@ -1,6 +1,6 @@
 ---
 name: agentpc
-description: Use agentpc to get an instant, resettable Windows, Ubuntu or Arch Linux ARM desktop VM on the user's Mac. Use it when a task needs a real, clean Windows or Linux machine, such as testing an installer, script or app on a fresh OS, reproducing a platform-specific bug, operating a GUI application, or taking screenshots of a desktop, and when the user mentions agentpc or asks for a Windows, Ubuntu or Arch Linux (ARM) VM.
+description: Use agentpc to get an instant, resettable Windows, Ubuntu or Arch Linux ARM desktop VM on the user's Mac. Use it when a task needs a real, clean Windows or Linux machine, such as testing an installer, script or app on a fresh OS, reproducing a platform-specific bug, operating a GUI application, running x86_64 Linux programs or amd64 containers on the Mac, or taking screenshots of a desktop, and when the user mentions agentpc or asks for a Windows, Ubuntu or Arch Linux (ARM) VM.
 ---
 
 # agentpc: instant, resettable desktops
@@ -23,8 +23,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 
 | Tool | Use |
 | --- | --- |
-| `list_vms` | VMs (state, size, checkpoints) and the available images with OS versions. Start here. |
-| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New VM (`ubuntu`, `windows` or `arch`, optionally a version such as `22.04`); returns when the desktop is ready. `offline: true` cuts it off from the internet and this Mac |
+| `list_vms` | VMs (state, size, checkpoints and, for running x86apps VMs, `x86_tso`) and the available images with OS versions. Start here. |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New VM (`ubuntu`, `windows` or `arch`, optionally a version such as `22.04` or `x86apps`); returns when the desktop is ready. `offline: true` cuts it off from the internet and this Mac |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down |
 | `reset_vm(name)` | Discard all changes: back to a clean install |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save the VM's disk and memory; go back to that state in seconds; or drop one checkpoint |
@@ -37,7 +37,7 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 | `list_forwards(name)` / `delete_forward(name, host_port)` | List a VM's forwards / stop one |
 | `read_vm_log(name, which, tail_lines?)` | Tail a VM's `qemu` or `serial` log when it won't boot or the desktop is unreachable |
 | `list_desktop_tools(name, tool?)` | List the GUI tools inside a VM, or one tool's full schema |
-| `use_desktop_tool(name, tool, arguments?)` | Call a GUI tool: click, type, launch apps, read the UI tree |
+| `use_desktop_tool(name, tool, arguments?)` | Call a GUI tool: click, type, launch apps, read the UI tree. A wrong name returns close matches |
 
 ## How to work
 
@@ -51,8 +51,11 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 4. For GUI work, loop: look (`take_screenshot` or a UI-snapshot tool), act (`use_desktop_tool`), then
    look again to verify.
 5. Call `list_desktop_tools` once per VM to learn the exact tool names and required arguments.
-   A call with wrong arguments returns that tool's argument list. The desktop driver is pinned
-   per image so tools match these docs: don't update it inside a VM (`reset_vm` restores it).
+   A call with wrong arguments returns that tool's argument list; a wrong tool name returns
+   close matches ("did you mean ..."). The desktop driver is pinned per image so tools match
+   these docs: don't update it inside a VM (`reset_vm` restores it). If a reply starts with a
+   reconnect note (the VM or its driver restarted), earlier snapshot ids and browser sessions
+   are gone: take a new snapshot and run `browser_prepare` again.
 6. When finished, `delete_vm` VMs you created, unless the user wants to keep them.
 
 ## Windows (desktop tools from cua-driver)
@@ -157,14 +160,20 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 - Don't create VMs you won't use. Each running VM uses 4 GB (Ubuntu, Arch) or 8 GB (Windows) of RAM.
 - The first `create_vm ubuntu` downloads the Ubuntu image (~1.2 GB). Another Ubuntu release
   (`version: "22.04"`, `"26.04"`, ...) is fetched or built the same way (~3 min).
-- `create_vm arch` (rolling release; no version needed, or `rolling-YYYYMMDD` to pin a build)
+- `create_vm arch` (rolling release; no version needed, `x86apps`, or `rolling-YYYYMMDD` /
+  `rolling-x86apps-YYYYMMDD` to pin a published build)
   downloads the Arch image on first use, or builds it locally (~6 min) if the download fails.
-- **x86_64 Linux programs** need `create_vm(os: "ubuntu", version: "x86apps")`: FEX translates
-  them to arm64, about 2x slower (JIT runtimes like Node ~6x); run them directly (`./tool`).
-  Go programs work (the image sets `GODEBUG=asyncpreemptoff=1` for them). A missing x86
-  library: `sudo apt install libfoo:amd64`. x86 containers work too
-  (`sudo apt install docker.io`, then `docker run --platform linux/amd64 ...`). x86 Electron/Chromium apps (VS Code, Slack, ...) need
-  `--no-sandbox`. The first create builds the image locally (~8 min).
+- **x86 Linux programs** (x86_64 and i386) need an x86apps VM: `create_vm(os: "ubuntu" or
+  "arch", version: "x86apps")`. FEX translates them to arm64, about 2× slower (JIT runtimes
+  like Node 6–7×); run them directly (`./tool`). Go programs work (the image sets
+  `GODEBUG=asyncpreemptoff=1` for them). x86 containers work too: install Docker (`sudo apt
+  install docker.io` on Ubuntu; `sudo pacman -Syu --noconfirm docker && sudo systemctl start
+  docker` on Arch), then `docker run --platform linux/amd64 ...`. x86 Electron/Chromium apps
+  (VS Code, Slack, ...) need `--no-sandbox`. A missing x86 library on Ubuntu: `sudo apt install
+  libfoo:amd64`; Arch has no multiarch, so x86 programs there use the libraries in FEX's x86
+  Arch Linux tree. `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or
+  `emulated`. The first create downloads the image, or builds it locally (~8 min Ubuntu,
+  ~10 min Arch) if the download fails.
 - Windows images can't be downloaded. If `list_vms` shows no Windows image, ask the user to
   build one once (~12 min) and don't start it yourself:
   `agentpc image build windows` (downloads the official ISO from Microsoft, 7.3 GB). Other

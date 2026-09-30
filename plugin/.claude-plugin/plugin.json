@@ -10,5 +10,5 @@
   "homepage": "https://github.com/pawanpaudel93/agentpc",
   "repository": "https://github.com/pawanpaudel93/agentpc",
   "license": "MIT",
-  "keywords": ["virtual-machine", "windows", "ubuntu", "computer-use", "desktop", "qemu", "apple-silicon", "testing"]
+  "keywords": ["virtual-machine", "windows", "ubuntu", "computer-use", "desktop", "qemu", "apple-silicon", "testing", "arch", "linux", "x86"]
 }

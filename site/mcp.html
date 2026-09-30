@@ -156,7 +156,7 @@ tool_timeout_sec = 900</code></pre>
               <tbody>
                 <tr>
                   <td><code translate="no">list_vms</code></td>
-                  <td>VMs (owner, state, size, checkpoints, viewer) and the images they come from, with OS versions. Start here.</td>
+                  <td>VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, <code translate="no">x86_tso</code>) and the images they come from, with OS versions. Start here.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">create_vm</code></td>
@@ -164,9 +164,9 @@ tool_timeout_sec = 900</code></pre>
                     New clone, returned once its desktop is ready: Ubuntu or Arch ~1 s, Windows ~4 s (the first
                     create of an image can take minutes). Takes <code translate="no">os</code>
                     (<code translate="no">ubuntu</code>, <code translate="no">windows</code> or <code translate="no">arch</code>), and optionally
-                    <code translate="no">version</code> (Ubuntu <code translate="no">"22.04"</code>, or <code translate="no">"x86apps"</code> to also run x86_64 Linux programs; Windows
+                    <code translate="no">version</code> (Ubuntu <code translate="no">"22.04"</code>, or <code translate="no">"x86apps"</code> / <code translate="no">"22.04-x86apps"</code> to also run x86_64 and i386 Linux programs; Windows
                     <code translate="no">"11-25h2"</code>, <code translate="no">"11-24h2"</code>,
-                    <code translate="no">"11-23h2"</code>; Arch is rolling, so only the default, <code translate="no">"rolling"</code>, or a pinned <code translate="no">"rolling-YYYYMMDD"</code> download), <code translate="no">name</code>,
+                    <code translate="no">"11-23h2"</code>; Arch is rolling, so the default, <code translate="no">"rolling"</code>, <code translate="no">"x86apps"</code>, or a pinned <code translate="no">"rolling-YYYYMMDD"</code> / <code translate="no">"rolling-x86apps-YYYYMMDD"</code> download), <code translate="no">name</code>,
                     <code translate="no">memory_gb</code> (2–64, default 8 Windows / 4 Ubuntu and Arch),
                     <code translate="no">cpus</code> (1–16, default 4) and <code translate="no">offline</code>.
                     A non-default size boots cold (~25 s Windows, ~15 s Ubuntu and Arch). Retrying in the same session returns the
@@ -259,7 +259,7 @@ tool_timeout_sec = 900</code></pre>
                 </tr>
                 <tr>
                   <td><code translate="no">list_desktop_tools</code></td>
-                  <td>The desktop-control tools inside a VM, with each one's required arguments and whether it's read-only, or one tool's full schema.</td>
+                  <td>The desktop-control tools inside a VM, with each one's required arguments and whether it's read-only, or one tool's full schema (a mistyped name returns close matches).</td>
                 </tr>
                 <tr>
                   <td><code translate="no">use_desktop_tool</code></td>
@@ -276,7 +276,7 @@ tool_timeout_sec = 900</code></pre>
           <section class="doc-section" id="desktop">
             <h2>Desktop control</h2>
             <p>
-              Both guests run <a href="https://github.com/trycua/cua">cua-driver</a> and are
+              All three guests (Windows, Ubuntu, Arch) run <a href="https://github.com/trycua/cua">cua-driver</a> and are
               1280×800. Work in a loop: look (<code translate="no">take_screenshot</code> or a
               snapshot tool), act (<code translate="no">use_desktop_tool</code>), then look again to
               verify. Prefer <code translate="no">run_command</code> for anything a shell can do.
@@ -321,7 +321,10 @@ tool_timeout_sec = 900</code></pre>
                     use <code translate="no">chromium</code> wherever Ubuntu uses
                     <code translate="no">google-chrome</code>. Install packages with
                     <code translate="no">sudo pacman -Syu --noconfirm &lt;pkg&gt;</code> (Arch doesn't support
-                    partial upgrades).
+                    partial upgrades). The first <code translate="no">-Syu</code> may upgrade everything, so give
+                    <code translate="no">run_command</code> a longer <code translate="no">timeout</code> or
+                    <code translate="no">background: true</code>, and reboot (<code translate="no">start_vm</code>) after a
+                    kernel upgrade before loading new modules. <code translate="no">/tmp</code> is a tmpfs, cleared at every boot.
                   </td>
                 </tr>
               </tbody>
@@ -334,6 +337,23 @@ tool_timeout_sec = 900</code></pre>
     "pid": 4120, "window_id": 65812, "snapshot_id": "s1a2b3c4d",
     "element_index": 7, "text": "Hello from the agent" } }</code></pre>
             </div>
+            <p>
+              If a reply starts with a reconnect note (the VM or its driver restarted), earlier snapshot ids
+              and browser sessions are gone: take a new snapshot and run <code translate="no">browser_prepare</code> again.
+            </p>
+            <h3>Guest tips</h3>
+            <p>
+              All guests are ARM64. On Windows, x64/x86 apps run through Prism (~2–4× slower; no x64 drivers).
+              For x86_64 and i386 Linux programs, create <code translate="no">ubuntu</code> or <code translate="no">arch</code>
+              with <code translate="no">version: "x86apps"</code>: they run through FEX, about 2× slower (Node 6–7×).
+              Go programs work; amd64 containers run with <code translate="no">docker run --platform linux/amd64</code>
+              (on Arch, first <code translate="no">sudo pacman -Syu --noconfirm docker &amp;&amp; sudo systemctl start docker</code>);
+              x86 Electron/Chromium apps need <code translate="no">--no-sandbox</code>. On Ubuntu, a missing x86 library
+              installs with <code translate="no">sudo apt install libfoo:amd64</code>; Arch has no multiarch, so x86
+              programs use the image's x86 Arch Linux tree. <code translate="no">list_vms</code> shows
+              <code translate="no">x86_tso</code>: <code translate="no">hardware</code> (needs macOS 15+) or
+              <code translate="no">emulated</code>.
+            </p>
           </section>
 
           <section class="doc-section" id="workflow">

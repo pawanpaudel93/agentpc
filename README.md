@@ -50,6 +50,8 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
 - **Agent-ready guests.** 1280x800 desktops with a browser (Edge on Windows, Chrome on Ubuntu, Chromium on Arch)
   and the pop-ups, update restarts and background jobs that interrupt unattended work turned off.
 - **Watch along.** Every VM has a browser viewer, so you can see what the agent is doing.
+- **x86 apps.** x64 Windows apps run through Prism; `ubuntu-x86apps` / `arch-x86apps` run
+  x86_64 Linux programs and amd64 containers through [FEX](https://fex-emu.com).
 - **Any version, side by side.** Run Ubuntu 22.04, 24.04 and 26.04, or several Windows 11
   releases, at the same time. Each image records its OS version, source and build date.
 - **Local and private.** Everything runs on your Mac and listens on `127.0.0.1` only.
@@ -221,7 +223,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 | --- | --- |
 | `agentpc create <image> [name] [--memory GB] [--cpus N] [--offline]` | Create a VM from `ubuntu`, `windows`, `arch` or a version such as `ubuntu-22.04`; fetches Ubuntu and Arch images if missing. `--memory` is 2–64 GB, `--cpus` 1–16; a non-default size boots cold instead of resuming. `--offline`: no internet or access to this Mac |
 | `agentpc list [--json]` (`ls`) | VMs and images; `--json` gives the same data as the MCP `list_vms` tool |
-| `agentpc info <name>` | Viewer URL (with the VNC password), SSH and VNC details, and checkpoints |
+| `agentpc info <name>` | Viewer URL (with the VNC password), SSH and VNC details, checkpoints, and on x86apps VMs how x86 programs run (`x86 programs: FEX, hardware\|emulated TSO`) |
 | `agentpc start <name>… \| --all` | Boot stopped VMs |
 | `agentpc stop <name>… \| --all` | Shut VMs down cleanly; disks are kept |
 | `agentpc reset <name>…` | Discard all changes: back to a fresh copy of the image |
@@ -237,11 +239,11 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 
 | Command | Description |
 | --- | --- |
-| `agentpc image pull <image>` | Download a published image, e.g. `ubuntu`, `ubuntu-22.04` or `arch` |
-| `agentpc image build <image> [--iso <path>]` | Build an image locally (Ubuntu ~3 min, Arch ~6 min, Windows ~12 min + ISO download) |
+| `agentpc image pull <image>` | Download a published image, e.g. `ubuntu`, `ubuntu-22.04`, `ubuntu-x86apps`, `arch`, `arch-x86apps` or a pinned `arch-rolling-YYYYMMDD` |
+| `agentpc image build <image> [--iso <path>]` | Build an image locally (Ubuntu ~3 min, Arch ~6 min, `ubuntu-x86apps` ~8 min, `arch-x86apps` ~10 min, Windows ~12 min + ISO download) |
 | `agentpc image ls` (`list`) | List local images with their OS versions |
 | `agentpc image info <image>` | Version, source, build date and desktop server of an image |
-| `agentpc image rm <image>…` (`delete`) | Delete local images |
+| `agentpc image rm <image>…` (`delete`) | Delete local images (refused while VMs or a running build use one) |
 | `agentpc image snapshot <image>` | Recapture the snapshot VMs resume from (build and pull do this) |
 | `agentpc image push <image>` | Maintainers: publish an Ubuntu or Arch image to ghcr.io |
 
@@ -273,8 +275,10 @@ full name when the release matters, e.g. in test harnesses.
 | --- | --- | --- |
 | `ubuntu` = `ubuntu-24.04` | Official Ubuntu 24.04 cloud image | `image pull` (automatic on first `create`) or `image build` |
 | `ubuntu-<release>` | Any release in [cloud-images.ubuntu.com/releases](https://cloud-images.ubuntu.com/releases/), e.g. `22.04`, `26.04` | `image build ubuntu-22.04`, or `image pull` if published |
-| `ubuntu-x86apps` = `ubuntu-24.04-x86apps` | Ubuntu 24.04 that also runs x86_64 Linux programs (see [x86_64 Linux programs](#x86_64-linux-programs)) | Built on first `create` (~8 min), or `image build ubuntu-x86apps` |
+| `ubuntu-x86apps` = `ubuntu-24.04-x86apps` | Ubuntu 24.04 that also runs x86_64 and i386 Linux programs (see [x86_64 Linux programs](#x86_64-linux-programs)) | `image pull` (automatic on first `create`; built locally, ~8 min, if the download fails) or `image build ubuntu-x86apps` |
+| `ubuntu-<release>-x86apps` | Another release with x86 programs, e.g. `ubuntu-22.04-x86apps` | `image build ubuntu-22.04-x86apps`, or `image pull` if published |
 | `arch` = `arch-rolling` | [Arch Linux ARM](https://archlinuxarm.org) (a community port of Arch), installed from its aarch64 tarball in an Ubuntu helper VM | `image pull` (automatic on first `create`; built locally, ~6 min, if the download fails) or `image build arch` (needs the Ubuntu image, fetched if missing) |
+| `arch-x86apps` = `arch-rolling-x86apps` | Arch Linux ARM that also runs x86_64 and i386 Linux programs (see [x86_64 Linux programs](#x86_64-linux-programs)) | `image pull` (automatic on first `create`; built locally, ~10 min, if the download fails) or `image build arch-x86apps` |
 | `windows-11-25h2` (`windows`) | Windows 11 25H2 (Home/Pro), 7.3 GB ISO from Microsoft | `image build windows` |
 | `windows-11-24h2`, `windows-11-23h2` | Earlier Windows 11 releases (Home/Pro) | `image build windows-11-23h2` |
 | `windows-<name>` | Your own Windows 11 ARM64 Home/Pro ISO | `image build windows-<name> --iso <path>` |
@@ -327,8 +331,12 @@ name. Windows images can't be redistributed:
 | `ubuntu-24.04` | Newest build of Ubuntu 24.04 (also tagged `ubuntu`) | `agentpc image pull ubuntu` |
 | `ubuntu-<release>` | Newest build of another release | `agentpc image pull ubuntu-22.04` |
 | `ubuntu-24.04-YYYYMMDD` | One specific build (pinned) | `agentpc image pull ubuntu-24.04-YYYYMMDD` |
+| `ubuntu-24.04-x86apps` | Newest build of Ubuntu 24.04 with x86 programs | `agentpc image pull ubuntu-x86apps` |
+| `ubuntu-24.04-x86apps-YYYYMMDD` | One specific build (pinned) | `agentpc image pull ubuntu-24.04-x86apps-YYYYMMDD` |
 | `arch-rolling` | Newest build of Arch Linux ARM (also tagged `arch`) | `agentpc image pull arch` |
-| `arch-rolling-YYYYMMDD` | One specific build (pinned) | `agentpc image pull arch-rolling-YYYYMMDD` |
+| `arch-rolling-YYYYMMDD` | One specific build (pinned; can't be built locally) | `agentpc image pull arch-rolling-YYYYMMDD` |
+| `arch-rolling-x86apps` | Newest build of Arch Linux ARM with x86 programs | `agentpc image pull arch-x86apps` |
+| `arch-rolling-x86apps-YYYYMMDD` | One specific build (pinned; can't be built locally) | `agentpc image pull arch-rolling-x86apps-YYYYMMDD` |
 
 ## Configuration
 
@@ -384,6 +392,12 @@ The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
 - **Arch build.** A clone of the Ubuntu image gets a blank second disk, and a script installs
   the Arch Linux ARM tarball onto it: systemd-boot, XFCE on X11 with auto-login, Chromium and
   the same pinned cua-driver. That disk becomes the image.
+- **x86apps build.** On `ubuntu-x86apps` and `arch-x86apps`, `guests/<os>/x86apps.sh` builds
+  [FEX](https://fex-emu.com) (version pinned there) from source as a static-pie with
+  `guests/ubuntu/fex.patch` (so x86 containers work) and installs an x86 root filesystem
+  (Ubuntu or Arch Linux) as a squashfs. QEMU for these VMs loads `src/hvf_tso.c`, which turns on
+  the CPU's TSO mode; agentpc checks the result after each boot and tells FEX, which falls back
+  to emulating x86 memory ordering when TSO is off.
 - **Agent-ready guests.** Each time a snapshot is captured, a prepare script turns off what
   interrupts unattended work (Windows SmartScreen, updates, first-run and tip pop-ups; Ubuntu's
   background apt jobs; Arch's pacman timers) and installs Google Chrome on Ubuntu for
@@ -398,7 +412,8 @@ The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
   `serial.log` (guest console).
 - **A VM is in a bad state:** `agentpc reset <name>`.
 - **`image build`/`pull`/`rm` refuses:** VMs still depend on that image; `agentpc rm` them
-  first.
+  first. Build and rm also refuse while a running build uses the image (an Arch build runs in
+  a clone of the Ubuntu image); try again when it finishes.
 
 ### Networking
 
@@ -465,9 +480,9 @@ already running — or simply retry `run_command` once it's back.
 
 ### x86_64 Linux programs
 
-The Ubuntu guest is arm64. For x86_64 (and i386) Linux programs, create a VM from the
-`ubuntu-x86apps` image (`agentpc create ubuntu-x86apps`, or `create_vm` with
-`version: "x86apps"`). It adds [FEX](https://fex-emu.com), which translates each x86 program
+The Ubuntu and Arch guests are arm64. For x86_64 (and i386) Linux programs, create a VM from
+the `ubuntu-x86apps` or `arch-x86apps` image (`agentpc create ubuntu-x86apps`, or `create_vm`
+with `version: "x86apps"`). It adds [FEX](https://fex-emu.com), which translates each x86 program
 to arm64 as it runs; the kernel and desktop stay native. Run the program directly (`./tool`).
 
 - **Speed.** Most code runs about 2× slower than native, JIT runtimes such as Node about
@@ -477,17 +492,18 @@ to arm64 as it runs; the kernel and desktop stay native. Run the program directl
   `x86_tso`: `hardware` or `emulated`. FEX keeps translated code in `~/.cache/fex-emu`, so a
   program's second start is several times faster than its first.
 - **Libraries.** x86 programs find the common libraries (libc, libstdc++, GTK, ...) in an x86
-  Ubuntu tree the image ships. For anything else, install the amd64 package:
-  `sudo apt install libfoo:amd64` (the image has amd64 package sources set up), or an amd64
-  `.deb` with `sudo apt install ./app_amd64.deb`. Installing an amd64 library can upgrade its
-  arm64 twin, since both must be the same version.
+  tree the image ships (x86 Ubuntu or x86 Arch Linux). On Ubuntu, install anything else as the
+  amd64 package: `sudo apt install libfoo:amd64` (the image has amd64 package sources set up),
+  or an amd64 `.deb` with `sudo apt install ./app_amd64.deb`. Installing an amd64 library can
+  upgrade its arm64 twin, since both must be the same version. Arch has no multiarch, so there
+  `pacman` installs only arm64 packages and x86 programs use the libraries in the x86 tree.
 - **Go programs** crash under FEX unless `GODEBUG=asyncpreemptoff=1`; the image sets it for
   x86 programs.
 - **x86 Electron and Chromium apps** (VS Code, Slack, Chrome, ...) abort at launch with a
   `zygote_host` error: FEX can't create the namespaces Chromium's sandbox uses. Launch them
   with `--no-sandbox` (e.g. `code --no-sandbox`).
-- **x86 containers** work: install Docker or Podman and run
-  `docker run --platform linux/amd64 <image>`. FEX runs them from the image's own x86 files.
+- **x86 containers** work: install Docker or Podman (on Arch: `sudo pacman -Syu --noconfirm
+  docker && sudo systemctl start docker`) and run `docker run --platform linux/amd64 <image>`. FEX runs them from the image's own x86 files.
 - **Not covered:** x86 kernel modules and drivers. It's translation, not an x86 machine.
 
 ### Hardware limits
@@ -556,7 +572,7 @@ describes the code layout for contributors and coding agents.
    the release notes grouped from the Conventional Commit subjects since the last tag), then
    asks before it commits `chore: release vX.Y.Z`, tags `vX.Y.Z`, pushes `main` and the tag,
    and creates the GitHub Release. `--dry-run` stops after building `dist/`.
-2. Publish the Linux images (`ubuntu`, `ubuntu-x86apps` and `arch`): log `oras` in with a
+2. Publish the Linux images (`ubuntu`, `ubuntu-x86apps`, `arch` and `arch-x86apps`): log `oras` in with a
    token that can write packages (`gh auth refresh -s write:packages`, then
    `gh auth token | oras login ghcr.io -u <user> --password-stdin`), then for each image run
    `agentpc image build <image>` and `agentpc image push <image>`. A push uploads 64 MB parts,

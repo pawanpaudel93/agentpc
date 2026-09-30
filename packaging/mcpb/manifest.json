@@ -4,7 +4,7 @@
   "display_name": "agentpc",
   "version": "0.0.0",
   "description": "Instant, resettable Windows, Ubuntu and Arch Linux ARM desktop VMs for AI agents on Apple Silicon Macs.",
-  "long_description": "Create, screenshot, drive and reset local Windows 11 (ARM64), Ubuntu (any release) and Arch Linux ARM desktop VMs over MCP. x64 Windows apps run through Prism, and an Ubuntu image with FEX runs x86_64 Linux programs and amd64 containers. Requires QEMU from Homebrew (brew install qemu). Ubuntu and Arch images download on first use (Arch builds locally, ~6 min, only if the download fails); Windows needs a one-time `agentpc image build windows`, which downloads the ISO from Microsoft.",
+  "long_description": "Create, screenshot, drive and reset local Windows 11 (ARM64), Ubuntu (any release) and Arch Linux ARM desktop VMs over MCP. x64 Windows apps run through Prism, and Ubuntu and Arch images with FEX (ubuntu-x86apps, arch-x86apps) run x86_64 Linux programs and amd64 containers. Requires QEMU from Homebrew (brew install qemu). Ubuntu and Arch images download on first use (Arch builds locally, ~6 min, only if the download fails); Windows needs a one-time `agentpc image build windows`, which downloads the ISO from Microsoft.",
   "author": { "name": "Pawan Paudel", "url": "https://github.com/pawanpaudel93" },
   "license": "MIT",
   "homepage": "https://github.com/pawanpaudel93/agentpc",
@@ -19,7 +19,7 @@
     }
   },
   "tools": [
-    { "name": "list_vms", "description": "VMs (state, owner, size, checkpoints) and which images exist" },
+    { "name": "list_vms", "description": "VMs (state, owner, size, checkpoints and, for running x86apps VMs, x86_tso) and which images exist" },
     { "name": "create_vm", "description": "Create a VM (optionally a given OS version, size, or offline); ready in seconds once its image exists" },
     { "name": "start_vm", "description": "Start an instance" },
     { "name": "stop_vm", "description": "Stop an instance" },
@@ -40,6 +40,6 @@
     { "name": "list_desktop_tools", "description": "List the desktop-control tools inside an instance" },
     { "name": "use_desktop_tool", "description": "Call a desktop-control tool inside an instance" }
   ],
-  "keywords": ["vm", "qemu", "windows", "ubuntu", "computer-use"],
+  "keywords": ["vm", "qemu", "windows", "ubuntu", "computer-use", "arch", "linux", "x86"],
   "compatibility": { "platforms": ["darwin"] }
 }

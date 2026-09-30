@@ -11,7 +11,7 @@ can run `agentpc mcp-install` (or install first: see README.md).
 
 | Tool | Use |
 | --- | --- |
-| `list_vms` | VMs (owner, state, size, checkpoints, viewer) and the images (with OS version) they come from. Start here. |
+| `list_vms` | VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, `x86_tso`) and the images (with OS version) they come from. Start here. |
 | `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New clone: ubuntu/arch ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready; retrying in the same session returns the VM it already made. `memory_gb` 2–64, `cpus` 1–16. `offline` cuts off the internet. |
 | `start_vm` / `stop_vm` / `reset_vm` / `delete_vm` | Lifecycle. `reset_vm` = back to a clean install. |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save disk + memory before a risky step; restore in seconds; or drop one checkpoint. |
@@ -48,9 +48,11 @@ give `run_command` a longer `timeout` or `background: true`, and after a kernel 
 with `start_vm` before loading new modules. `/tmp` is a tmpfs, cleared at every boot.
 
 `list_desktop_tools` shows each tool's required arguments, and a call with wrong arguments returns
-the tool's argument list. If `get_window_state` comes back "degraded" with no elements, act by
-pixels (`x`/`y` from that call's screenshot). The driver is pinned per image; don't update it
-inside a VM.
+the tool's argument list (a wrong tool name returns close matches). If `get_window_state` comes
+back "degraded" with no elements, act by pixels (`x`/`y` from that call's screenshot). The driver
+is pinned per image; don't update it inside a VM. If a reply starts with a reconnect note (the VM
+or its driver restarted), earlier snapshot ids and browser sessions are gone: take a new
+snapshot and run `browser_prepare` again.
 
 Guest tips:
 
@@ -69,6 +71,14 @@ Guest tips:
   -ExclusionPath C:\work`. The guest is ARM64; x64 and x86 programs run through Windows' Prism
   emulation (roughly 2–4× slower), but x64 drivers and kernel-mode software don't. Prefer an
   ARM64 build when one exists.
+- **x86 Linux programs** (x86_64 and i386) need an x86apps VM: `create_vm(os: "ubuntu" or
+  "arch", version: "x86apps")`. FEX translates them to arm64, about 2× slower (JIT runtimes like
+  Node 6–7×); run them directly (`./tool`). Go programs work. x86 containers work with `docker
+  run --platform linux/amd64` (install Docker first: `sudo apt install docker.io` on Ubuntu,
+  `sudo pacman -Syu --noconfirm docker && sudo systemctl start docker` on Arch). x86
+  Electron/Chromium apps need `--no-sandbox`. A missing x86 library on Ubuntu: `sudo apt install
+  libfoo:amd64`; Arch has no multiarch, so x86 programs there use the libraries in FEX's x86 Arch
+  Linux tree. `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or `emulated`.
 - Guests are 1280x800 with a 2D-only GPU (no acceleration) and no audio device.
 
 Rules:
@@ -79,10 +89,12 @@ Rules:
 - Don't create instances you won't use, and `delete_vm` your instances when done.
   Each running VM takes 4 GB (ubuntu, arch) or 8 GB (windows) of RAM.
 - `create_vm ubuntu` downloads the Ubuntu image on first use (~1.2 GB); pass `version`
-  (e.g. "22.04") for another release, or `version: "x86apps"` for Ubuntu that also runs
-  x86_64 Linux programs (through FEX; ~2x slower; built locally on first use, ~8 min).
-  `create_vm arch` (`arch-rolling`; `version` may only pin a build, `rolling-YYYYMMDD`)
-  downloads the Arch image on first use, or builds it locally (~6 min) if the download fails. A Windows image must be built by the user once:
+  (e.g. "22.04") for another release, or `version: "x86apps"` (`ubuntu-<release>-x86apps`) for
+  Ubuntu that also runs x86 Linux programs (downloaded on first use, or built locally, ~8 min,
+  if the download fails). `create_vm arch` (`arch-rolling`; `version` may be `x86apps`, or pin
+  a published build, `rolling-YYYYMMDD` / `rolling-x86apps-YYYYMMDD`) downloads the Arch image
+  on first use, or builds it locally (~6 min; ~10 min for x86apps) if the download fails.
+  A Windows image must be built by the user once:
   `agentpc image build windows` (downloads the ISO; ~12 min), or another version
   (`windows-11-24h2`, `windows-11-23h2`; `agentpc image build --help` lists them).
   If `list_vms` shows no windows image, ask the user to run that. Don't start a build
@@ -111,7 +123,8 @@ Rules:
   On `ubuntu-<release>-x86apps` images, `guests/ubuntu/x86apps.sh` runs first: FEX (version
   pinned there) built static-pie from source with `guests/ubuntu/fex.patch` (so x86 containers
   work; bumping the pin may need the patch rebased), its x86 root filesystem,
-  amd64 apt sources, and `agentpc-fex-tso`. QEMU for those VMs loads `src/hvf_tso.c` (built by
+  amd64 apt sources, and `agentpc-fex-tso`. On `arch-rolling-x86apps`, `guests/arch/x86apps.sh`
+  does the same with the same patch and an x86 Arch Linux root filesystem (no multiarch). QEMU for those VMs loads `src/hvf_tso.c` (built by
   `build.rs`) to turn on the CPU's TSO mode; after each boot `ops` tells FEX which mode it got.
   Changes take effect on the next `agentpc image build`, which refuses while VMs of that image exist.
 - Images are `<os>-<version>` (`Image` in `instance.rs`); a bare OS means its default version.

@@ -64,7 +64,7 @@
             <a href="#how">How it works</a>
             <a href="#networking">Networking</a>
             <a href="#config">Configuration</a>
-            <a href="#windows">Windows tips</a>
+            <a href="#windows">Guest tips</a>
             <a href="#troubleshooting">Troubleshooting</a>
             <a href="#security">Security</a>
             <a href="#uninstall">Uninstall</a>
@@ -138,12 +138,16 @@
                   <td>Any release on cloud-images.ubuntu.com, e.g. <code translate="no">22.04</code> or <code translate="no">26.04</code>. <code translate="no">image build ubuntu-22.04</code>, or <code translate="no">image pull</code> if published.</td>
                 </tr>
                 <tr>
-                  <td><code translate="no">ubuntu-x86apps</code></td>
-                  <td>Ubuntu 24.04 that also runs x86_64 Linux programs, through FEX translation. Built automatically on first <code translate="no">create</code>, or <code translate="no">image build ubuntu-x86apps</code>.</td>
+                  <td><code translate="no">ubuntu-x86apps</code> = <code translate="no">ubuntu-24.04-x86apps</code></td>
+                  <td>Ubuntu 24.04 that also runs x86_64 and i386 Linux programs, through FEX translation. <code translate="no">image pull</code> (automatic on first <code translate="no">create</code>; built locally, ~8 min, only if the download fails) or <code translate="no">image build ubuntu-x86apps</code>. Another release: <code translate="no">ubuntu-&lt;release&gt;-x86apps</code>, e.g. <code translate="no">ubuntu-22.04-x86apps</code>.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">arch</code> = <code translate="no">arch-rolling</code></td>
-                  <td>Arch Linux ARM (a community port of Arch) with XFCE and Chromium; install packages with <code translate="no">sudo pacman -Syu --noconfirm &lt;pkg&gt;</code>. <code translate="no">image pull</code> (automatic on first <code translate="no">create</code>; built locally in an Ubuntu helper VM, ~6 min, only if the download fails) or <code translate="no">image build arch</code> (needs the Ubuntu image, fetched if missing).</td>
+                  <td>Arch Linux ARM (a community port of Arch) with XFCE and Chromium; install packages with <code translate="no">sudo pacman -Syu --noconfirm &lt;pkg&gt;</code>. <code translate="no">image pull</code> (automatic on first <code translate="no">create</code>; built locally in an Ubuntu helper VM, ~6 min, only if the download fails) or <code translate="no">image build arch</code> (needs the Ubuntu image, fetched if missing). Pin a published build with <code translate="no">arch-rolling-YYYYMMDD</code> (pull only).</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">arch-x86apps</code> = <code translate="no">arch-rolling-x86apps</code></td>
+                  <td>Arch Linux ARM that also runs x86_64 and i386 Linux programs, through FEX translation. <code translate="no">image pull</code> (automatic on first <code translate="no">create</code>; built locally, ~10 min, only if the download fails) or <code translate="no">image build arch-x86apps</code>.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">windows-11-25h2</code></td>
@@ -261,8 +265,8 @@
           </section>
 
           <section class="doc-section" id="windows">
-            <h2>Windows guest tips</h2>
-            <h3>GUI installers return immediately</h3>
+            <h2>Guest tips</h2>
+            <h3>Windows: GUI installers return immediately</h3>
             <p>Run them silently and wait for the process, then check its exit code:</p>
             <div class="code-panel">
               <pre><code translate="no">Start-Process installer.exe -ArgumentList '/S' -Wait -PassThru</code></pre>
@@ -277,7 +281,7 @@
 <span class="comment"># … Add-WindowsCapability / DISM …</span>
 Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
             </div>
-            <h3>Defender is on</h3>
+            <h3>Windows: Defender is on</h3>
             <p>
               Only SmartScreen is off. Defender may quarantine a fresh or unsigned test binary, so
               exclude your work directory:
@@ -285,24 +289,32 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
             <div class="code-panel">
               <pre><code translate="no">Add-MpPreference -ExclusionPath C:\work</code></pre>
             </div>
-            <h3>x64 apps run through emulation</h3>
+            <h3>Windows: x64 apps run through emulation</h3>
             <p>
               The guest is Windows 11 ARM64. x64 and x86 programs (installers, desktop apps, CLIs) run
               through Windows' built-in Prism emulation, roughly 2–4× slower than native. x64 drivers,
               kernel-mode software and anti-cheat don't run. Prefer an ARM64 build when one exists.
             </p>
+            <h3>Arch guest tips</h3>
+            <ul>
+              <li><strong>Packages:</strong> <code translate="no">sudo pacman -Syu --noconfirm &lt;pkg&gt;</code> (Arch doesn't support partial upgrades). The first <code translate="no">-Syu</code> may upgrade the whole system, so give <code translate="no">run_command</code> a longer <code translate="no">timeout</code> or <code translate="no">background: true</code>; after a kernel upgrade, reboot (<code translate="no">start_vm</code>) before loading new modules.</li>
+              <li><strong><code translate="no">/tmp</code> is a tmpfs</strong>, cleared at every boot (unlike Ubuntu's); keep files elsewhere.</li>
+            </ul>
             <h3>x86_64 Linux programs</h3>
             <p>
-              The Ubuntu guest is arm64. Create a VM from <code translate="no">ubuntu-x86apps</code>
-              (<code translate="no">create_vm</code> with <code translate="no">version: "x86apps"</code>) and x86_64
+              The Ubuntu and Arch guests are arm64. Create a VM from <code translate="no">ubuntu-x86apps</code>
+              or <code translate="no">arch-x86apps</code> (<code translate="no">create_vm</code> with
+              <code translate="no">version: "x86apps"</code>) and x86_64 and i386
               programs run through <a href="https://fex-emu.com">FEX</a>, which translates each one to arm64:
               about 2× slower, JIT runtimes such as Node 6–7×, and much faster from the second start on
               thanks to FEX's code cache. On macOS 15 or later the VM's CPUs also run in TSO mode, x86's memory
               ordering, which makes multithreaded x86 code up to ~40% faster. Go programs work (the image sets
               <code translate="no">GODEBUG=asyncpreemptoff=1</code> for them). x86 Electron and Chromium apps need
-              <code translate="no">--no-sandbox</code>. A missing x86 library installs with
-              <code translate="no">sudo apt install libfoo:amd64</code>. x86 containers work too:
-              <code translate="no">docker run --platform linux/amd64 &lt;image&gt;</code>. x86 kernel modules don't run: it's translation, not an x86 machine.
+              <code translate="no">--no-sandbox</code>. On Ubuntu a missing x86 library installs with
+              <code translate="no">sudo apt install libfoo:amd64</code>; Arch has no multiarch, so x86 programs there
+              use the libraries in the image's x86 Arch Linux tree. x86 containers work too:
+              <code translate="no">docker run --platform linux/amd64 &lt;image&gt;</code> (on Arch, first
+              <code translate="no">sudo pacman -Syu --noconfirm docker &amp;&amp; sudo systemctl start docker</code>). x86 kernel modules don't run: it's translation, not an x86 machine.
             </p>
             <h3>Hardware limits</h3>
             <p>Guests have a fixed 1280×800 display, a 2D-only GPU (no 3D acceleration; WebGL is software-rendered or unavailable) and no audio device.</p>
@@ -320,7 +332,7 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
                 <tr><td>VM won't boot</td><td>Read <code translate="no">qemu.log</code> and <code translate="no">serial.log</code> in <code translate="no">~/.agentpc/instances/&lt;name&gt;/</code> (MCP: <code translate="no">read_vm_log</code>).</td></tr>
                 <tr><td>VM is in a bad state</td><td><code translate="no">agentpc reset &lt;name&gt;</code></td></tr>
                 <tr><td>SSH dropped after a reboot</td><td><code translate="no">agentpc start &lt;name&gt;</code> waits until the desktop is ready again.</td></tr>
-                <tr><td><code translate="no">image build</code>/<code translate="no">pull</code>/<code translate="no">rm</code> refuses</td><td>VMs still use that image; <code translate="no">agentpc rm</code> them first.</td></tr>
+                <tr><td><code translate="no">image build</code>/<code translate="no">pull</code>/<code translate="no">rm</code> refuses</td><td>VMs still use that image; <code translate="no">agentpc rm</code> them first. Build and rm also refuse while a running build uses the image (an Arch build runs in a clone of the Ubuntu image): try again when it finishes.</td></tr>
                 <tr><td>Running low on disk</td><td><code translate="no">agentpc clean</code> deletes what can be downloaded again.</td></tr>
               </tbody>
             </table>

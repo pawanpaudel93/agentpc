@@ -105,8 +105,8 @@
                   <td>
                     Create a VM from <code translate="no">ubuntu</code>, <code translate="no">windows</code>,
                     <code translate="no">arch</code> or a
-                    version such as <code translate="no">ubuntu-22.04</code>, or <code translate="no">ubuntu-x86apps</code> for x86_64
-                    Linux programs; fetches Ubuntu and Arch images if missing.
+                    version such as <code translate="no">ubuntu-22.04</code>, or <code translate="no">ubuntu-x86apps</code> /
+                    <code translate="no">arch-x86apps</code> for x86_64 and i386 Linux programs; fetches Ubuntu and Arch images if missing.
                     <code translate="no">--memory</code> 2–64 GB (default 8 Windows, 4 Ubuntu and Arch) and
                     <code translate="no">--cpus</code> 1–16 (default 4); a non-default size boots cold instead of
                     resuming. <code translate="no">--offline</code>: no internet and no access to this Mac (SSH,
@@ -120,7 +120,7 @@
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc info &lt;name&gt;</code></td>
-                  <td>Viewer URL (with the VNC password), SSH and VNC details, and checkpoints.</td>
+                  <td>Viewer URL (with the VNC password), SSH and VNC details, checkpoints, and on x86apps VMs how x86 programs run (<code translate="no">x86 programs: FEX, hardware|emulated TSO</code>).</td>
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc start &lt;name&gt;… | --all</code></td>
@@ -213,11 +213,11 @@
               <tbody>
                 <tr>
                   <td><code translate="no">agentpc image pull &lt;image&gt;</code></td>
-                  <td>Download a published image, e.g. <code translate="no">ubuntu</code>, <code translate="no">ubuntu-22.04</code> or <code translate="no">arch</code>. Windows can't be redistributed.</td>
+                  <td>Download a published image, e.g. <code translate="no">ubuntu</code>, <code translate="no">ubuntu-22.04</code>, <code translate="no">ubuntu-x86apps</code>, <code translate="no">arch</code> or <code translate="no">arch-x86apps</code>. Dated Arch builds (<code translate="no">arch-rolling-YYYYMMDD</code>, <code translate="no">arch-rolling-x86apps-YYYYMMDD</code>) can only be pulled. Windows can't be redistributed.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc image build &lt;image&gt; [--iso &lt;path&gt;]</code></td>
-                  <td>Build an image locally: Ubuntu ~3 min, Arch ~6 min (in an Ubuntu helper VM), Windows ~12 min plus the ISO download.</td>
+                  <td>Build an image locally: Ubuntu ~3 min, Arch ~6 min (in an Ubuntu helper VM), <code translate="no">ubuntu-x86apps</code> ~8 min, <code translate="no">arch-x86apps</code> ~10 min, Windows ~12 min plus the ISO download. Refuses while VMs of that image exist or a running build uses it.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc image ls</code></td>
@@ -229,7 +229,7 @@
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc image rm &lt;image&gt;…</code></td>
-                  <td>Delete local images. Refuses while VMs of that image exist. Alias: <code translate="no">delete</code>.</td>
+                  <td>Delete local images. Refuses while VMs of that image exist or a running build uses it (an Arch build runs in a clone of the Ubuntu image). Alias: <code translate="no">delete</code>.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc image snapshot &lt;image&gt;</code></td>
