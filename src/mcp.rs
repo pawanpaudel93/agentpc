@@ -42,7 +42,8 @@ like \"22.04\"; Windows \"11-25h2\", \"11-24h2\", \"11-23h2\"); list_vms shows w
 The first create of an image can take minutes (download/build); after that it's seconds.
 Both guests are ARM64. On Windows, x64 and x86 programs run through Prism emulation (slower;
 no x64 drivers), so prefer an ARM64 build when one exists. For x86_64 Linux programs, create
-ubuntu with version \"x86apps\": they run through FEX translation, about 2x slower.
+ubuntu with version \"x86apps\": they run through FEX translation, about 2x slower; amd64
+containers (docker run --platform linux/amd64) work there too.
 
 Desktop tools come from cua-driver on both OSes: launch_app returns a pid and window_ids;
 get_window_state(pid, window_id) returns numbered elements and a snapshot_id to pass with

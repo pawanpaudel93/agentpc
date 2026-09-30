@@ -247,9 +247,9 @@
         </div>
         <div class="grid two">
           <div class="card">
-            <p class="card-kicker" translate="no">ubuntu · ubuntu-22.04 · ubuntu-26.04</p>
+            <p class="card-kicker" translate="no">ubuntu · ubuntu-22.04 · ubuntu-x86apps</p>
             <h3>Ubuntu</h3>
-            <p>XFCE on X11 with Google Chrome for the browser tools. The image downloads on first use (~1.2 GB).</p>
+            <p>XFCE on X11 with Google Chrome for the browser tools. The image downloads on first use (~1.2 GB). <code translate="no">ubuntu-x86apps</code> also runs x86_64 Linux programs and amd64 containers, through FEX.</p>
             <pre class="terminal"><code translate="no"><span class="prompt">$ </span>agentpc create ubuntu</code></pre>
             <div class="stat-row">
               <div><strong>~1 s</strong><span>to a new VM</span></div>
@@ -260,7 +260,7 @@
           <div class="card">
             <p class="card-kicker" translate="no">windows · windows-11-24h2 · windows-11-23h2</p>
             <h3>Windows 11 ARM</h3>
-            <p>Built once on your Mac from Microsoft's official ISO, since Windows images can't be redistributed. Includes Edge.</p>
+            <p>Built once on your Mac from Microsoft's official ISO, since Windows images can't be redistributed. Includes Edge, and x64 apps run through Windows' Prism emulation.</p>
             <pre class="terminal"><code translate="no"><span class="prompt">$ </span>agentpc image build windows  <span class="comment"># once, ~12 min</span>
 <span class="prompt">$ </span>agentpc create windows</code></pre>
             <div class="stat-row">

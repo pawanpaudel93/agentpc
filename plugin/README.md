@@ -33,7 +33,8 @@ a clean machine."*
 The first Ubuntu VM downloads the Ubuntu image (~1.2 GB). Windows images can't be
 redistributed, so build yours once with `agentpc image build windows`, which downloads the
 official ISO from Microsoft. Other versions work side by side, e.g. `ubuntu-22.04` or
-`windows-11-23h2`.
+`windows-11-23h2`. For x86_64 Linux programs and amd64 containers, use `ubuntu-x86apps`
+(translated by FEX); on Windows, x64 apps run through Prism.
 
 ## More
 

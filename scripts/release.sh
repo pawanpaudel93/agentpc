@@ -246,5 +246,6 @@ Released $TAG: https://github.com/$REPO/releases/tag/$TAG
 Follow-ups:
   MCP Registry: mcp-publisher login github && mcp-publisher publish dist/server.json
                 (brew install mcp-publisher)
-  Ubuntu image (separate): agentpc image build ubuntu, oras login ghcr.io, agentpc image push ubuntu
+  Ubuntu images (separate): agentpc image build ubuntu, oras login ghcr.io, agentpc image push ubuntu
+                            (and the same for ubuntu-x86apps)
 EOF
