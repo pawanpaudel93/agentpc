@@ -46,7 +46,8 @@ no x64 drivers), so prefer an ARM64 build when one exists. For x86_64 Linux prog
 ubuntu with version \"x86apps\": they run through FEX translation, about 2x slower; amd64
 containers (docker run --platform linux/amd64) work there too.
 An Arch Linux ARM guest (os \"arch\") works like Ubuntu (XFCE, bash, the same desktop tools), but
-packages come from pacman (sudo pacman -S --needed --noconfirm <pkg>) and its browser is Chromium:
+packages come from pacman (sudo pacman -Syu --noconfirm <pkg>: Arch doesn't support partial
+upgrades, and an image's package lists age) and its browser is Chromium:
 launch_app {\"name\": \"chromium\", \"additional_arguments\": [\"<url>\"]} where Ubuntu uses google-chrome.
 
 Desktop tools come from cua-driver on every OS: launch_app returns a pid and window_ids;

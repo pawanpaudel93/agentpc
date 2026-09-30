@@ -61,6 +61,7 @@ pub(crate) const WINDOWS_ISOS: [WinIso; 3] = [
 
 const UBUNTU_PREPARE: &str = include_str!("../guests/ubuntu/prepare.sh");
 const ARCH_PREPARE: &str = include_str!("../guests/arch/prepare.sh");
+const ARCH_BUILD: &str = include_str!("../guests/arch/build.sh");
 const UBUNTU_X86_APPS: &str = include_str!("../guests/ubuntu/x86apps.sh");
 const FEX_PATCH: &str = include_str!("../guests/ubuntu/fex.patch");
 const WIN_PREPARE: &str = include_str!("../guests/windows/prepare.ps1");
@@ -105,12 +106,23 @@ fn remove_image_tmp(image: &Image) {
 /// still can't run Drop; `agentpc clean` sweeps whatever an interrupt leaves.)
 struct BuildGuard {
     inst: Instance,
+    /// The image being made, whose temp files a failure clears (an Arch build runs in a
+    /// VM of the Ubuntu image).
+    image: Image,
     armed: bool,
 }
 
 impl BuildGuard {
     fn new(inst: Instance) -> Self {
-        Self { inst, armed: true }
+        let image = inst.image.clone();
+        Self::making(inst, image)
+    }
+    fn making(inst: Instance, image: Image) -> Self {
+        Self {
+            inst,
+            image,
+            armed: true,
+        }
     }
     fn keep(mut self) {
         self.armed = false;
@@ -124,23 +136,13 @@ impl Drop for BuildGuard {
         }
         qemu::quit(&self.inst);
         let _ = std::fs::remove_dir_all(&self.inst.dir);
-        remove_image_tmp(&self.inst.image);
+        remove_image_tmp(&self.image);
     }
 }
-
-/// Why an Arch image can't be built here: Arch Linux ARM images come from the registry for now.
-pub(crate) const ARCH_BUILD_UNSUPPORTED: &str =
-    "building Arch Linux ARM images isn't supported yet";
 
 /// `build`, for a caller already holding the image lock.
 pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     let os = image.os;
-    if os == Os::Arch {
-        bail!(
-            "{ARCH_BUILD_UNSUPPORTED}; pull one instead: {} image pull {image}",
-            crate::setup::cmd_name()
-        );
-    }
     if !image.instances()?.is_empty() {
         bail!("VMs of {image} depend on it; rm them first");
     }
@@ -152,8 +154,7 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     let need_gb = match os {
         Os::Windows => 35,
         Os::Ubuntu if image.x86_apps() => 16,
-        Os::Ubuntu => 12,
-        Os::Arch => unreachable!("arch images aren't built here"),
+        Os::Ubuntu | Os::Arch => 12,
     };
     crate::ops::ensure_free_space(need_gb, &format!("build {image}"))?;
 
@@ -163,6 +164,9 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
             qemu::stop(&old)?;
         }
         std::fs::remove_dir_all(instances_dir().join(&name))?;
+    }
+    if os == Os::Arch {
+        return build_arch(image, &name);
     }
     let iso_path = match os {
         Os::Windows => {
@@ -221,22 +225,7 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
     }
     let guard = BuildGuard::new(Instance::create_scratch(&name, image)?);
     let inst = &guard.inst;
-    run(
-        "qemu-img",
-        &[
-            "create",
-            "-q",
-            "-f",
-            "qcow2",
-            "-b",
-            &format!("../../images/{image}.qcow2"),
-            "-F",
-            "qcow2",
-            &inst.disk().to_string_lossy(),
-        ],
-    )?;
-    std::fs::copy(image.vars(), inst.vars())?;
-    crate::ops::set_writable(&inst.vars())?;
+    clone_image(inst, image)?;
 
     log!("booting {image} to capture its snapshot");
     qemu::start(inst, &[])?;
@@ -318,6 +307,167 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
         gb(&state)
     );
     Ok(())
+}
+
+/// Give a scratch VM a disk on top of `image`'s (a qcow2 overlay) and a copy of its vars.
+fn clone_image(inst: &Instance, image: &Image) -> Result<()> {
+    run(
+        "qemu-img",
+        &[
+            "create",
+            "-q",
+            "-f",
+            "qcow2",
+            "-b",
+            &format!("../../images/{image}.qcow2"),
+            "-F",
+            "qcow2",
+            &inst.disk().to_string_lossy(),
+        ],
+    )?;
+    std::fs::copy(image.vars(), inst.vars())?;
+    crate::ops::set_writable(&inst.vars())
+}
+
+/// Build the Arch Linux ARM image: a helper VM of the default Ubuntu image gets a blank
+/// second disk (/dev/vdb), `guests/arch/build.sh` installs Arch onto it, and that disk
+/// becomes the image. Then its snapshot is captured like any other image's.
+fn build_arch(image: &Image, name: &str) -> Result<()> {
+    let helper = Image::new(Os::Ubuntu, None)?;
+    // Hold the Ubuntu image only while cloning it: the clone's overlay is all the build uses.
+    let guard = {
+        let _lock = crate::instance::image_lock(&helper)?;
+        crate::ops::fetch_image_locked(&helper)?;
+        let guard = BuildGuard::making(Instance::create_scratch(name, &helper)?, image.clone());
+        clone_image(&guard.inst, &helper)?;
+        guard
+    };
+    let inst = &guard.inst;
+    let target = inst.dir.join("arch.qcow2");
+    run(
+        "qemu-img",
+        &[
+            "create",
+            "-q",
+            "-f",
+            "qcow2",
+            &target.to_string_lossy(),
+            "20G",
+        ],
+    )?;
+    // Added after the helper's own virtio disk (vda), so the guest sees it as /dev/vdb.
+    qemu::start(
+        inst,
+        &[
+            "-drive".into(),
+            format!(
+                "file={},if=virtio,format=qcow2,discard=unmap",
+                target.display()
+            ),
+        ],
+    )?;
+    log!("building Arch Linux ARM (~6 min)");
+    let took = wait_ready(inst, Duration::from_secs(Os::Ubuntu.boot_timeout()))?;
+    log!("{} ready in {}s", inst.name, took.as_secs());
+    let script = inst.dir.join("build.sh");
+    std::fs::write(&script, ARCH_BUILD)?;
+    crate::ops::upload(inst, &script, "/tmp/agentpc-arch-build.sh")?;
+    let tarball = run_arch_build(inst)?;
+
+    qemu::stop(inst)?;
+    log!("writing the {image} image");
+    let (disk, vars) = (image.disk(), image.vars());
+    let _ = std::fs::remove_file(&disk);
+    let _ = std::fs::remove_file(&vars);
+    let tmp = disk.with_extension("qcow2.tmp");
+    wait_for_space(
+        allocated(&target) + (1 << 30),
+        &format!("write the {image} image"),
+    )?;
+    run(
+        "qemu-img",
+        &[
+            "convert",
+            "-O",
+            "qcow2",
+            &target.to_string_lossy(),
+            &tmp.to_string_lossy(),
+        ],
+    )?;
+    std::fs::rename(&tmp, &disk)?;
+    // Blank vars: edk2 initializes them at first boot and finds systemd-boot on the disk.
+    std::fs::File::create(&vars)?.set_len(64 << 20)?;
+    for p in [&disk, &vars] {
+        let mut perm = std::fs::metadata(p)?.permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(p, perm)?;
+    }
+    std::fs::remove_dir_all(&inst.dir)?;
+    // The image is in place and the helper VM gone; snapshot_locked guards its own VM.
+    guard.keep();
+    let size = std::fs::metadata(&disk)?.len() as f64 / 1e9;
+    log!("{image} image ready ({size:.1} GB)");
+    let built = crate::instance::local_date();
+    let info = ImageInfo {
+        os: Os::Arch.to_string(),
+        version: "Arch Linux ARM".into(),
+        version_id: crate::instance::ARCH_VERSION.into(),
+        arch: "arm64".into(),
+        base: format!(
+            "Arch Linux ARM aarch64 tarball, {}",
+            tarball.unwrap_or_else(|| built.clone())
+        ),
+        built,
+        agentpc: env!("CARGO_PKG_VERSION").into(),
+        ..Default::default()
+    };
+    write_info(image, &info)?;
+    snapshot_locked(image)
+}
+
+/// Lines of build.sh output kept for the error when it fails.
+const BUILD_TAIL: usize = 20;
+
+/// Run the uploaded build.sh against /dev/vdb in the helper VM (as root; ~5 min, ~1 GB of
+/// downloads). ssh itself has no timeout, only keepalives that notice a dead VM. Its
+/// `==> ` lines are logged as progress; returns what its `alarm-tarball: ` line reports.
+fn run_arch_build(inst: &Instance) -> Result<Option<String>> {
+    use std::io::BufRead;
+    let mut child = Command::new("ssh")
+        .args(crate::ops::ssh_args(
+            inst,
+            "sudo bash /tmp/agentpc-arch-build.sh /dev/vdb 2>&1",
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("run ssh")?;
+    let mut tail = std::collections::VecDeque::with_capacity(BUILD_TAIL);
+    let mut tarball = None;
+    let out = child.stdout.take().context("ssh stdout")?;
+    for line in std::io::BufReader::new(out).lines() {
+        let line = line?;
+        if let Some(p) = line.strip_prefix("==> ") {
+            log!("{p}");
+        } else if let Some(t) = line.strip_prefix("alarm-tarball:") {
+            tarball = Some(t.trim().to_string()).filter(|t| !t.is_empty());
+            if let Some(t) = &tarball {
+                log!("Arch Linux ARM tarball: {t}");
+            }
+        }
+        if tail.len() == BUILD_TAIL {
+            tail.pop_front();
+        }
+        tail.push_back(line);
+    }
+    let st = child.wait()?;
+    if !st.success() {
+        bail!(
+            "building Arch Linux ARM failed ({st}); last output:\n{}",
+            Vec::from(tail).join("\n")
+        );
+    }
+    Ok(tarball)
 }
 
 /// Apply the agent-friendly defaults in `guests/<os>/prepare.*` to a running guest, after
@@ -423,7 +573,7 @@ echo "server=$(~/.local/bin/cua-driver --version 2>/dev/null | awk '{print $NF}'
             r#". /etc/os-release
 echo "version=$PRETTY_NAME"
 echo "version_id=${VERSION_ID:-${BUILD_ID:-}}"
-echo "arch=$(uname -m)"
+echo "arch=$(uname -m | sed 's/^aarch64$/arm64/')"
 echo "server=$(~/.local/bin/cua-driver --version 2>/dev/null | awk '{print $NF}')""#
         }
         // ProductName still says "Windows 10" on Windows 11; the WMI caption doesn't.

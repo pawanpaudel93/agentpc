@@ -203,7 +203,7 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ImageCmd {
-    /// Build an image locally by installing the OS (Ubuntu ~3 min, Windows ~12 min)
+    /// Build an image locally by installing the OS (Ubuntu ~3 min, Arch ~6 min, Windows ~12 min)
     #[command(after_help = "\
 Images are <os>-<version>; a bare os means the default version.
   ubuntu-<release>            any release at cloud-images.ubuntu.com/releases (default 24.04)
@@ -211,11 +211,11 @@ Images are <os>-<version>; a bare os means the default version.
   windows-11-25h2             Windows 11 25H2 Home/Pro (default: windows, windows-11)
   windows-11-24h2             Windows 11 24H2 Home/Pro (archive mirror)
   windows-11-23h2             Windows 11 23H2 Home/Pro (archive mirror)
-  arch-rolling                Arch Linux ARM (default: arch); pull it, building isn't supported yet
+  arch-rolling                Arch Linux ARM (default: arch), installed from an Ubuntu helper VM
 ISOs are checksum-verified. --iso installs your own: it must match a release name above,
 or use any other name (windows-custom).")]
     Build {
-        /// Image to build, e.g. ubuntu, ubuntu-22.04, windows, windows-11-24h2
+        /// Image to build, e.g. ubuntu, ubuntu-22.04, arch, windows, windows-11-24h2
         image: String,
         /// Windows ARM64 ISO to install from (default: $WIN_ISO, an earlier download,
         /// a Home/Pro ISO of that release in ~/Downloads, else download it)

@@ -474,43 +474,9 @@ pub fn create(
 /// First `create` from an image: fetch it (Ubuntu, Arch), or say how to build it (Windows).
 fn provision_image(image: &Image) -> Result<()> {
     match image.os {
-        Os::Arch => {
+        Os::Ubuntu | Os::Arch => {
             let _lock = crate::instance::image_lock(image)?;
-            if image.exists() {
-                return Ok(());
-            }
-            log!("no {image} image yet; downloading it");
-            // No local build to fall back on: say so unless the download itself worked.
-            crate::registry::pull_locked(image).map_err(|e| {
-                if image.exists() {
-                    e.context(format!("setting up the downloaded {image} image"))
-                } else {
-                    e.context(format!(
-                        "downloading {image} failed, and {}",
-                        crate::image::ARCH_BUILD_UNSUPPORTED
-                    ))
-                }
-            })
-        }
-        Os::Ubuntu => {
-            let _lock = crate::instance::image_lock(image)?;
-            // Another create may have fetched it while this one waited for the lock.
-            if image.exists() {
-                return Ok(());
-            }
-            log!("no {image} image yet; downloading it");
-            if let Err(e) = crate::registry::pull_locked(image) {
-                // A failed snapshot leaves a downloaded but unusable image; rebuild it too.
-                let what = if image.exists() {
-                    "setting up the downloaded image"
-                } else {
-                    "download"
-                };
-                let minutes = if image.x86_apps() { 8 } else { 3 };
-                log!("{what} failed ({e:#}); building it locally instead (~{minutes} min)");
-                crate::image::build_locked(image, None)?;
-            }
-            Ok(())
+            fetch_image_locked(image)
         }
         Os::Windows => bail!(
             "no {image} image yet; build it once (~12 min, downloads the ISO from Microsoft): \
@@ -518,6 +484,32 @@ fn provision_image(image: &Image) -> Result<()> {
             crate::setup::cmd_name()
         ),
     }
+}
+
+/// Get a missing Linux image, for a caller holding its image lock: pull it, else build it
+/// here. Also how an Arch build gets the Ubuntu image its helper VM runs.
+pub(crate) fn fetch_image_locked(image: &Image) -> Result<()> {
+    // Another create may have fetched it while this one waited for the lock.
+    if image.exists() {
+        return Ok(());
+    }
+    log!("no {image} image yet; downloading it");
+    if let Err(e) = crate::registry::pull_locked(image) {
+        // A failed snapshot leaves a downloaded but unusable image; rebuild it too.
+        let what = if image.exists() {
+            "setting up the downloaded image"
+        } else {
+            "download"
+        };
+        let minutes = match image.os {
+            Os::Arch => 6,
+            _ if image.x86_apps() => 8,
+            _ => 3,
+        };
+        log!("{what} failed ({e:#}); building it locally instead (~{minutes} min)");
+        crate::image::build_locked(image, None)?;
+    }
+    Ok(())
 }
 
 /// Start a stopped instance and wait until it's usable.

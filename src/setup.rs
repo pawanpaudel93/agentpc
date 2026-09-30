@@ -311,7 +311,7 @@ pub fn doctor() -> Result<bool> {
             let hint = match os {
                 Os::Windows => format!("{cmd} image build windows"),
                 Os::Ubuntu => format!("{cmd} image pull ubuntu (or {cmd} image build ubuntu)"),
-                Os::Arch => format!("{cmd} image pull arch"),
+                Os::Arch => format!("{cmd} image pull arch (or {cmd} image build arch)"),
             };
             println!("  info {os}: none yet — build or pull one: {hint}");
         }

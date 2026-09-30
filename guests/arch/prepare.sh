@@ -11,9 +11,11 @@ for unit in pacman-filesdb-refresh.timer archlinux-keyring-wkd-sync.timer; do
 done
 
 # cua-driver's browser tools drive Chromium-family browsers only, and Arch Linux ARM has
-# no Google Chrome build. Arch doesn't support partial upgrades, so installing means -Syu.
+# no Google Chrome build. build.sh installs Chromium; installing it here would mean a full
+# -Syu (Arch doesn't support partial upgrades), so a missing one is an image bug.
 if ! command -v chromium >/dev/null 2>&1; then
-    pacman -Syu --needed --noconfirm chromium >/dev/null
+    echo "prepare: chromium is not installed; rebuild the image (agentpc image build arch)" >&2
+    exit 1
 fi
 
 # A new profile opens first-run UI, which blocks agents. The "First Run" marker skips it.
