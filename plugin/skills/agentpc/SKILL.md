@@ -170,8 +170,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   install docker.io` on Ubuntu; `sudo pacman -Syu --noconfirm docker && sudo systemctl start
   docker` on Arch), then `docker run --platform linux/amd64 ...`. x86 Electron/Chromium apps
   (VS Code, Slack, ...) need `--no-sandbox`. A missing x86 library on Ubuntu: `sudo apt install
-  libfoo:amd64`; Arch has no multiarch, so x86 programs there use the libraries in FEX's x86
-  Arch Linux tree. `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or
+  libfoo:amd64`. Arch has no multiarch: x86 programs there use FEX's x86 Arch Linux tree, and
+  `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs more x86 packages into it. `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or
   `emulated`. The first create downloads the image, or builds it locally (~8 min Ubuntu,
   ~10 min Arch) if the download fails.
 - Windows images can't be downloaded. If `list_vms` shows no Windows image, ask the user to

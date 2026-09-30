@@ -48,7 +48,8 @@ create ubuntu or arch with version \"x86apps\": they run through FEX translation
 (Node 6-7x). Go programs work; amd64 containers work with docker run --platform linux/amd64 (on
 Arch first: sudo pacman -Syu --noconfirm docker && sudo systemctl start docker); x86
 Electron/Chromium apps need --no-sandbox. On Ubuntu, x86 libraries install with sudo apt install
-libfoo:amd64; Arch has no multiarch, so x86 programs use the x86 Arch tree FEX runs them in.
+libfoo:amd64; on Arch (no multiarch), sudo fex-pacman -Sy --noconfirm --needed <pkg> installs
+x86 packages into the x86 Arch tree FEX runs them in.
 list_vms shows x86_tso: hardware (fast; needs macOS 15+) or emulated.
 An Arch Linux ARM guest (os \"arch\") works like Ubuntu (XFCE, bash, the same desktop tools), but
 packages come from pacman (sudo pacman -Syu --noconfirm <pkg>: Arch doesn't support partial

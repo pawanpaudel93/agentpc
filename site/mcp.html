@@ -349,8 +349,9 @@ tool_timeout_sec = 900</code></pre>
               Go programs work; amd64 containers run with <code translate="no">docker run --platform linux/amd64</code>
               (on Arch, first <code translate="no">sudo pacman -Syu --noconfirm docker &amp;&amp; sudo systemctl start docker</code>);
               x86 Electron/Chromium apps need <code translate="no">--no-sandbox</code>. On Ubuntu, a missing x86 library
-              installs with <code translate="no">sudo apt install libfoo:amd64</code>; Arch has no multiarch, so x86
-              programs use the image's x86 Arch Linux tree. <code translate="no">list_vms</code> shows
+              installs with <code translate="no">sudo apt install libfoo:amd64</code>; on Arch (no multiarch) x86
+              programs use the image's x86 Arch Linux tree, and
+              <code translate="no">sudo fex-pacman -Sy --noconfirm --needed &lt;pkg&gt;</code> installs more x86 packages into it. <code translate="no">list_vms</code> shows
               <code translate="no">x86_tso</code>: <code translate="no">hardware</code> (needs macOS 15+) or
               <code translate="no">emulated</code>.
             </p>

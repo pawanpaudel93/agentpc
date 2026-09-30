@@ -311,8 +311,9 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
               ordering, which makes multithreaded x86 code up to ~40% faster. Go programs work (the image sets
               <code translate="no">GODEBUG=asyncpreemptoff=1</code> for them). x86 Electron and Chromium apps need
               <code translate="no">--no-sandbox</code>. On Ubuntu a missing x86 library installs with
-              <code translate="no">sudo apt install libfoo:amd64</code>; Arch has no multiarch, so x86 programs there
-              use the libraries in the image's x86 Arch Linux tree. x86 containers work too:
+              <code translate="no">sudo apt install libfoo:amd64</code>; on Arch (no multiarch) x86 programs
+              use the image's x86 Arch Linux tree, and <code translate="no">sudo fex-pacman -Sy --noconfirm --needed &lt;pkg&gt;</code>
+              installs more x86 packages into it. x86 containers work too:
               <code translate="no">docker run --platform linux/amd64 &lt;image&gt;</code> (on Arch, first
               <code translate="no">sudo pacman -Syu --noconfirm docker &amp;&amp; sudo systemctl start docker</code>). x86 kernel modules don't run: it's translation, not an x86 machine.
             </p>

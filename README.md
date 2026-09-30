@@ -394,8 +394,8 @@ The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
   the same pinned cua-driver. That disk becomes the image.
 - **x86apps build.** On `ubuntu-x86apps` and `arch-x86apps`, `guests/<os>/x86apps.sh` builds
   [FEX](https://fex-emu.com) (version pinned there) from source as a static-pie with
-  `guests/ubuntu/fex.patch` (so x86 containers work) and installs an x86 root filesystem
-  (Ubuntu or Arch Linux) as a squashfs. QEMU for these VMs loads `src/hvf_tso.c`, which turns on
+  `guests/ubuntu/fex.patch` (so x86 containers work) and installs an x86 root filesystem: Ubuntu's
+  as a squashfs, Arch Linux's unpacked so `fex-pacman` can add packages to it. QEMU for these VMs loads `src/hvf_tso.c`, which turns on
   the CPU's TSO mode; agentpc checks the result after each boot and tells FEX, which falls back
   to emulating x86 memory ordering when TSO is off.
 - **Agent-ready guests.** Each time a snapshot is captured, a prepare script turns off what
@@ -495,8 +495,11 @@ to arm64 as it runs; the kernel and desktop stay native. Run the program directl
   tree the image ships (x86 Ubuntu or x86 Arch Linux). On Ubuntu, install anything else as the
   amd64 package: `sudo apt install libfoo:amd64` (the image has amd64 package sources set up),
   or an amd64 `.deb` with `sudo apt install ./app_amd64.deb`. Installing an amd64 library can
-  upgrade its arm64 twin, since both must be the same version. Arch has no multiarch, so there
-  `pacman` installs only arm64 packages and x86 programs use the libraries in the x86 tree.
+  upgrade its arm64 twin, since both must be the same version. Arch has no multiarch, so on
+  `arch-x86apps` x86 programs use FEX's x86 Arch Linux tree, and
+  `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs more x86 packages into it (the x86
+  `pacman`, run in a chroot, pinned to that tree's Arch Linux Archive date so nothing is
+  partially upgraded).
 - **Go programs** crash under FEX unless `GODEBUG=asyncpreemptoff=1`; the image sets it for
   x86 programs.
 - **x86 Electron and Chromium apps** (VS Code, Slack, Chrome, ...) abort at launch with a

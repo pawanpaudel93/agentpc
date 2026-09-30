@@ -77,8 +77,8 @@ Guest tips:
   run --platform linux/amd64` (install Docker first: `sudo apt install docker.io` on Ubuntu,
   `sudo pacman -Syu --noconfirm docker && sudo systemctl start docker` on Arch). x86
   Electron/Chromium apps need `--no-sandbox`. A missing x86 library on Ubuntu: `sudo apt install
-  libfoo:amd64`; Arch has no multiarch, so x86 programs there use the libraries in FEX's x86 Arch
-  Linux tree. `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or `emulated`.
+  libfoo:amd64`. Arch has no multiarch: x86 programs there use FEX's x86 Arch Linux tree, and
+  `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs more x86 packages into it. `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or `emulated`.
 - Guests are 1280x800 with a 2D-only GPU (no acceleration) and no audio device.
 
 Rules:
@@ -124,7 +124,8 @@ Rules:
   pinned there) built static-pie from source with `guests/ubuntu/fex.patch` (so x86 containers
   work; bumping the pin may need the patch rebased), its x86 root filesystem,
   amd64 apt sources, and `agentpc-fex-tso`. On `arch-rolling-x86apps`, `guests/arch/x86apps.sh`
-  does the same with the same patch and an x86 Arch Linux root filesystem (no multiarch). QEMU for those VMs loads `src/hvf_tso.c` (built by
+  does the same with the same patch and an unpacked x86 Arch Linux root filesystem (no multiarch;
+  `fex-pacman` installs x86 packages into it in a chroot). QEMU for those VMs loads `src/hvf_tso.c` (built by
   `build.rs`) to turn on the CPU's TSO mode; after each boot `ops` tells FEX which mode it got.
   Changes take effect on the next `agentpc image build`, which refuses while VMs of that image exist.
 - Images are `<os>-<version>` (`Image` in `instance.rs`); a bare OS means its default version.

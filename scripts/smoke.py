@@ -260,14 +260,15 @@ def x86apps(m, vm, r, guest="ubuntu"):
     ok, out = sh("sudo /tmp/node-v22.20.0-linux-x64/bin/node -p process.arch")
     r.check("x86 programs run as root too", ok and out.strip().endswith("x64"), out[-300:])
 
-    # Multiarch: x86 libraries the RootFS lacks come from apt, and FEX finds them. Arch has
-    # no multiarch: x86 programs use only the libraries in the x86 root filesystem.
+    # x86 libraries the RootFS lacks: on Ubuntu from apt (multiarch), on Arch (no multiarch)
+    # installed into the x86 root filesystem with fex-pacman. Either way FEX finds them.
+    load = " && FEXBash -c 'python3 -c \"import ctypes; ctypes.CDLL(\\\"libzmq.so.5\\\"); print(\\\"loaded\\\")\"'"
     if guest == "ubuntu":
-        ok, out = sh(
-            install("libzmq5:amd64")
-            + " && FEXBash -c 'python3 -c \"import ctypes; ctypes.CDLL(\\\"libzmq.so.5\\\"); print(\\\"loaded\\\")\"'"
-        )
+        ok, out = sh(install("libzmq5:amd64") + load)
         r.check("apt install <lib>:amd64 gives x86 programs the library", ok and "loaded" in out.split(), out[-300:])
+    else:
+        ok, out = sh("sudo fex-pacman -Sy --noconfirm --needed zeromq >/dev/null 2>&1" + load)
+        r.check("fex-pacman gives x86 programs the library", ok and "loaded" in out.split(), out[-300:])
 
     # agentpc turns on the CPU's TSO mode for x86apps VMs (macOS 15+) and then tells FEX it
     # needn't emulate x86 memory ordering.
