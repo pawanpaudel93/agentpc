@@ -14,17 +14,51 @@ apt-get -o DPkg::Lock::Timeout=300 install -y -q arch-install-scripts libarchive
 # Arch Linux ARM's generic aarch64 root filesystem. Its download host has no valid HTTPS, so
 # the tarball is checked against the Arch Linux ARM Build System key, pinned by fingerprint
 # (listed at archlinuxarm.org/about/package-signing), which is fetched over HTTPS.
+# The tarball and its signature live in $cache, which agentpc fills from its own copy before
+# the build and reads back after it: a cached pair that verifies is used as is; otherwise both
+# are downloaded there (with the tarball's Last-Modified in $tarball.date) and left for agentpc.
 signer=68B3537F39A313B3E574D06777193F152BDBE6A6
-tarball=ArchLinuxARM-aarch64-latest.tar.gz
-cd /tmp
-curl -fsSL -o "$tarball" "http://os.archlinuxarm.org/os/$tarball"
-curl -fsSL -o "$tarball.sig" "http://os.archlinuxarm.org/os/$tarball.sig"
+name=ArchLinuxARM-aarch64-latest.tar.gz
+cache=/home/agent/agentpc-alarm
+tarball=$cache/$name
 export GNUPGHOME=/tmp/alarm-gnupg
 rm -rf "$GNUPGHOME"; install -d -m 700 "$GNUPGHOME"
 curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x$signer" | gpg -q --import
-gpg -q --status-fd 1 --verify "$tarball.sig" "$tarball" | grep -q "VALIDSIG $signer"
-echo "alarm-tarball: $(curl -fsSI "http://os.archlinuxarm.org/os/$tarball" -L |
-    sed -n 's/^[Ll]ast-[Mm]odified: *//p' | tr -d '\r' | tail -n 1)"
+verify() {
+    local status
+    # Captured first: grep -q exiting early would SIGPIPE gpg, which pipefail turns into a failure.
+    status=$(gpg -q --status-fd 1 --verify "$tarball.sig" "$tarball" 2>/dev/null) || return 1
+    grep -q "VALIDSIG $signer" <<<"$status"
+}
+download() {
+    local headers
+    mkdir -p "$cache"
+    rm -f "$tarball" "$tarball.sig" "$tarball.date"
+    headers=$(mktemp)
+    curl -fsSL -D "$headers" -o "$tarball.part" "http://os.archlinuxarm.org/os/$name"
+    curl -fsSL -o "$tarball.sig.part" "http://os.archlinuxarm.org/os/$name.sig"
+    mv "$tarball.part" "$tarball"
+    mv "$tarball.sig.part" "$tarball.sig"
+    # -L's redirects each dump their headers: the last Last-Modified is the file's.
+    sed -n 's/^[Ll]ast-[Mm]odified: *//p' "$headers" | tr -d '\r' | tail -n 1 > "$tarball.date"
+    rm -f "$headers"
+}
+if [[ -f $tarball && -f $tarball.sig ]] && verify; then
+    origin="cached tarball"
+    if [[ -s $tarball.date ]]; then origin=$(<"$tarball.date"); fi
+else
+    if [[ -f $tarball || -f $tarball.sig ]]; then
+        echo "cached Arch Linux ARM tarball incomplete or unverified: downloading it" >&2
+    fi
+    download
+    verify || { echo "Arch Linux ARM tarball signature check failed (signer $signer)" >&2; exit 1; }
+    origin=$(<"$tarball.date")
+    if [[ -z $origin ]]; then origin="downloaded tarball (no Last-Modified)"; fi
+fi
+# agentpc reads the pair back as the agent user.
+chown -R agent:agent "$cache"
+chmod -R a+rX "$cache"
+echo "alarm-tarball: $origin"
 
 echo "==> partitioning and unpacking"
 # A 512 MiB EFI system partition, which becomes /boot (systemd-boot loads the kernel from it),
@@ -47,7 +81,6 @@ cp -r "$root/boot/." /tmp/esp/
 rm -rf "${root:?}/boot/"*
 umount /tmp/esp
 mount "${disk}1" "$root/boot"
-rm -f "$tarball" "$tarball.sig"
 
 cat > "$root/root/setup.sh" <<'SETUP'
 #!/bin/bash
@@ -128,11 +161,24 @@ printf 'title Arch Linux ARM\nlinux /Image\ninitrd /initramfs-linux.img\noptions
     > /boot/loader/entries/arch.conf
 printf 'LABEL=archroot / ext4 defaults 0 1\nLABEL=ESP /boot vfat defaults,umask=0077 0 2\n' > /etc/fstab
 
-# Pinned like the Ubuntu image's (guests/ubuntu/user-data); telemetry off.
+# Pinned and checked like the Ubuntu image's (guests/ubuntu/user-data; keep the sha256s in
+# sync); telemetry off.
 su - agent -c 'set -e; d=$(mktemp -d); cd "$d"
+  raw=https://raw.githubusercontent.com/trycua/cua/cua-driver-rs-v0.30.3/libs/cua-driver/scripts
   curl -fsSLO https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.30.3/install.sh
-  curl -fsSLO https://raw.githubusercontent.com/trycua/cua/cua-driver-rs-v0.30.3/libs/cua-driver/scripts/_install-rust.sh
+  curl -fsSLO "$raw/_install-rust.sh"
+  curl -fsSLO "$raw/_install-common.sh"
+  printf "%s\n" \
+    "317ba3a49fdba10f2a7f1b9f392c1bc1b7657f3aae85e1e2e43684cf17a1bf3b  install.sh" \
+    "2d7aa18f56b33a04cf79e001f4c48abdee7b54234e5fd5868c9327b4a47568e6  _install-rust.sh" \
+    "5bc3aa010eb8667a099b582a9ada9a8f93001745b842cc7cf3cc6c472520cf29  _install-common.sh" |
+    sha256sum -c --quiet || { echo "cua-driver installer checksum mismatch" >&2; exit 1; }
   CUA_DRIVER_RS_VERSION=0.30.3 CUA_DRIVER_RS_TELEMETRY_ENABLED=0 bash ./install.sh >/dev/null
+  cd ~/.cua-driver/packages/releases/0.30.3-aarch64-unknown-linux-gnu
+  printf "%s\n" \
+    "b9d31159bc1358c7069173cea0e025e8b3b3febad50cfce8059548a943e87187  cua-driver" \
+    "f9f9e0db8cb12ce631bb6b74deec0ece7823bb4e3ff31d48b493e9c4b590c2b9  cua-cursor-theme" |
+    sha256sum -c --quiet || { echo "installed cua-driver checksum mismatch" >&2; exit 1; }
   ~/.local/bin/cua-driver telemetry disable >/dev/null; rm -rf "$d"'
 # agentpc's readiness check looks for this, as on the cloud-init-provisioned Ubuntu image.
 mkdir -p /var/lib/cloud

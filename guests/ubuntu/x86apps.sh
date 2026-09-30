@@ -12,6 +12,8 @@ export DEBIAN_FRONTEND=noninteractive
 # atomics, RCpc loads), which every Apple Silicon chip has; the default would tune for the
 # build machine's CPU and could crash on an older one. Bump deliberately.
 fex_version=2609.1
+# The commit the FEX-$fex_version tag points to (its peeled ^{} commit): a moved tag fails the build.
+fex_commit=9fbdc00bd6401aff3b32d79e78ff98b8a13e4dcf
 if [ "$(cat /var/lib/agentpc/fex-version 2>/dev/null)" != "$fex_version" ]; then
     # Images from before the pin had FEX from its PPA.
     if dpkg -s fex-emu-armv8.4 >/dev/null 2>&1; then
@@ -24,15 +26,25 @@ if [ "$(cat /var/lib/agentpc/fex-version 2>/dev/null)" != "$fex_version" ]; then
     apt-get -o DPkg::Lock::Timeout=300 install -y -q git squashfuse $build_deps >/dev/null
     src=$(mktemp -d)
     git clone -q --depth 1 --branch "FEX-$fex_version" --recurse-submodules --shallow-submodules \
-        https://github.com/FEX-Emu/FEX "$src/FEX" 2>/dev/null
+        https://github.com/FEX-Emu/FEX "$src/FEX"
+    got=$(git -C "$src/FEX" rev-parse HEAD)
+    if [ "$got" != "$fex_commit" ]; then
+        echo "FEX tag FEX-$fex_version is at $got, expected $fex_commit: refusing to build" >&2
+        exit 1
+    fi
     git -C "$src/FEX" apply /tmp/agentpc-fex.patch
-    cmake -S "$src/FEX" -B "$src/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    # The build's output goes to a log; on failure its tail goes to stderr, which agentpc shows.
+    log=$src/build.log
+    run() {
+        "$@" >>"$log" 2>&1 || { echo "FEX build failed: $1 (log: $log)" >&2; tail -n 60 "$log" >&2; exit 1; }
+    }
+    run cmake -S "$src/FEX" -B "$src/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
         -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DCMAKE_EXE_LINKER_FLAGS="-static-pie -fuse-ld=lld" \
         -DTUNE_CPU=none -DTUNE_ARCH=armv8.4-a -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
         -DBUILD_FEXCONFIG=OFF -DENABLE_GDB_SYMBOLS=OFF -DENABLE_OFFLINE_TELEMETRY=OFF \
-        -DENABLE_CCACHE=OFF >/dev/null
-    ninja -C "$src/build" install >/dev/null
+        -DENABLE_CCACHE=OFF
+    run ninja -C "$src/build" install
     rm -rf "$src"
     apt-get purge -y -q --autoremove $build_deps >/dev/null
     mkdir -p /var/lib/agentpc
@@ -47,12 +59,33 @@ rm -f /tmp/agentpc-fex.patch
 . /etc/os-release
 name="Ubuntu_$(echo "$VERSION_ID" | tr . _)"
 rootfs=/usr/share/fex-emu/RootFS/$name.sqsh
-if [ ! -f "$rootfs" ]; then
+# Pinned and checked per release (sha256 of the file rootfs.fex-emu.gg lists; its own hash
+# is xxh3); a stamp records the installed pin, so a bump reaches existing images.
+case "$VERSION_ID" in
+    24.04) rootfs_url=https://rootfs.fex-emu.gg/Ubuntu_24_04/2026-08-11/Ubuntu_24_04.sqsh
+        rootfs_sha256=2854b06d3ff1b8f6e526135bfb6dd5b7b30ab3ab73e79ae933a3d9fed959a178 ;;
+    22.04) rootfs_url=https://rootfs.fex-emu.gg/Ubuntu_22_04/2025-01-08/Ubuntu_22_04.sqsh
+        rootfs_sha256=1bbbd33486eaac93b187a59ba2173665efdbaa3274dd1d8eeb4bd829147f1981 ;;
+    *) rootfs_url='' rootfs_sha256='' ;;
+esac
+rootfs_stamp=/var/lib/agentpc/fex-rootfs
+mkdir -p /usr/share/fex-emu/RootFS /var/lib/agentpc
+if [ -n "$rootfs_url" ]; then
+    if [ "$(cat "$rootfs_stamp" 2>/dev/null)" != "$rootfs_url:$rootfs_sha256" ]; then
+        # Images from before the pin may already hold this file: check it before downloading.
+        if ! { [ -f "$rootfs" ] && echo "$rootfs_sha256  $rootfs" | sha256sum -c --quiet >/dev/null 2>&1; }; then
+            curl -fsSL -o "$rootfs.tmp" "$rootfs_url"
+            echo "$rootfs_sha256  $rootfs.tmp" | sha256sum -c --quiet
+            mv "$rootfs.tmp" "$rootfs"
+        fi
+        echo "$rootfs_url:$rootfs_sha256" > "$rootfs_stamp"
+    fi
+elif [ ! -f "$rootfs" ]; then
+    # No pin for this release: whatever FEXRootFSFetcher lists for it, unchecked.
     tmp=$(mktemp -d)
     HOME=$tmp XDG_DATA_HOME=$tmp/data XDG_CONFIG_HOME=$tmp/config FEXRootFSFetcher -y -a \
         --distro-name=ubuntu --distro-version="$VERSION_ID" --distro-list-first \
         --force-ui=tty >/dev/null
-    mkdir -p /usr/share/fex-emu/RootFS
     mv "$tmp/data/fex-emu/RootFS/$name.sqsh" "$rootfs"
     rm -rf "$tmp"
 fi

@@ -69,14 +69,30 @@ runcmd:
   # xfce4 pulls in light-locker, which would lock the agent out of the session.
   - apt-get purge -y light-locker
   # Pinned: the skill and docs describe this version's tools. Bump deliberately. The
-  # installer runs a sibling _install-rust.sh if present (else the latest from cua.ai), so
-  # fetch both from the same tag. Telemetry off: VMs don't report to a third party.
+  # installer runs a sibling _install-rust.sh if present (else the latest from cua.ai), which
+  # sources a sibling _install-common.sh (else the latest from cua.ai), so fetch all three
+  # from the same tag and check them. The installer doesn't check the release it downloads,
+  # so the installed binaries are checked against the release's own afterwards. On a
+  # mismatch the image is never marked ready. Telemetry off: VMs don't report to a third party.
+  # Bumping: update every sha256 below (and in guests/arch/build.sh).
   - |
     su - agent -c 'set -e; d=$(mktemp -d); cd "$d"
+      raw=https://raw.githubusercontent.com/trycua/cua/cua-driver-rs-v0.30.3/libs/cua-driver/scripts
       curl -fsSLO https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.30.3/install.sh
-      curl -fsSLO https://raw.githubusercontent.com/trycua/cua/cua-driver-rs-v0.30.3/libs/cua-driver/scripts/_install-rust.sh
+      curl -fsSLO "$raw/_install-rust.sh"
+      curl -fsSLO "$raw/_install-common.sh"
+      printf "%s\n" \
+        "317ba3a49fdba10f2a7f1b9f392c1bc1b7657f3aae85e1e2e43684cf17a1bf3b  install.sh" \
+        "2d7aa18f56b33a04cf79e001f4c48abdee7b54234e5fd5868c9327b4a47568e6  _install-rust.sh" \
+        "5bc3aa010eb8667a099b582a9ada9a8f93001745b842cc7cf3cc6c472520cf29  _install-common.sh" |
+        sha256sum -c --quiet || { echo "cua-driver installer checksum mismatch" >&2; exit 1; }
       CUA_DRIVER_RS_VERSION=0.30.3 CUA_DRIVER_RS_TELEMETRY_ENABLED=0 bash ./install.sh
-      ~/.local/bin/cua-driver telemetry disable; rm -rf "$d"'
+      cd ~/.cua-driver/packages/releases/0.30.3-aarch64-unknown-linux-gnu
+      printf "%s\n" \
+        "b9d31159bc1358c7069173cea0e025e8b3b3febad50cfce8059548a943e87187  cua-driver" \
+        "f9f9e0db8cb12ce631bb6b74deec0ece7823bb4e3ff31d48b493e9c4b590c2b9  cua-cursor-theme" |
+        sha256sum -c --quiet || { echo "installed cua-driver checksum mismatch" >&2; exit 1; }
+      ~/.local/bin/cua-driver telemetry disable; rm -rf "$d"' || exit 1
   - touch /var/lib/cloud/agent-ready
   # VMs cloned from the image boot without a seed; stop cloud-init treating them as
   # new instances and re-running this whole file.

@@ -9,22 +9,35 @@ set -eu
 # guests/ubuntu/x86apps.sh): static-pie so x86 containers work, tuned for armv8.4. Arch Linux
 # ARM doesn't package FEX. The build runs in /var/tmp: Arch's /tmp is a small RAM disk.
 fex_version=2609.1
+# The commit the FEX-$fex_version tag points to (its peeled ^{} commit): a moved tag fails the build.
+fex_commit=9fbdc00bd6401aff3b32d79e78ff98b8a13e4dcf
 if [ "$(cat /var/lib/agentpc/fex-version 2>/dev/null)" != "$fex_version" ]; then
     # llvm brings llvm-ar, which the ThinLTO build needs.
     build_deps="clang lld llvm cmake ninja nasm"
+    # -Syu: a pulled or older image's sync database may be stale, and Arch forbids partial upgrades.
     # shellcheck disable=SC2086
-    pacman -S --noconfirm --needed git python $build_deps >/dev/null
+    pacman -Syu --noconfirm --needed git python $build_deps >/dev/null
     src=$(mktemp -d -p /var/tmp)
     git clone -q --depth 1 --branch "FEX-$fex_version" --recurse-submodules --shallow-submodules \
-        https://github.com/FEX-Emu/FEX "$src/FEX" 2>/dev/null
+        https://github.com/FEX-Emu/FEX "$src/FEX"
+    got=$(git -C "$src/FEX" rev-parse HEAD)
+    if [ "$got" != "$fex_commit" ]; then
+        echo "FEX tag FEX-$fex_version is at $got, expected $fex_commit: refusing to build" >&2
+        exit 1
+    fi
     git -C "$src/FEX" apply /tmp/agentpc-fex.patch
-    cmake -S "$src/FEX" -B "$src/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    # The build's output goes to a log; on failure its tail goes to stderr, which agentpc shows.
+    log=$src/build.log
+    run() {
+        "$@" >>"$log" 2>&1 || { echo "FEX build failed: $1 (log: $log)" >&2; tail -n 60 "$log" >&2; exit 1; }
+    }
+    run cmake -S "$src/FEX" -B "$src/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
         -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DCMAKE_EXE_LINKER_FLAGS="-static-pie -fuse-ld=lld" \
         -DTUNE_CPU=none -DTUNE_ARCH=armv8.4-a -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
         -DBUILD_FEXCONFIG=OFF -DENABLE_GDB_SYMBOLS=OFF -DENABLE_OFFLINE_TELEMETRY=OFF \
-        -DENABLE_CCACHE=OFF >/dev/null
-    ninja -C "$src/build" install >/dev/null
+        -DENABLE_CCACHE=OFF
+    run ninja -C "$src/build" install
     rm -rf "$src"
     # shellcheck disable=SC2086
     pacman -Rns --noconfirm $build_deps >/dev/null
@@ -42,23 +55,35 @@ rm -f /tmp/agentpc-fex.patch
 rootfs=/usr/share/fex-emu/RootFS/ArchLinux
 rootfs_date=2026-08-11
 rootfs_sha256=5d0c1a38590c68e5c2597c2c8a26d2f80170b1b738c857d63e1cdadada5f5f2a
-if [ ! -d "$rootfs/usr" ]; then
-    pacman -S --noconfirm --needed squashfs-tools >/dev/null
+# A stamp records the installed pin, so a bump (or a tree an interrupted run left half
+# unpacked) reinstalls it. The tree is unpacked beside it and moved into place when complete.
+rootfs_stamp=/var/lib/agentpc/fex-rootfs
+if [ "$(cat "$rootfs_stamp" 2>/dev/null)" != "$rootfs_date:$rootfs_sha256" ]; then
+    # Never delete a tree with something (a running fex-pacman's chroot) mounted inside it.
+    if findmnt -rn -o TARGET | awk -v r="$rootfs" 'index($0, r) == 1 { f = 1 } END { exit !f }'; then
+        echo "x86apps: filesystems are mounted under $rootfs; not replacing it" >&2
+        exit 1
+    fi
+    pacman -Syu --noconfirm --needed squashfs-tools >/dev/null
     sqsh=/var/tmp/ArchLinux.sqsh
     curl -fsSL -o "$sqsh" "https://rootfs.fex-emu.gg/ArchLinux/$rootfs_date/ArchLinux.sqsh"
     echo "$rootfs_sha256  $sqsh" | sha256sum -c --quiet
-    mkdir -p /usr/share/fex-emu/RootFS
-    unsquashfs -q -f -d "$rootfs" "$sqsh" >/dev/null
+    mkdir -p /usr/share/fex-emu/RootFS /var/lib/agentpc
+    rm -rf "$rootfs.new"
+    unsquashfs -q -f -d "$rootfs.new" "$sqsh" >/dev/null
     rm -f "$sqsh"
     pacman -Rns --noconfirm squashfs-tools >/dev/null
     # Its pacman: no seccomp download sandbox (FEX doesn't support seccomp), and the Arch
     # Linux Archive snapshot of the tree's own date, so installs never mean a partial upgrade
     # (and never replace its source-built Mesa).
-    sed -i 's/^#DisableSandboxSyscalls/DisableSandboxSyscalls/' "$rootfs/etc/pacman.conf"
-    grep -q '^DisableSandboxSyscalls' "$rootfs/etc/pacman.conf" ||
-        echo DisableSandboxSyscalls >> "$rootfs/etc/pacman.conf"
+    sed -i 's/^#DisableSandboxSyscalls/DisableSandboxSyscalls/' "$rootfs.new/etc/pacman.conf"
+    grep -q '^DisableSandboxSyscalls' "$rootfs.new/etc/pacman.conf" ||
+        echo DisableSandboxSyscalls >> "$rootfs.new/etc/pacman.conf"
     echo "Server = https://archive.archlinux.org/repos/$(echo "$rootfs_date" | tr - /)/\$repo/os/\$arch" \
-        > "$rootfs/etc/pacman.d/mirrorlist"
+        > "$rootfs.new/etc/pacman.d/mirrorlist"
+    rm -rf "$rootfs"
+    mv "$rootfs.new" "$rootfs"
+    echo "$rootfs_date:$rootfs_sha256" > "$rootfs_stamp"
 fi
 
 # `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs x86 packages into the tree. FEX
@@ -73,8 +98,18 @@ set -euo pipefail
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 R=/usr/share/fex-emu/RootFS/ArchLinux
 ids="passwd passwd- group group- shadow shadow- gshadow gshadow- subuid subgid"
+# One at a time: a second run's cleanup would unmount the first one's chroot.
+exec 9>/run/lock/fex-pacman
+flock 9
 cleanup() {
-    for m in dev sys proc tmp; do umount -R "$R/$m" 2>/dev/null || true; done
+    # Daemons pacman started in the chroot (gpg-agent, dirmngr) would keep its mounts busy.
+    for p in /proc/[0-9]*; do
+        if [ "$(readlink "$p/root" 2>/dev/null)" = "$R" ]; then kill -9 "${p#/proc/}" 2>/dev/null || true; fi
+    done
+    sleep 0.2
+    for m in dev sys proc tmp; do
+        if mountpoint -q "$R/$m"; then umount -R "$R/$m" 2>/dev/null || umount -R -l "$R/$m" || true; fi
+    done
     rm -f "$R/run/.containerenv" "$R/etc/resolv.conf"
     mkdir -p "$R/chroot/etc"
     for f in $ids; do if [ -e "$R/etc/$f" ]; then mv -f "$R/etc/$f" "$R/chroot/etc/$f"; fi; done
@@ -88,7 +123,7 @@ mount -t proc proc "$R/proc"
 mount --rbind /sys "$R/sys"; mount --make-rslave "$R/sys"
 mount --rbind /dev "$R/dev"; mount --make-rslave "$R/dev"
 mount -t tmpfs tmpfs "$R/tmp"
-FEX_ROOTFS= chroot "$R" /usr/bin/pacman "$@"
+FEX_ROOTFS='' chroot "$R" /usr/bin/pacman "$@"
 EOF
 chmod 755 /usr/local/bin/fex-pacman
 
