@@ -23,8 +23,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 
 | Tool | Use |
 | --- | --- |
-| `list_vms` | VMs (state, size, checkpoints and, for running x86apps VMs, `x86_tso`) and the available images with OS versions. Start here. |
-| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New VM (`ubuntu`, `windows` or `arch`, optionally a version such as `22.04` or `x86apps`); returns when the desktop is ready. `offline: true` cuts it off from the internet and this Mac |
+| `list_vms` | VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, `x86_tso`) and the available images with OS versions. Start here. |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New VM (`ubuntu`, `windows` or `arch`, optionally a version such as `22.04`, `x86apps` or `22.04-x86apps`); returns when the desktop is ready. `offline: true` cuts it off from the internet and this Mac |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down |
 | `reset_vm(name)` | Discard all changes: back to a clean install |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save the VM's disk and memory; go back to that state in seconds; or drop one checkpoint |
@@ -36,7 +36,7 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 | `forward_port(name, guest_port, host_port?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). SSH tunnel: reaches a server on the guest's own `127.0.0.1`; lasts until the VM stops |
 | `list_forwards(name)` / `delete_forward(name, host_port)` | List a VM's forwards / stop one |
 | `read_vm_log(name, which, tail_lines?)` | Tail a VM's `qemu` or `serial` log when it won't boot or the desktop is unreachable |
-| `list_desktop_tools(name, tool?)` | List the GUI tools inside a VM, or one tool's full schema |
+| `list_desktop_tools(name, tool?)` | Desktop-control tools in that VM with their required arguments and read-only marks, or one tool's full schema |
 | `use_desktop_tool(name, tool, arguments?)` | Call a GUI tool: click, type, launch apps, read the UI tree. A wrong name returns close matches |
 
 ## How to work
@@ -171,9 +171,10 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   docker` on Arch), then `docker run --platform linux/amd64 ...`. x86 Electron/Chromium apps
   (VS Code, Slack, ...) need `--no-sandbox`. A missing x86 library on Ubuntu: `sudo apt install
   libfoo:amd64`. Arch has no multiarch: x86 programs there use FEX's x86 Arch Linux tree, and
-  `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs more x86 packages into it. `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or
-  `emulated`. The first create downloads the image, or builds it locally (~8 min Ubuntu,
-  ~10 min Arch) if the download fails.
+  `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs more x86 packages into it.
+  `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or `emulated`. The first
+  create downloads the image, or builds it locally (~8 min Ubuntu, ~10 min Arch) if the
+  download fails.
 - Windows images can't be downloaded. If `list_vms` shows no Windows image, ask the user to
   build one once (~12 min) and don't start it yourself:
   `agentpc image build windows` (downloads the official ISO from Microsoft, 7.3 GB). Other

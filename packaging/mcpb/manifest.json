@@ -4,7 +4,7 @@
   "display_name": "agentpc",
   "version": "0.0.0",
   "description": "Instant, resettable Windows, Ubuntu and Arch Linux ARM desktop VMs for AI agents on Apple Silicon Macs.",
-  "long_description": "Create, screenshot, drive and reset local Windows 11 (ARM64), Ubuntu (any release) and Arch Linux ARM desktop VMs over MCP. x64 Windows apps run through Prism, and Ubuntu and Arch images with FEX (ubuntu-x86apps, arch-x86apps) run x86_64 Linux programs and amd64 containers. Requires QEMU from Homebrew (brew install qemu). Ubuntu and Arch images download on first use (Arch builds locally, ~6 min, only if the download fails); Windows needs a one-time `agentpc image build windows`, which downloads the ISO from Microsoft.",
+  "long_description": "Create, screenshot, drive and reset local Windows 11 (ARM64), Ubuntu (any release) and Arch Linux ARM desktop VMs over MCP. x64 Windows apps run through Prism, and Ubuntu and Arch images with FEX (ubuntu-x86apps, arch-x86apps) run x86_64 Linux programs and amd64 containers. Requires QEMU from Homebrew (brew install qemu). Ubuntu and Arch images download on first use (and build locally, ~3–10 min, only if the download fails); Windows needs a one-time `agentpc image build windows`, which downloads the ISO from Microsoft.",
   "author": { "name": "Pawan Paudel", "url": "https://github.com/pawanpaudel93" },
   "license": "MIT",
   "homepage": "https://github.com/pawanpaudel93/agentpc",
@@ -37,8 +37,8 @@
     { "name": "list_forwards", "description": "List a VM's active port forwards" },
     { "name": "delete_forward", "description": "Stop a port forward" },
     { "name": "read_vm_log", "description": "Tail a VM's QEMU or serial log" },
-    { "name": "list_desktop_tools", "description": "List the desktop-control tools inside an instance" },
-    { "name": "use_desktop_tool", "description": "Call a desktop-control tool inside an instance" }
+    { "name": "list_desktop_tools", "description": "List the desktop-control tools inside an instance with their required arguments, or one tool's schema" },
+    { "name": "use_desktop_tool", "description": "Call a desktop-control tool inside an instance; a wrong name or wrong arguments return close matches or the argument list" }
   ],
   "keywords": ["vm", "qemu", "windows", "ubuntu", "computer-use", "arch", "linux", "x86"],
   "compatibility": { "platforms": ["darwin"] }

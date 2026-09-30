@@ -14,7 +14,8 @@ set -eu
 REPO="pawanpaudel93/agentpc"
 TARGET="aarch64-apple-darwin"
 # Files that record the version (manifest.json's is filled at pack time instead).
-VERSION_FILES="Cargo.toml Cargo.lock server.json plugin/.claude-plugin/plugin.json .claude-plugin/marketplace.json"
+VERSION_FILES="Cargo.toml Cargo.lock server.json plugin/.claude-plugin/plugin.json .claude-plugin/marketplace.json
+site/index.html site/cli.html site/guide.html site/mcp.html"
 
 say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 die() {
@@ -112,6 +113,10 @@ subst Cargo.toml "1,/^version = /s/^version = \"$OLD_RE\"/version = \"$VERSION\"
 subst plugin/.claude-plugin/plugin.json "s/\"version\": \"$OLD_RE\"/\"version\": \"$VERSION\"/"
 subst .claude-plugin/marketplace.json "s/\"version\": \"$OLD_RE\"/\"version\": \"$VERSION\"/"
 subst server.json "s/\"version\": \"$OLD_RE\"/\"version\": \"$VERSION\"/; s#/v$OLD_RE/agentpc-$OLD_RE\.mcpb#/$TAG/agentpc-$VERSION.mcpb#"
+# The site's nav badge: any old version, so a missed bump can't stick.
+for f in site/index.html site/cli.html site/guide.html site/mcp.html; do
+  subst "$f" "s#<span class=\"version\" translate=\"no\">v[0-9.]*</span>#<span class=\"version\" translate=\"no\">$TAG</span>#"
+done
 cargo update --quiet --offline --workspace
 
 [ "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" = "$VERSION" ] ||
@@ -246,6 +251,6 @@ Released $TAG: https://github.com/$REPO/releases/tag/$TAG
 Follow-ups:
   MCP Registry: mcp-publisher login github && mcp-publisher publish dist/server.json
                 (brew install mcp-publisher)
-  Linux images (separate): oras login ghcr.io, then for each of ubuntu, ubuntu-x86apps and arch:
+  Linux images (separate): oras login ghcr.io, then for each of ubuntu, ubuntu-x86apps, arch and arch-x86apps:
                            agentpc image build <image> && agentpc image push <image>
 EOF

@@ -39,17 +39,17 @@ install; checkpoint_vm/restore_vm save and return to any point in seconds (disk 
 checkpoint before a risky or slow-to-redo step. run_command runs PowerShell on Windows and bash
 on Ubuntu and Arch; the guest login is agent/agent. create_vm takes an optional version (Ubuntu
 release like \"22.04\"; Windows \"11-25h2\", \"11-24h2\", \"11-23h2\"; Arch is rolling: no version,
-or \"rolling-YYYYMMDD\" to pin a published build; \"x86apps\" on Ubuntu or Arch, see below);
-list_vms shows which images exist.
+or \"rolling-YYYYMMDD\" / \"rolling-x86apps-YYYYMMDD\" to pin a published build; \"x86apps\" on
+Ubuntu or Arch, see below); list_vms shows which images exist.
 The first create of an image can take minutes (download/build); after that it's seconds.
 All guests are ARM64. On Windows, x64 and x86 programs run through Prism emulation (slower;
 no x64 drivers), so prefer an ARM64 build when one exists. For x86_64 and i386 Linux programs,
 create ubuntu or arch with version \"x86apps\": they run through FEX translation, about 2x slower
-(Node 6-7x). Go programs work; amd64 containers work with docker run --platform linux/amd64 (on
-Arch first: sudo pacman -Syu --noconfirm docker && sudo systemctl start docker); x86
-Electron/Chromium apps need --no-sandbox. On Ubuntu, x86 libraries install with sudo apt install
-libfoo:amd64; on Arch (no multiarch), sudo fex-pacman -Sy --noconfirm --needed <pkg> installs
-x86 packages into the x86 Arch tree FEX runs them in.
+(Node 6-7x). Go programs work; amd64 containers work with docker run --platform linux/amd64
+(install Docker first: sudo apt install docker.io on Ubuntu; sudo pacman -Syu --noconfirm docker
+&& sudo systemctl start docker on Arch); x86 Electron/Chromium apps need --no-sandbox. On Ubuntu,
+x86 libraries install with sudo apt install libfoo:amd64; on Arch (no multiarch), sudo fex-pacman
+-Sy --noconfirm --needed <pkg> installs x86 packages into the x86 Arch tree FEX runs them in.
 list_vms shows x86_tso: hardware (fast; needs macOS 15+) or emulated.
 An Arch Linux ARM guest (os \"arch\") works like Ubuntu (XFCE, bash, the same desktop tools), but
 packages come from pacman (sudo pacman -Syu --noconfirm <pkg>: Arch doesn't support partial
@@ -275,8 +275,8 @@ struct UploadArgs {
     name: String,
     /// File or directory on this Mac (absolute, or relative to the server's working directory).
     host_path: String,
-    /// Destination in the VM; relative paths are under the agent user's home
-    /// (e.g. "Downloads/" on Windows, "/tmp/" on Ubuntu and Arch).
+    /// Destination in the VM; relative paths are under the agent user's home (e.g. "Downloads/");
+    /// on Arch, /tmp is cleared at every boot.
     guest_path: String,
 }
 
@@ -367,8 +367,8 @@ impl Gateway {
     #[tool(
         title = "List VMs",
         description = "List VM instances (name, image, state, size, checkpoints, owner, viewer URL and, for\n\
-                          running x86apps VMs, x86_tso: hardware|emulated) and which images exist. Each VM shows its owner; only reset/delete/restore a VM you created,\n\
-                          unless the user asks otherwise.",
+                          running x86apps VMs, x86_tso: hardware|emulated) and which images exist.\n\
+                          Each VM shows its owner; only reset/delete/restore a VM you created, unless the user asks otherwise.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_vms(&self) -> CallToolResult {
@@ -686,7 +686,8 @@ impl Gateway {
     #[tool(
         title = "List desktop tools",
         description = "List the desktop-control tools available in an instance (name + summary), or the full\n\
-                          input schema of one tool when `tool` is given. Call them with `use_desktop_tool`.",
+                          input schema of one tool when `tool` is given. Call them with `use_desktop_tool`. A wrong tool\n\
+                          name returns close matches.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_desktop_tools(&self, Parameters(a): Parameters<ToolsArgs>) -> CallToolResult {

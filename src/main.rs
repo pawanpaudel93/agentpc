@@ -204,7 +204,7 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ImageCmd {
-    /// Build an image locally by installing the OS (Ubuntu ~3 min, Arch ~6 min, x86apps ~8 min,
+    /// Build an image locally by installing the OS (Ubuntu ~3 min, Arch ~6 min, ubuntu-x86apps ~8 min,
     /// arch-x86apps ~10 min, Windows ~12 min)
     #[command(after_help = "\
 Images are <os>-<version>; a bare os means the default version.
@@ -221,7 +221,7 @@ the Ubuntu image).
 ISOs are checksum-verified. --iso installs your own: it must match a release name above,
 or use any other name (windows-custom).")]
     Build {
-        /// Image to build, e.g. ubuntu, ubuntu-22.04, arch, windows, windows-11-24h2
+        /// Image to build, e.g. ubuntu, ubuntu-22.04, ubuntu-x86apps, arch, arch-x86apps, windows, windows-11-24h2
         image: String,
         /// Windows ARM64 ISO to install from (default: $WIN_ISO, an earlier download,
         /// a Home/Pro ISO of that release in ~/Downloads, else download it)

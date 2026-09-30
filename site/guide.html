@@ -29,7 +29,7 @@
         <a class="brand" href="index.html">
           <img src="favicon.svg" width="36" height="36" alt="" decoding="async" />
           <span>agentpc</span>
-          <span class="version" translate="no">v0.1.2</span>
+          <span class="version" translate="no">v0.1.7</span>
         </a>
         <div class="nav-links">
           <a href="index.html#install">Install</a>
@@ -147,7 +147,7 @@
                 </tr>
                 <tr>
                   <td><code translate="no">arch-x86apps</code> = <code translate="no">arch-rolling-x86apps</code></td>
-                  <td>Arch Linux ARM that also runs x86_64 and i386 Linux programs, through FEX translation. <code translate="no">image pull</code> (automatic on first <code translate="no">create</code>; built locally, ~10 min, only if the download fails) or <code translate="no">image build arch-x86apps</code>.</td>
+                  <td>Arch Linux ARM that also runs x86_64 and i386 Linux programs, through FEX translation. <code translate="no">image pull</code> (automatic on first <code translate="no">create</code>; built locally, ~10 min, only if the download fails) or <code translate="no">image build arch-x86apps</code>. Pin a published build with <code translate="no">arch-rolling-x86apps-YYYYMMDD</code> (pull only).</td>
                 </tr>
                 <tr>
                   <td><code translate="no">windows-11-25h2</code></td>
@@ -198,6 +198,8 @@
               <li><strong>Snapshots stay local.</strong> A memory snapshot depends on the Mac's chip and QEMU version, so only the disk is published; the snapshot is recaptured after each pull (about a minute).</li>
               <li><strong>Image distribution.</strong> Ubuntu and Arch images are OCI artifacts on GitHub Container Registry: a compressed qcow2 split into 64 MB parts, downloaded in parallel and checksum-verified.</li>
               <li><strong>Agent-ready guests.</strong> Each snapshot capture turns off what interrupts unattended work (SmartScreen, updates, first-run pop-ups, Ubuntu's background apt jobs, Arch's pacman timers) and installs Chrome on Ubuntu.</li>
+              <li><strong>Arch build.</strong> A clone of the Ubuntu image installs the Arch Linux ARM tarball onto a blank second disk (systemd-boot, XFCE, Chromium, cua-driver); that disk becomes the image.</li>
+              <li><strong>x86apps build.</strong> FEX (pinned) is built from source as a static-pie, with a patch so x86 containers work, plus an x86 root filesystem: Ubuntu's as a squashfs, Arch Linux's unpacked so <code translate="no">fex-pacman</code> can add to it. QEMU for these VMs turns on the CPU's TSO mode (macOS 15+); agentpc tells FEX after each boot whether it got it.</li>
             </ul>
           </section>
 
@@ -308,14 +310,17 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
               programs run through <a href="https://fex-emu.com">FEX</a>, which translates each one to arm64:
               about 2× slower, JIT runtimes such as Node 6–7×, and much faster from the second start on
               thanks to FEX's code cache. On macOS 15 or later the VM's CPUs also run in TSO mode, x86's memory
-              ordering, which makes multithreaded x86 code up to ~40% faster. Go programs work (the image sets
+              ordering, which makes multithreaded x86 code up to ~40% faster; <code translate="no">list_vms</code>
+              (<code translate="no">agentpc list --json</code>) shows it as <code translate="no">x86_tso</code>:
+              <code translate="no">hardware</code> or <code translate="no">emulated</code>. Go programs work (the image sets
               <code translate="no">GODEBUG=asyncpreemptoff=1</code> for them). x86 Electron and Chromium apps need
               <code translate="no">--no-sandbox</code>. On Ubuntu a missing x86 library installs with
-              <code translate="no">sudo apt install libfoo:amd64</code>; on Arch (no multiarch) x86 programs
+              <code translate="no">sudo apt install libfoo:amd64</code> (or an amd64 <code translate="no">.deb</code>:
+              <code translate="no">sudo apt install ./app_amd64.deb</code>); on Arch (no multiarch) x86 programs
               use the image's x86 Arch Linux tree, and <code translate="no">sudo fex-pacman -Sy --noconfirm --needed &lt;pkg&gt;</code>
               installs more x86 packages into it. x86 containers work too:
-              <code translate="no">docker run --platform linux/amd64 &lt;image&gt;</code> (on Arch, first
-              <code translate="no">sudo pacman -Syu --noconfirm docker &amp;&amp; sudo systemctl start docker</code>). x86 kernel modules don't run: it's translation, not an x86 machine.
+              <code translate="no">docker run --platform linux/amd64 &lt;image&gt;</code> (install Docker first:
+              <code translate="no">sudo apt install docker.io</code> on Ubuntu, <code translate="no">sudo pacman -Syu --noconfirm docker &amp;&amp; sudo systemctl start docker</code> on Arch). x86 kernel modules don't run: it's translation, not an x86 machine.
             </p>
             <h3>Hardware limits</h3>
             <p>Guests have a fixed 1280×800 display, a 2D-only GPU (no 3D acceleration; WebGL is software-rendered or unavailable) and no audio device.</p>

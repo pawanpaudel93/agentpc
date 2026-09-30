@@ -29,7 +29,7 @@
         <a class="brand" href="index.html">
           <img src="favicon.svg" width="36" height="36" alt="" decoding="async" />
           <span>agentpc</span>
-          <span class="version" translate="no">v0.1.2</span>
+          <span class="version" translate="no">v0.1.7</span>
         </a>
         <div class="nav-links">
           <a href="index.html#install">Install</a>
@@ -347,7 +347,8 @@ tool_timeout_sec = 900</code></pre>
               For x86_64 and i386 Linux programs, create <code translate="no">ubuntu</code> or <code translate="no">arch</code>
               with <code translate="no">version: "x86apps"</code>: they run through FEX, about 2× slower (Node 6–7×).
               Go programs work; amd64 containers run with <code translate="no">docker run --platform linux/amd64</code>
-              (on Arch, first <code translate="no">sudo pacman -Syu --noconfirm docker &amp;&amp; sudo systemctl start docker</code>);
+              (install Docker first: <code translate="no">sudo apt install docker.io</code> on Ubuntu,
+              <code translate="no">sudo pacman -Syu --noconfirm docker &amp;&amp; sudo systemctl start docker</code> on Arch);
               x86 Electron/Chromium apps need <code translate="no">--no-sandbox</code>. On Ubuntu, a missing x86 library
               installs with <code translate="no">sudo apt install libfoo:amd64</code>; on Arch (no multiarch) x86
               programs use the image's x86 Arch Linux tree, and

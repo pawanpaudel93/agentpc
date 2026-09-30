@@ -78,7 +78,8 @@ Guest tips:
   `sudo pacman -Syu --noconfirm docker && sudo systemctl start docker` on Arch). x86
   Electron/Chromium apps need `--no-sandbox`. A missing x86 library on Ubuntu: `sudo apt install
   libfoo:amd64`. Arch has no multiarch: x86 programs there use FEX's x86 Arch Linux tree, and
-  `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs more x86 packages into it. `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or `emulated`.
+  `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs more x86 packages into it.
+  `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or `emulated`.
 - Guests are 1280x800 with a 2D-only GPU (no acceleration) and no audio device.
 
 Rules:

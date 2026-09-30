@@ -168,7 +168,7 @@ pick the server up automatically.
 
 | Tool | Description |
 | --- | --- |
-| `list_vms` | VMs (owner, state, size, checkpoints, viewer) and the available images with their OS versions |
+| `list_vms` | VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, `x86_tso`) and the available images with their OS versions |
 | `create_vm` | Create a VM (optionally of a given version, size, or offline) and wait until its desktop is ready. Retrying it in the same session returns the VM already created |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down cleanly |
 | `reset_vm` | Discard all changes: back to a fresh copy of the image |
@@ -182,8 +182,11 @@ pick the server up automatically.
 | `forward_port` | Reach a server running in a VM from your Mac (SSH tunnel; works even for servers bound to the guest's own `127.0.0.1`) |
 | `list_forwards` / `delete_forward` | List a VM's active port forwards / stop one by its host port |
 | `read_vm_log` | Read the tail of a VM's `qemu` or `serial` log, for when a VM won't boot or the desktop is unreachable |
-| `list_desktop_tools` | List the desktop-control tools inside a VM, with each one's required arguments and whether it's read-only |
+| `list_desktop_tools` | List the desktop-control tools inside a VM, with each one's required arguments and whether it's read-only; a wrong name returns close matches |
 | `use_desktop_tool` | Call one of them: click, type, launch apps, read the UI tree, … A call with wrong arguments or a wrong name returns the tool's arguments or close matches |
+
+If a desktop-tool reply starts with a reconnect note (the VM or its driver restarted), earlier
+snapshot ids and browser sessions are gone: take a new snapshot and run `browser_prepare` again.
 
 VMs an MCP session created or started are stopped (never deleted) when the session ends, unless
 `AGENTPC_KEEP_RUNNING=1`.
@@ -395,9 +398,10 @@ The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
 - **x86apps build.** On `ubuntu-x86apps` and `arch-x86apps`, `guests/<os>/x86apps.sh` builds
   [FEX](https://fex-emu.com) (version pinned there) from source as a static-pie with
   `guests/ubuntu/fex.patch` (so x86 containers work) and installs an x86 root filesystem: Ubuntu's
-  as a squashfs, Arch Linux's unpacked so `fex-pacman` can add packages to it. QEMU for these VMs loads `src/hvf_tso.c`, which turns on
-  the CPU's TSO mode; agentpc checks the result after each boot and tells FEX, which falls back
-  to emulating x86 memory ordering when TSO is off.
+  as a squashfs, Arch Linux's unpacked so `fex-pacman` can add packages to it.
+  QEMU for these VMs loads `src/hvf_tso.c`, which turns on the CPU's TSO mode; agentpc checks
+  the result after each boot and tells FEX, which falls back to emulating x86 memory ordering
+  when TSO is off.
 - **Agent-ready guests.** Each time a snapshot is captured, a prepare script turns off what
   interrupts unattended work (Windows SmartScreen, updates, first-run and tip pop-ups; Ubuntu's
   background apt jobs; Arch's pacman timers) and installs Google Chrome on Ubuntu for
@@ -506,7 +510,8 @@ to arm64 as it runs; the kernel and desktop stay native. Run the program directl
   `zygote_host` error: FEX can't create the namespaces Chromium's sandbox uses. Launch them
   with `--no-sandbox` (e.g. `code --no-sandbox`).
 - **x86 containers** work: install Docker or Podman (on Arch: `sudo pacman -Syu --noconfirm
-  docker && sudo systemctl start docker`) and run `docker run --platform linux/amd64 <image>`. FEX runs them from the image's own x86 files.
+  docker && sudo systemctl start docker`) and run `docker run --platform linux/amd64 <image>`.
+  FEX runs them from the image's own x86 files.
 - **Not covered:** x86 kernel modules and drivers. It's translation, not an x86 machine.
 
 ### Hardware limits
