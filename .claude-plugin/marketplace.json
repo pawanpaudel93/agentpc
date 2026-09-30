@@ -10,7 +10,7 @@
       "name": "agentpc",
       "source": "./plugin",
       "description": "Create, drive, screenshot and reset local Windows and Ubuntu desktop VMs from Claude",
-      "version": "0.1.4"
+      "version": "0.1.5"
     }
   ]
 }
