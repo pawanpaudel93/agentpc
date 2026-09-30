@@ -146,6 +146,20 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     if !image.instances()?.is_empty() {
         bail!("VMs of {image} depend on it; rm them first");
     }
+    let busy = image.busy_builds();
+    if !busy.is_empty() {
+        bail!(
+            "{image} is in use by a running build ({}); try again when it finishes",
+            busy.join(", ")
+        );
+    }
+    // A build is always today's Arch, so it can't stand in for a dated published one.
+    if os == Os::Arch && crate::instance::is_pinned_arch(&image.version) {
+        bail!(
+            "{image} is a published build and can only be downloaded: {} image pull {image}",
+            crate::setup::cmd_name()
+        );
+    }
     for d in [home(), cache_dir(), images_dir(), instances_dir()] {
         std::fs::create_dir_all(&d).with_context(|| format!("create {}", d.display()))?;
     }
@@ -791,6 +805,13 @@ pub fn describe(image: &Image) -> Result<String> {
 pub fn remove(image: &Image) -> Result<String> {
     if !image.instances()?.is_empty() {
         bail!("VMs of {image} depend on it; rm them first");
+    }
+    let busy = image.busy_builds();
+    if !busy.is_empty() {
+        bail!(
+            "{image} is in use by a running build ({}); try again when it finishes",
+            busy.join(", ")
+        );
     }
     let files = [
         image.info_file(),

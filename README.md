@@ -6,7 +6,7 @@
 ![Platform: macOS on Apple Silicon](https://img.shields.io/badge/platform-macOS%20%7C%20Apple%20Silicon-lightgrey)
 ![MCP server](https://img.shields.io/badge/MCP-server-8A2BE2)
 
-**Instant, resettable Windows, Ubuntu and Arch Linux desktops for AI agents, on your Mac.**
+**Instant, resettable Windows, Ubuntu and Arch Linux ARM desktops for AI agents, on your Mac.**
 
 Website: <https://agentpc.pawanpaudel.com.np>
 
@@ -101,7 +101,7 @@ agentpc create ubuntu        # first run: downloads (~1.2 GB) and prepares the i
 **Arch Linux ARM:**
 
 ```sh
-agentpc create arch          # first run: pulls the image, or builds it (~6 min); then ~1 s per VM
+agentpc create arch          # first run: downloads and prepares the image; then ~1 s per VM
 ```
 
 **Windows:** Microsoft's license doesn't allow redistributing Windows images, so each Mac
@@ -274,7 +274,7 @@ full name when the release matters, e.g. in test harnesses.
 | `ubuntu` = `ubuntu-24.04` | Official Ubuntu 24.04 cloud image | `image pull` (automatic on first `create`) or `image build` |
 | `ubuntu-<release>` | Any release in [cloud-images.ubuntu.com/releases](https://cloud-images.ubuntu.com/releases/), e.g. `22.04`, `26.04` | `image build ubuntu-22.04`, or `image pull` if published |
 | `ubuntu-x86apps` = `ubuntu-24.04-x86apps` | Ubuntu 24.04 that also runs x86_64 Linux programs (see [x86_64 Linux programs](#x86_64-linux-programs)) | Built on first `create` (~8 min), or `image build ubuntu-x86apps` |
-| `arch` = `arch-rolling` | [Arch Linux ARM](https://archlinuxarm.org) (a community port of Arch), installed from its aarch64 tarball in an Ubuntu helper VM | `image pull` once published, else built on first `create` (~6 min), or `image build arch` |
+| `arch` = `arch-rolling` | [Arch Linux ARM](https://archlinuxarm.org) (a community port of Arch), installed from its aarch64 tarball in an Ubuntu helper VM | `image pull` (automatic on first `create`; built locally, ~6 min, if the download fails) or `image build arch` (needs the Ubuntu image, fetched if missing) |
 | `windows-11-25h2` (`windows`) | Windows 11 25H2 (Home/Pro), 7.3 GB ISO from Microsoft | `image build windows` |
 | `windows-11-24h2`, `windows-11-23h2` | Earlier Windows 11 releases (Home/Pro) | `image build windows-11-23h2` |
 | `windows-<name>` | Your own Windows 11 ARM64 Home/Pro ISO | `image build windows-<name> --iso <path>` |
@@ -320,14 +320,15 @@ Each image records what it is (`agentpc image info <image>`):
 ```
 
 Published images live in one package, `ghcr.io/pawanpaudel93/agentpc`, tagged by image
-name. Ubuntu is published, and Arch will be under `arch-rolling` (also tagged `arch`); Windows
-images can't be redistributed:
+name. Windows images can't be redistributed:
 
 | Tag | Meaning | Pull with |
 | --- | --- | --- |
 | `ubuntu-24.04` | Newest build of Ubuntu 24.04 (also tagged `ubuntu`) | `agentpc image pull ubuntu` |
 | `ubuntu-<release>` | Newest build of another release | `agentpc image pull ubuntu-22.04` |
 | `ubuntu-24.04-YYYYMMDD` | One specific build (pinned) | `agentpc image pull ubuntu-24.04-YYYYMMDD` |
+| `arch-rolling` | Newest build of Arch Linux ARM (also tagged `arch`) | `agentpc image pull arch` |
+| `arch-rolling-YYYYMMDD` | One specific build (pinned) | `agentpc image pull arch-rolling-YYYYMMDD` |
 
 ## Configuration
 
@@ -419,7 +420,8 @@ Mac's network (a VPN or proxy configured on the Mac applies to a VM's outbound t
   ports you forward from the Mac still reach them.
 - **Corporate proxy / CA:** a guest inherits no proxy settings from the Mac. Set `HTTP_PROXY`
   and `HTTPS_PROXY` inside the guest, and import your corporate root CA with
-  `Import-Certificate` (Windows), `update-ca-certificates` (Ubuntu) or `trust anchor` (Arch).
+  `Import-Certificate` (Windows), `update-ca-certificates` (Ubuntu) or
+  `sudo trust anchor --store <cert>` (Arch).
 
 ### Guest reboots
 
@@ -453,6 +455,13 @@ already running — or simply retry `run_command` once it's back.
   (installers, desktop apps, CLIs) run through Windows' built-in Prism emulation, roughly 2–4×
   slower than native; x64 drivers, kernel-mode software and anti-cheat don't run. Prefer an
   ARM64 build when a download offers one.
+
+### Arch guest tips
+
+- **Packages:** `sudo pacman -Syu --noconfirm <pkg>` (Arch doesn't support partial upgrades).
+  The first `-Syu` may upgrade the whole system, so give `run_command` a longer `timeout` or
+  `background: true`; after a kernel upgrade, reboot (`start_vm`) before loading new modules.
+- **`/tmp` is a tmpfs**, cleared at every boot (unlike Ubuntu's); keep files elsewhere.
 
 ### x86_64 Linux programs
 
@@ -547,11 +556,12 @@ describes the code layout for contributors and coding agents.
    the release notes grouped from the Conventional Commit subjects since the last tag), then
    asks before it commits `chore: release vX.Y.Z`, tags `vX.Y.Z`, pushes `main` and the tag,
    and creates the GitHub Release. `--dry-run` stops after building `dist/`.
-2. Publish the Ubuntu image: `agentpc image build ubuntu`, then log `oras` in with a token
-   that can write packages (`gh auth refresh -s write:packages`, then
-   `gh auth token | oras login ghcr.io -u <user> --password-stdin`) and run
-   `agentpc image push ubuntu`. It uploads 64 MB parts, retries failures and links the package
-   to this repo; make the package public once in its settings.
+2. Publish the Linux images (`ubuntu`, `ubuntu-x86apps` and `arch`): log `oras` in with a
+   token that can write packages (`gh auth refresh -s write:packages`, then
+   `gh auth token | oras login ghcr.io -u <user> --password-stdin`), then for each image run
+   `agentpc image build <image>` and `agentpc image push <image>`. A push uploads 64 MB parts,
+   retries failures and links the package to this repo; make the package public once in its
+   settings.
 3. Publish to the MCP Registry: `brew install mcp-publisher`, `mcp-publisher login github`,
    then `mcp-publisher publish dist/server.json`.
 

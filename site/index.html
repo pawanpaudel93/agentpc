@@ -6,12 +6,12 @@
     <title>agentpc: instant desktops for AI agents on your Mac</title>
     <meta
       name="description"
-      content="agentpc gives AI agents instant, resettable Windows, Ubuntu and Arch Linux desktop VMs on an Apple Silicon Mac, over one MCP server."
+      content="agentpc gives AI agents instant, resettable Windows, Ubuntu and Arch Linux ARM desktop VMs on an Apple Silicon Mac, over one MCP server."
     />
     <meta property="og:title" content="agentpc" />
     <meta
       property="og:description"
-      content="Instant, resettable Windows, Ubuntu and Arch Linux desktops for AI agents, on your Mac. One MCP server for Claude, Codex, Cursor, Gemini and VS Code."
+      content="Instant, resettable Windows, Ubuntu and Arch Linux ARM desktops for AI agents, on your Mac. One MCP server for Claude, Codex, Cursor, Gemini and VS Code."
     />
     <meta property="og:type" content="website" />
     <meta property="og:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
@@ -48,7 +48,7 @@
           <p class="eyebrow">MCP server · Apple Silicon</p>
           <h1>A real computer for your agent, ready in a second</h1>
           <p class="hero-copy">
-            agentpc runs Windows, Ubuntu and Arch Linux desktop VMs on your Mac and hands them to AI agents
+            agentpc runs Windows, Ubuntu and Arch Linux ARM desktop VMs on your Mac and hands them to AI agents
             over MCP. The agent clicks, types, runs commands and takes screenshots, then resets
             the VM to a clean install in seconds.
           </p>
@@ -248,8 +248,8 @@
         <div class="grid two">
           <div class="card">
             <p class="card-kicker" translate="no">ubuntu · ubuntu-22.04 · ubuntu-x86apps · arch</p>
-            <h3>Ubuntu and Arch Linux</h3>
-            <p>XFCE on X11 with Google Chrome for the browser tools. The image downloads on first use (~1.2 GB). <code translate="no">ubuntu-x86apps</code> also runs x86_64 Linux programs and amd64 containers, through FEX. <code translate="no">arch</code> is Arch Linux ARM, with Chromium and pacman, pulled or built on first use (~6 min).</p>
+            <h3>Ubuntu and Arch Linux ARM</h3>
+            <p>XFCE on X11 on both, and both images download on first use. Ubuntu comes with Google Chrome for the browser tools (~1.2 GB download); <code translate="no">ubuntu-x86apps</code> also runs x86_64 Linux programs and amd64 containers, through FEX. <code translate="no">arch</code> comes with Chromium and pacman (and builds locally, ~6 min, only if the download fails).</p>
             <pre class="terminal"><code translate="no"><span class="prompt">$ </span>agentpc create ubuntu</code></pre>
             <div class="stat-row">
               <div><strong>~1 s</strong><span>to a new VM</span></div>

@@ -92,6 +92,14 @@ pub struct Image {
 /// `ubuntu-24.04-x86apps`, or `ubuntu-x86apps` for the default release.
 const X86_APPS: &str = "x86apps";
 
+/// `rolling-YYYYMMDD`: a published Arch build, downloaded by its dated registry tag.
+pub fn is_pinned_arch(version: &str) -> bool {
+    version
+        .strip_prefix(ARCH_VERSION)
+        .and_then(|d| d.strip_prefix('-'))
+        .is_some_and(|d| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
 impl Image {
     pub fn new(os: Os, version: Option<&str>) -> Result<Self> {
         let mut version = version.unwrap_or(os.default_version()).to_ascii_lowercase();
@@ -106,6 +114,12 @@ impl Image {
         }
         if os == Os::Arch && version.ends_with(X86_APPS) {
             bail!("x86 apps are only available on ubuntu images (ubuntu-x86apps)");
+        }
+        // Arch is rolling: one version, plus the dated tags of published builds (pinned pulls).
+        if os == Os::Arch && version != ARCH_VERSION && !is_pinned_arch(&version) {
+            bail!(
+                "arch is a rolling release: use arch (arch-{ARCH_VERSION}), or arch-{ARCH_VERSION}-YYYYMMDD to download one published build"
+            );
         }
         // It becomes part of file names and registry tags.
         if version.is_empty()
@@ -217,6 +231,21 @@ impl Image {
             .into_iter()
             .filter(|i| &i.image == self)
             .collect())
+    }
+
+    /// Running hidden build/snapshot VMs (`_build-*`, `_snap-*`) whose disk is a clone of this
+    /// image, such as the Ubuntu helper an Arch build runs in. Removing or rebuilding the
+    /// image under them would pull the disk out from under a running build.
+    pub fn busy_builds(&self) -> Vec<String> {
+        let own = [format!("_build-{self}"), format!("_snap-{self}")];
+        std::fs::read_dir(instances_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('_') && !own.contains(n))
+            .filter(|n| Instance::load(n).is_ok_and(|i| &i.image == self && i.running()))
+            .collect()
     }
 }
 
@@ -859,5 +888,12 @@ mod tests {
         assert!(!i.x86_apps());
         assert!("arch-x86apps".parse::<Image>().is_err());
         assert!("arch-rolling-x86apps".parse::<Image>().is_err());
+        assert!("arch-2024".parse::<Image>().is_err());
+        assert!("arch-latest".parse::<Image>().is_err());
+        assert_eq!(
+            "arch-rolling-20260930".parse::<Image>().unwrap().version,
+            "rolling-20260930"
+        );
+        assert!("arch-rolling-2026".parse::<Image>().is_err());
     }
 }

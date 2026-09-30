@@ -1,6 +1,6 @@
 # agentpc — instructions for coding agents
 
-This repo runs instant, resettable Windows, Ubuntu and Arch Linux desktop VMs on an Apple Silicon Mac and
+This repo runs instant, resettable Windows, Ubuntu and Arch Linux ARM desktop VMs on an Apple Silicon Mac and
 exposes them to you through one MCP server, `agentpc` (`agentpc mcp`). It is
 preconfigured for Claude Code (`.mcp.json`), Codex (`.codex/config.toml`), Gemini CLI
 (`.gemini/settings.json`), Cursor (`.cursor/mcp.json`) and VS Code (`.vscode/mcp.json`),
@@ -43,7 +43,9 @@ tools need `"delivery_mode": "foreground"`. `launch_app` takes a command name su
 **Arch** (Arch Linux ARM, a community port of Arch; same XFCE desktop and tools as Ubuntu):
 the browser is Chromium, so `launch_app` `chromium` where Ubuntu uses `google-chrome`.
 Install packages with `sudo pacman -Syu --noconfirm <pkg>` (Arch doesn't support partial
-upgrades, and an image's package lists age).
+upgrades, and an image's package lists age); the first `-Syu` may upgrade the whole system, so
+give `run_command` a longer `timeout` or `background: true`, and after a kernel upgrade reboot
+with `start_vm` before loading new modules. `/tmp` is a tmpfs, cleared at every boot.
 
 `list_desktop_tools` shows each tool's required arguments, and a call with wrong arguments returns
 the tool's argument list. If `get_window_state` comes back "degraded" with no elements, act by
@@ -79,8 +81,8 @@ Rules:
 - `create_vm ubuntu` downloads the Ubuntu image on first use (~1.2 GB); pass `version`
   (e.g. "22.04") for another release, or `version: "x86apps"` for Ubuntu that also runs
   x86_64 Linux programs (through FEX; ~2x slower; built locally on first use, ~8 min).
-  `create_vm arch` (`arch-rolling`, the only version) pulls the Arch image on first use, or
-  builds it locally (~6 min) if none is published. A Windows image must be built by the user once:
+  `create_vm arch` (`arch-rolling`; `version` may only pin a build, `rolling-YYYYMMDD`)
+  downloads the Arch image on first use, or builds it locally (~6 min) if the download fails. A Windows image must be built by the user once:
   `agentpc image build windows` (downloads the ISO; ~12 min), or another version
   (`windows-11-24h2`, `windows-11-23h2`; `agentpc image build --help` lists them).
   If `list_vms` shows no windows image, ask the user to run that. Don't start a build

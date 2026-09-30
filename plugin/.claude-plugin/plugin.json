@@ -2,7 +2,7 @@
   "name": "agentpc",
   "displayName": "agentpc",
   "version": "0.1.5",
-  "description": "Instant, resettable Windows and Ubuntu desktops on your Mac that Claude can create in seconds, then click, type, screenshot, run commands in, and reset.",
+  "description": "Instant, resettable Windows, Ubuntu and Arch Linux ARM desktops on your Mac that Claude can create in seconds, then click, type, screenshot, run commands in, and reset.",
   "author": {
     "name": "Pawan Paudel",
     "url": "https://github.com/pawanpaudel93"

@@ -30,8 +30,8 @@ use crate::instance::{Image, Instance, Os};
 use crate::{ops, qemu};
 
 const INSTRUCTIONS: &str = "\
-Controls instant, resettable Windows, Ubuntu and Arch Linux desktop VMs on this Mac. Treat VMs as
-throwaway sandboxes.
+Controls instant, resettable Windows, Ubuntu and Arch Linux ARM desktop VMs on this Mac. Treat
+VMs as throwaway sandboxes.
 
 Flow: list_vms -> create_vm (or start_vm on one you created) -> take_screenshot -> list_desktop_tools ->
 use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance to a clean
@@ -47,7 +47,9 @@ ubuntu with version \"x86apps\": they run through FEX translation, about 2x slow
 containers (docker run --platform linux/amd64) work there too.
 An Arch Linux ARM guest (os \"arch\") works like Ubuntu (XFCE, bash, the same desktop tools), but
 packages come from pacman (sudo pacman -Syu --noconfirm <pkg>: Arch doesn't support partial
-upgrades, and an image's package lists age) and its browser is Chromium:
+upgrades, and an image's package lists age; the first -Syu may upgrade everything, so give
+run_command a longer timeout or background: true, and after a kernel upgrade reboot with
+start_vm before loading new modules; /tmp is cleared at every boot) and its browser is Chromium:
 launch_app {\"name\": \"chromium\", \"additional_arguments\": [\"<url>\"]} where Ubuntu uses google-chrome.
 
 Desktop tools come from cua-driver on every OS: launch_app returns a pid and window_ids;
@@ -215,15 +217,15 @@ enum OsArg {
 #[derive(Deserialize, JsonSchema)]
 struct CreateArgs {
     os: OsArg,
-    /// Default: ubuntu 24.04, windows 11. Ubuntu: any release, e.g. "22.04", "26.04";
+    /// Default: ubuntu 24.04, windows 11, arch rolling. Ubuntu: any release, e.g. "22.04", "26.04";
     /// "x86apps" (or "24.04-x86apps") is Ubuntu that also runs x86_64 Linux programs.
     /// Windows: "11-25h2", "11-24h2" or "11-23h2". Omitted, Windows uses 25H2, or the newest
-    /// installed Windows 11 image if 25H2 isn't built. Arch: rolling release, "rolling" (the
-    /// default) only.
+    /// installed Windows 11 image if 25H2 isn't built. Arch: only the default, "rolling", or a
+    /// pinned download, "rolling-YYYYMMDD".
     version: Option<String>,
     name: Option<String>,
     /// Memory in GB (default 8 on Windows, 4 on Ubuntu and Arch). A non-default size boots cold
-    /// (~25 s Windows, ~15 s Ubuntu) instead of resuming the image's snapshot.
+    /// (~25 s Windows, ~15 s Ubuntu and Arch) instead of resuming the image's snapshot.
     #[schemars(range(min = 2, max = 64))]
     memory_gb: Option<u32>,
     /// CPUs (default 4). A non-default count boots cold, like memory_gb.

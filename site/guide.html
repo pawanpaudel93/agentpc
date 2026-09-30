@@ -143,7 +143,7 @@
                 </tr>
                 <tr>
                   <td><code translate="no">arch</code> = <code translate="no">arch-rolling</code></td>
-                  <td>Arch Linux ARM (a community port of Arch) with XFCE and Chromium; install packages with <code translate="no">sudo pacman -Syu --noconfirm &lt;pkg&gt;</code>. <code translate="no">image pull</code> once published, else built on first <code translate="no">create</code> in an Ubuntu helper VM (~6 min), or <code translate="no">image build arch</code>.</td>
+                  <td>Arch Linux ARM (a community port of Arch) with XFCE and Chromium; install packages with <code translate="no">sudo pacman -Syu --noconfirm &lt;pkg&gt;</code>. <code translate="no">image pull</code> (automatic on first <code translate="no">create</code>; built locally in an Ubuntu helper VM, ~6 min, only if the download fails) or <code translate="no">image build arch</code> (needs the Ubuntu image, fetched if missing).</td>
                 </tr>
                 <tr>
                   <td><code translate="no">windows-11-25h2</code></td>
@@ -222,7 +222,7 @@
                 </tr>
                 <tr>
                   <td>Through a corporate proxy</td>
-                  <td>Guests inherit no proxy. Set <code translate="no">HTTP_PROXY</code>/<code translate="no">HTTPS_PROXY</code> in the guest and import your root CA (<code translate="no">Import-Certificate</code> or <code translate="no">update-ca-certificates</code>).</td>
+                  <td>Guests inherit no proxy. Set <code translate="no">HTTP_PROXY</code>/<code translate="no">HTTPS_PROXY</code> in the guest and import your root CA (<code translate="no">Import-Certificate</code> on Windows, <code translate="no">update-ca-certificates</code> on Ubuntu, <code translate="no">sudo trust anchor --store &lt;cert&gt;</code> on Arch).</td>
                 </tr>
               </tbody>
             </table>

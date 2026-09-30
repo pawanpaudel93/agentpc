@@ -1,6 +1,6 @@
 ---
 name: agentpc
-description: Use agentpc to get an instant, resettable Windows, Ubuntu or Arch Linux desktop VM on the user's Mac. Use it when a task needs a real, clean Windows or Linux machine, such as testing an installer, script or app on a fresh OS, reproducing a platform-specific bug, operating a GUI application, or taking screenshots of a desktop, and when the user mentions agentpc or asks for a Windows, Ubuntu or Arch Linux VM.
+description: Use agentpc to get an instant, resettable Windows, Ubuntu or Arch Linux ARM desktop VM on the user's Mac. Use it when a task needs a real, clean Windows or Linux machine, such as testing an installer, script or app on a fresh OS, reproducing a platform-specific bug, operating a GUI application, or taking screenshots of a desktop, and when the user mentions agentpc or asks for a Windows, Ubuntu or Arch Linux (ARM) VM.
 ---
 
 # agentpc: instant, resettable desktops
@@ -112,7 +112,10 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 - The browser is Chromium: use `name: "chromium"` wherever Ubuntu uses `"google-chrome"`;
   the browser tools work the same.
 - Install packages with `sudo pacman -Syu --noconfirm <pkg>`: Arch doesn't support partial
-  upgrades, and an image's package lists age.
+  upgrades, and an image's package lists age. The first `-Syu` may upgrade the whole system:
+  give `run_command` a longer `timeout` or `background: true`. After a kernel upgrade, reboot
+  with `start_vm` before loading new modules.
+- `/tmp` is a tmpfs, cleared at every boot (unlike Ubuntu's).
 
 ## Guest tips
 
@@ -134,7 +137,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   CLIs) run through Windows' built-in Prism emulation, roughly 2–4× slower than native. x64
   drivers, kernel-mode software and anti-cheat don't. Prefer an ARM64 build when one exists.
 - **Proxy / corporate CA.** The guest inherits no Mac proxy; set `HTTP(S)_PROXY` inside it and
-  import a corporate root with `Import-Certificate` (Windows) or `update-ca-certificates` (Ubuntu) or `trust anchor` (Arch).
+  import a corporate root with `Import-Certificate` (Windows), `update-ca-certificates` (Ubuntu)
+  or `sudo trust anchor --store <cert>` (Arch).
   Mac VPNs apply automatically (the VM's NAT rides the Mac's network).
 - **No GPU acceleration** (2D virtio GPU: WebGL is software or off), **no audio device**, fixed
   1280x800.
@@ -147,14 +151,14 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 - To test untrusted software or offline behaviour, `create_vm` with `offline: true`: no internet
   and no access to the Mac, while `run_command`, files, desktop tools and `forward_port` work.
 - For a heavy build, `create_vm` accepts `memory_gb` and `cpus`; a non-default size boots
-  cold (~25 s Windows, ~15 s Ubuntu) instead of resuming in seconds.
+  cold (~25 s Windows, ~15 s Ubuntu and Arch) instead of resuming in seconds.
 - Output that needs more than 10,000 characters from each end: write it to a file in the VM
   and `download_file` it.
 - Don't create VMs you won't use. Each running VM uses 4 GB (Ubuntu, Arch) or 8 GB (Windows) of RAM.
 - The first `create_vm ubuntu` downloads the Ubuntu image (~1.2 GB). Another Ubuntu release
   (`version: "22.04"`, `"26.04"`, ...) is fetched or built the same way (~3 min).
-- `create_vm arch` (rolling release; no version needed) pulls the Arch image on first use, or
-  builds it locally (~6 min) if none is published.
+- `create_vm arch` (rolling release; no version needed, or `rolling-YYYYMMDD` to pin a build)
+  downloads the Arch image on first use, or builds it locally (~6 min) if the download fails.
 - **x86_64 Linux programs** need `create_vm(os: "ubuntu", version: "x86apps")`: FEX translates
   them to arm64, about 2x slower (JIT runtimes like Node ~6x); run them directly (`./tool`).
   Go programs work (the image sets `GODEBUG=asyncpreemptoff=1` for them). A missing x86

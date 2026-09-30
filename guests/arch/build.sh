@@ -7,7 +7,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 disk=${1:?usage: build.sh <disk>}
 
-echo "==> downloading Arch Linux ARM"
+echo "==> installing build tools and downloading Arch Linux ARM"
 apt-get -o DPkg::Lock::Timeout=300 install -y -q arch-install-scripts libarchive-tools dosfstools \
     gdisk gnupg >/dev/null
 
