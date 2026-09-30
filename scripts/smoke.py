@@ -132,6 +132,12 @@ class Report:
         return ok
 
 
+def stdout(out):
+    """The stdout section of a run_command reply ("exit code: N", then "--- stdout ---"...)."""
+    m = re.search(r"^--- stdout ---\n(.*?)(?=^--- stderr ---$|\Z)", out, re.M | re.S)
+    return m.group(1).strip() if m else ""
+
+
 def poll(fn, seconds=30, every=2):
     """Call fn until it returns something truthy or time runs out; returns the last value."""
     end = time.time() + seconds
@@ -398,18 +404,18 @@ def x86apps(m, vm, r, guest="ubuntu"):
         # FEX still sees the guest's own user.
         rootfs = "/usr/share/fex-emu/RootFS/ArchLinux"
         ok, out = sh(f"findmnt -rn -o TARGET -R {rootfs} | grep -vx {rootfs}; true")
-        r.check("fex-pacman unmounts its chroot", ok and not out.strip(), out[-300:])
+        r.check("fex-pacman unmounts its chroot", ok and not stdout(out), out[-300:])
         ok, out = sh(f"test -e {rootfs}/run/.containerenv && echo present || echo absent")
-        r.check("fex-pacman removes the .containerenv marker", ok and out.strip() == "absent", out[-300:])
+        r.check("fex-pacman removes the .containerenv marker", ok and stdout(out) == "absent", out[-300:])
         ok, out = sh("FEXBash -c 'id -un'")
-        r.check("FEXBash runs as agent after fex-pacman", ok and out.strip().splitlines()[-1:] == ["agent"], out[-300:])
+        r.check("FEXBash runs as agent after fex-pacman", ok and stdout(out).splitlines()[-1:] == ["agent"], out[-300:])
 
     # The FEX build in the image is the one guests/<os>/x86apps.sh pins.
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "guests", guest, "x86apps.sh")
     with open(script) as f:
         pinned = re.search(r"^fex_version=(\S+)", f.read(), re.M).group(1)
     ok, out = sh("cat /var/lib/agentpc/fex-version")
-    r.check(f"FEX {pinned} (the pinned version) is installed", ok and out.strip() == pinned, out[-300:])
+    r.check(f"FEX {pinned} (the pinned version) is installed", ok and stdout(out) == pinned, out[-300:])
 
     # agentpc turns on the CPU's TSO mode for x86apps VMs (macOS 15+) and then tells FEX it
     # needn't emulate x86 memory ordering; on older macOS FEX emulates it.
@@ -430,7 +436,7 @@ def x86apps(m, vm, r, guest="ubuntu"):
         r.check("pacman installs docker", ok, out[-300:])
         # -Syu may have upgraded the kernel, whose modules docker needs: reboot into it.
         ok, out = sh("test -d /usr/lib/modules/$(uname -r) && echo present || echo missing")
-        if ok and out.strip() == "missing":
+        if ok and stdout(out) == "missing":
             ok, out = m.tool("stop_vm", name=vm)
             if ok:
                 ok, out = m.tool("start_vm", name=vm)
@@ -446,7 +452,7 @@ def x86apps(m, vm, r, guest="ubuntu"):
     r.check("an amd64 container runs", ok and "x86_64" in out.split(), out[-300:])
 
     ok, out = sh("du -sk ~/.cache/fex-emu | cut -f1")
-    kb = out.strip().splitlines()[-1] if out.strip() else ""
+    kb = stdout(out).splitlines()[-1] if stdout(out) else ""
     r.check("FEX caches translated code on disk", ok and kb.isdigit() and int(kb) > 0, out[-200:])
 
     ok, out = sh(
