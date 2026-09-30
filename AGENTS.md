@@ -96,8 +96,9 @@ Rules:
   `oem/setup.ps1` runs at first logon; `guests/ubuntu/user-data` is the Ubuntu cloud-init.
   `guests/<os>/prepare.*` runs in the guest every time a snapshot is captured (agent defaults:
   no pop-ups or updates, Chrome on Ubuntu), so it also upgrades existing and pulled images.
-  On `ubuntu-<release>-x86apps` images, `guests/ubuntu/x86apps.sh` runs first: FEX rebuilt
-  static-pie with `guests/ubuntu/fex.patch` (so x86 containers work), its x86 root filesystem,
+  On `ubuntu-<release>-x86apps` images, `guests/ubuntu/x86apps.sh` runs first: FEX (version
+  pinned there) built static-pie from source with `guests/ubuntu/fex.patch` (so x86 containers
+  work; bumping the pin may need the patch rebased), its x86 root filesystem,
   amd64 apt sources, and `agentpc-fex-tso`. QEMU for those VMs loads `src/hvf_tso.c` (built by
   `build.rs`) to turn on the CPU's TSO mode; after each boot `ops` tells FEX which mode it got.
   Changes take effect on the next `agentpc image build`, which refuses while VMs of that image exist.

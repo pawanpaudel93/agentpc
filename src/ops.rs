@@ -387,6 +387,15 @@ pub fn run(cmd: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// How FEX gets x86's memory ordering in an x86apps VM: from the CPU, or by emulating it.
+fn x86_memory_ordering(inst: &Instance) -> &'static str {
+    if qemu::hardware_tso(inst) {
+        "hardware (TSO)"
+    } else {
+        "emulated (slower; hardware TSO needs macOS 15+)"
+    }
+}
+
 pub fn info(inst: &Instance) -> String {
     let cps = checkpoints(inst);
     let cps = if cps.is_empty() {
@@ -394,8 +403,16 @@ pub fn info(inst: &Instance) -> String {
     } else {
         format!("\n  checkpoints: {}", cps.join(", "))
     };
+    let x86 = if inst.image.x86_apps() {
+        format!(
+            "\n  x86 programs: FEX, memory ordering {}",
+            x86_memory_ordering(inst)
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "{} ({}): viewer {}\n  ssh: {} ssh {}    vnc: vnc://127.0.0.1:{}    login: agent/agent{cps}",
+        "{} ({}): viewer {}\n  ssh: {} ssh {}    vnc: vnc://127.0.0.1:{}    login: agent/agent{x86}{cps}",
         inst.name,
         inst.image,
         viewer::url(inst),
@@ -837,6 +854,9 @@ pub fn list_json() -> Result<String> {
             // A stopped VM has no viewer to point at.
             if running {
                 obj["viewer"] = json!(viewer::url(i));
+                if i.image.x86_apps() {
+                    obj["x86_memory_ordering"] = json!(x86_memory_ordering(i));
+                }
             }
             obj
         })

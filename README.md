@@ -450,7 +450,8 @@ to arm64 as it runs; the kernel and desktop stay native. Run the program directl
 - **Speed.** Most code runs about 2× slower than native, JIT runtimes such as Node about
   6–7×. On macOS 15 or later, agentpc also switches these VMs' CPUs to TSO, x86's
   memory ordering, so FEX needn't emulate it: multithreaded code runs up to ~40% faster, and
-  native arm64 code isn't slowed. FEX keeps translated code in `~/.cache/fex-emu`, so a
+  native arm64 code isn't slowed. `agentpc list --json` (`list_vms`) shows which a VM got as
+  `x86_memory_ordering`. FEX keeps translated code in `~/.cache/fex-emu`, so a
   program's second start is several times faster than its first.
 - **Libraries.** x86 programs find the common libraries (libc, libstdc++, GTK, ...) in an x86
   Ubuntu tree the image ships. For anything else, install the amd64 package:

@@ -5,37 +5,38 @@
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 
-# armv8.4 builds use LSE atomics and RCpc loads, which every Apple Silicon chip has.
-if ! command -v FEX >/dev/null 2>&1; then
-    add-apt-repository -y ppa:fex-emu/fex >/dev/null
-    apt-get -o DPkg::Lock::Timeout=300 install -y -q \
-        fex-emu-armv8.4 fex-emu-binfmt32 fex-emu-binfmt64 squashfuse >/dev/null
-fi
-apt-mark hold fex-emu-armv8.4 fex-emu-binfmt32 fex-emu-binfmt64 >/dev/null
-
-# x86 containers: the packaged FEX is dynamically linked, so it can't start inside a
-# container (its arm64 libraries aren't there), and it needs a FEXServer the container can't
-# reach. Rebuild the same release static-pie with /tmp/agentpc-fex.patch (guests/ubuntu/
-# fex.patch: no server inside a container, plus a fix the static build needs) and divert the
-# packaged binary. binfmt_misc's F flag holds the interpreter open, so re-register it.
-if ! file -L /usr/bin/FEX | grep -q static-pie; then
-    version=$(FEXGetConfig --version)
+# FEX, pinned like cua-driver: built from source with /tmp/agentpc-fex.patch
+# (guests/ubuntu/fex.patch), because FEX's PPA keeps only its newest release. Static-pie, so
+# the binfmt_misc interpreter also starts inside Docker and Podman containers, where the
+# patch runs it without FEXServer on the container's own x86 files. Tuned for armv8.4 (LSE
+# atomics, RCpc loads), which every Apple Silicon chip has; the default would tune for the
+# build machine's CPU and could crash on an older one. Bump deliberately.
+fex_version=2609.1
+if [ "$(cat /usr/share/fex-emu/agentpc-build 2>/dev/null)" != "$fex_version" ]; then
+    # Images from before the pin had FEX from its PPA.
+    if dpkg -s fex-emu-armv8.4 >/dev/null 2>&1; then
+        dpkg-divert --quiet --local --rename --remove /usr/bin/FEX 2>/dev/null || true
+        apt-mark unhold fex-emu-armv8.4 fex-emu-binfmt32 fex-emu-binfmt64 >/dev/null
+        apt-get purge -y -q fex-emu-armv8.4 fex-emu-binfmt32 fex-emu-binfmt64 >/dev/null
+        rm -f /etc/apt/sources.list.d/fex-emu-ubuntu-fex-*
+    fi
     build_deps="clang lld cmake ninja-build nasm"
-    apt-get -o DPkg::Lock::Timeout=300 install -y -q git $build_deps >/dev/null
+    apt-get -o DPkg::Lock::Timeout=300 install -y -q git squashfuse $build_deps >/dev/null
     src=$(mktemp -d)
-    git clone -q --depth 1 --branch "FEX-$version" --recurse-submodules --shallow-submodules \
+    git clone -q --depth 1 --branch "FEX-$fex_version" --recurse-submodules --shallow-submodules \
         https://github.com/FEX-Emu/FEX "$src/FEX" 2>/dev/null
     git -C "$src/FEX" apply /tmp/agentpc-fex.patch
     cmake -S "$src/FEX" -B "$src/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
         -DCMAKE_CXX_SCAN_FOR_MODULES=OFF -DCMAKE_EXE_LINKER_FLAGS="-static-pie -fuse-ld=lld" \
-        -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DENABLE_ASSERTIONS=OFF \
-        >/dev/null
-    ninja -C "$src/build" FEX >/dev/null
-    dpkg-divert --quiet --local --rename --add /usr/bin/FEX
-    install -m 755 "$src/build/Bin/FEX" /usr/bin/FEX
+        -DTUNE_CPU=none -DTUNE_ARCH=armv8.4-a -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
+        -DBUILD_FEXCONFIG=OFF -DENABLE_GDB_SYMBOLS=OFF -DENABLE_OFFLINE_TELEMETRY=OFF \
+        -DENABLE_CCACHE=OFF >/dev/null
+    ninja -C "$src/build" install >/dev/null
     rm -rf "$src"
     apt-get purge -y -q --autoremove $build_deps >/dev/null
+    echo "$fex_version" > /usr/share/fex-emu/agentpc-build
+    # binfmt_misc's F flag holds the interpreter open: re-register the new one.
     systemctl restart systemd-binfmt
 fi
 rm -f /tmp/agentpc-fex.patch
