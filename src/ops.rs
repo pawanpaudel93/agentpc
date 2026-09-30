@@ -105,9 +105,19 @@ fn scp(inst: &Instance, from: &str, to: &str) -> Result<()> {
 /// which QEMU's hostfwd cannot. The tunnel lives until the VM stops or it is removed
 /// (`remove_forward`/`stop_forwards`); its pid is recorded under
 /// `<instance>/forwards/<host_port>.pid`. With no `host_port`, a free one is picked.
-pub fn forward(inst: &Instance, guest_port: u16, host_port: Option<u16>) -> Result<String> {
+/// UDP can't go through an SSH tunnel, so a UDP forward is a QEMU hostfwd instead
+/// (`forward_udp`).
+pub fn forward(
+    inst: &Instance,
+    guest_port: u16,
+    host_port: Option<u16>,
+    protocol: Protocol,
+) -> Result<String> {
     if !inst.running() {
         bail!("{} is not running; start it first", inst.name);
+    }
+    if protocol == Protocol::Udp {
+        return forward_udp(inst, guest_port, host_port);
     }
     let host_port = match host_port {
         Some(p) => p,
@@ -183,6 +193,95 @@ pub fn forward(inst: &Instance, guest_port: u16, host_port: Option<u16>) -> Resu
 fn forward_url(inst: &Instance, host_port: u16, guest_port: u16) -> String {
     format!(
         "127.0.0.1:{host_port} -> {}:{guest_port} (until the VM stops or the forward is removed)",
+        inst.name
+    )
+}
+
+/// A forward's transport. TCP goes through an SSH tunnel, UDP through a QEMU hostfwd.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Protocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl Protocol {
+    fn as_str(self) -> &'static str {
+        match self {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+        }
+    }
+
+    /// Extension of the forward's record under `<instance>/forwards/`.
+    fn record_ext(self) -> &'static str {
+        match self {
+            Protocol::Tcp => "pid",
+            Protocol::Udp => "udp",
+        }
+    }
+}
+
+/// The netdev every VM gets (`qemu::launch`), which runtime hostfwds attach to.
+const NETDEV: &str = "net0";
+
+fn hostfwd_add_cmd(host_port: u16, guest_port: u16) -> String {
+    format!("hostfwd_add {NETDEV} udp:127.0.0.1:{host_port}-:{guest_port}")
+}
+
+fn hostfwd_remove_cmd(host_port: u16) -> String {
+    format!("hostfwd_remove {NETDEV} udp:127.0.0.1:{host_port}")
+}
+
+/// Forward UDP on 127.0.0.1:<host_port> to the guest with a QEMU user-net hostfwd added over
+/// the monitor. Unlike the TCP tunnel it reaches the guest's network address (10.0.2.15), so
+/// the server must listen on 0.0.0.0, not 127.0.0.1. The hostfwd dies with this QEMU; the
+/// record, `<instance>/forwards/<host_port>.udp`, holds that QEMU's pid and the guest port,
+/// so a record left from an earlier run reads as down.
+fn forward_udp(inst: &Instance, guest_port: u16, host_port: Option<u16>) -> Result<String> {
+    if inst.offline() {
+        // libslirp's restrict=on drops every UDP datagram the guest sends, replies included.
+        bail!(
+            "{} is offline: its network drops all UDP from the guest, so a UDP forward can't \
+             carry replies",
+            inst.name
+        );
+    }
+    let qemu_pid = inst
+        .pid()
+        .with_context(|| format!("{} is not running; start it first", inst.name))?;
+    let host_port = match host_port {
+        Some(p) => p,
+        None => std::net::UdpSocket::bind(("127.0.0.1", 0))?
+            .local_addr()?
+            .port(),
+    };
+    let dir = inst.dir.join("forwards");
+    std::fs::create_dir_all(&dir)?;
+    let record = dir.join(format!("{host_port}.udp"));
+    if let Some((pid, guest)) = read_forward(&record)
+        && pid == qemu_pid
+    {
+        if guest != guest_port {
+            bail!(
+                "udp 127.0.0.1:{host_port} already forwards to {}:{guest}; delete it first",
+                inst.name
+            );
+        }
+        return Ok(forward_udp_text(inst, host_port, guest_port));
+    }
+    let out = qemu::Qmp::connect(inst)?.hmp(&hostfwd_add_cmd(host_port, guest_port))?;
+    if !out.is_empty() {
+        bail!("forwarding udp port {host_port} failed: {out}");
+    }
+    std::fs::write(&record, format!("{qemu_pid}\n{guest_port}\n"))?;
+    Ok(forward_udp_text(inst, host_port, guest_port))
+}
+
+fn forward_udp_text(inst: &Instance, host_port: u16, guest_port: u16) -> String {
+    format!(
+        "udp 127.0.0.1:{host_port} -> {}:{guest_port} (until the VM stops or the forward is \
+         removed; the guest server must listen on 0.0.0.0, not 127.0.0.1)",
         inst.name
     )
 }
@@ -713,7 +812,8 @@ pub fn checkpoint(inst: &Instance, label: &str) -> Result<String> {
 }
 
 /// Put the instance back exactly as it was at checkpoint `label` and start it: it resumes
-/// in seconds if the checkpoint has its memory, else it boots. Port forwards are lost.
+/// in seconds if the checkpoint has its memory, else it boots. Port forwards (TCP and UDP)
+/// are dropped, as on stop and reset.
 pub fn restore(inst: &Instance, label: &str) -> Result<String> {
     let _lock = inst.lock()?;
     let dir = checkpoint_dir(inst, label)?;
@@ -729,6 +829,7 @@ pub fn restore(inst: &Instance, label: &str) -> Result<String> {
             }
         );
     }
+    stop_forwards(inst);
     qemu::quit(inst);
     // Clone (APFS) into a temp in the same dir, then rename over the live files, so an
     // interrupted restore can't leave a half-written disk. fs::copy is a clonefile here.
@@ -994,26 +1095,39 @@ fn pid_alive(pid: i32) -> bool {
     unsafe { c_kill(pid, 0) == 0 }
 }
 
-/// Active forwards on a VM as `(host_port, guest_port, alive)`, sorted by host port.
-pub fn list_forwards(inst: &Instance) -> Vec<(u16, u16, bool)> {
+/// Active forwards on a VM as `(host_port, protocol, guest_port, alive)`, sorted by host port.
+/// A TCP forward is alive while its tunnel runs, a UDP one while the QEMU that holds it does.
+pub fn list_forwards(inst: &Instance) -> Vec<(u16, Protocol, u16, bool)> {
     let mut out = Vec::new();
+    let mut qemu_pid = None;
     if let Ok(entries) = std::fs::read_dir(inst.dir.join("forwards")) {
         for e in entries.flatten() {
             let p = e.path();
-            if p.extension().is_some_and(|x| x == "pid")
-                && let Some((pid, guest)) = read_forward(&p)
-            {
-                let host = p
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                out.push((host, guest, pid_alive(pid)));
-            }
+            let Some((protocol, host)) = forward_record_name(&p) else {
+                continue;
+            };
+            let Some((pid, guest)) = read_forward(&p) else {
+                continue;
+            };
+            let alive = match protocol {
+                Protocol::Tcp => pid_alive(pid),
+                Protocol::Udp => *qemu_pid.get_or_insert_with(|| inst.pid()) == Some(pid),
+            };
+            out.push((host, protocol, guest, alive));
         }
     }
     out.sort();
     out
+}
+
+/// The protocol and host port of a forward record (`<host_port>.pid` or `<host_port>.udp`).
+fn forward_record_name(p: &Path) -> Option<(Protocol, u16)> {
+    let protocol = match p.extension()?.to_str()? {
+        "pid" => Protocol::Tcp,
+        "udp" => Protocol::Udp,
+        _ => return None,
+    };
+    Some((protocol, p.file_stem()?.to_str()?.parse().ok()?))
 }
 
 /// One line per forward, for the CLI and the MCP `list_forwards` tool.
@@ -1023,9 +1137,10 @@ pub fn forwards_text(inst: &Instance) -> String {
         return format!("{}: no forwarded ports", inst.name);
     }
     list.into_iter()
-        .map(|(h, g, alive)| {
+        .map(|(h, protocol, g, alive)| {
             format!(
-                "127.0.0.1:{h} -> {}:{g}{}",
+                "{} 127.0.0.1:{h} -> {}:{g}{}",
+                protocol.as_str(),
                 inst.name,
                 if alive { "" } else { " (down)" }
             )
@@ -1034,21 +1149,56 @@ pub fn forwards_text(inst: &Instance) -> String {
         .join("\n")
 }
 
-/// Tear down one forward by its host port.
-pub fn remove_forward(inst: &Instance, host_port: u16) -> Result<String> {
+/// Tear down the forward on a host port: the given protocol's, or with `None` every
+/// protocol's (TCP and UDP ports are separate, so both can exist).
+pub fn remove_forward(
+    inst: &Instance,
+    host_port: u16,
+    protocol: Option<Protocol>,
+) -> Result<String> {
     let dir = inst.dir.join("forwards");
-    let pid_file = dir.join(format!("{host_port}.pid"));
-    let Some((pid, _)) = read_forward(&pid_file) else {
-        bail!("{}: no forward on port {host_port}", inst.name);
-    };
-    crate::instance::kill(pid, 15);
-    let _ = std::fs::remove_file(&pid_file);
-    let _ = std::fs::remove_file(dir.join(format!("{host_port}.log")));
-    Ok(format!("removed the forward on 127.0.0.1:{host_port}"))
+    let mut removed = Vec::new();
+    for p in [Protocol::Tcp, Protocol::Udp] {
+        if protocol.is_some_and(|want| want != p) {
+            continue;
+        }
+        let record = dir.join(format!("{host_port}.{}", p.record_ext()));
+        let Some((pid, _)) = read_forward(&record) else {
+            continue;
+        };
+        match p {
+            Protocol::Tcp => {
+                crate::instance::kill(pid, 15);
+                let _ = std::fs::remove_file(dir.join(format!("{host_port}.log")));
+            }
+            // Only the QEMU that added the hostfwd holds it; an older record is already dead.
+            // "not found" means it's gone too, so any reply still lets the record go.
+            Protocol::Udp if inst.pid() == Some(pid) => {
+                qemu::Qmp::connect(inst)?.hmp(&hostfwd_remove_cmd(host_port))?;
+            }
+            Protocol::Udp => {}
+        }
+        let _ = std::fs::remove_file(&record);
+        removed.push(p.as_str());
+    }
+    if removed.is_empty() {
+        bail!(
+            "{}: no {}forward on port {host_port}",
+            inst.name,
+            protocol
+                .map(|p| format!("{} ", p.as_str()))
+                .unwrap_or_default()
+        );
+    }
+    Ok(format!(
+        "removed the {} forward on 127.0.0.1:{host_port}",
+        removed.join(" and ")
+    ))
 }
 
-/// Tear down every forward of a VM. Call on stop/delete/reset/restore (the tunnels die with
-/// the VM anyway, but their pid files should not linger).
+/// Tear down every forward of a VM. Call on stop/delete/reset/restore: the tunnels and
+/// UDP hostfwds die with the VM anyway, but their records should not linger. UDP hostfwds
+/// are left to die with QEMU, which every caller is about to stop.
 pub fn stop_forwards(inst: &Instance) {
     if let Ok(entries) = std::fs::read_dir(inst.dir.join("forwards")) {
         for e in entries.flatten() {
@@ -1087,10 +1237,46 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_hostfwd_commands() {
+        assert_eq!(
+            hostfwd_add_cmd(5000, 53),
+            "hostfwd_add net0 udp:127.0.0.1:5000-:53"
+        );
+        assert_eq!(
+            hostfwd_remove_cmd(5000),
+            "hostfwd_remove net0 udp:127.0.0.1:5000"
+        );
+    }
+
+    #[test]
+    fn forward_record_names() {
+        let p = |s: &str| forward_record_name(Path::new(s));
+        assert_eq!(p("/x/forwards/8080.pid"), Some((Protocol::Tcp, 8080)));
+        assert_eq!(p("/x/forwards/5000.udp"), Some((Protocol::Udp, 5000)));
+        assert_eq!(p("/x/forwards/8080.log"), None);
+        assert_eq!(p("/x/forwards/nope.udp"), None);
+        assert_eq!(p("/x/forwards/70000.udp"), None);
+    }
+
+    #[test]
+    fn reads_forward_records() {
+        let dir = std::env::temp_dir().join(format!("agentpc-fwd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = dir.join("5000.udp");
+        std::fs::write(&rec, "4242\n53\n").unwrap();
+        assert_eq!(read_forward(&rec), Some((4242, 53)));
+        std::fs::write(&rec, "garbage\n").unwrap();
+        assert_eq!(read_forward(&rec), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn checks_instance_names() {
         for ok in ["ubuntu-1", "my.vm_2", "A", &"x".repeat(64)] {
-            assert!(super::check_name(ok).is_ok(), "{ok}");
+            assert!(check_name(ok).is_ok(), "{ok}");
         }
         for bad in [
             "",
@@ -1103,7 +1289,7 @@ mod tests {
             "ünïcode",
             &"x".repeat(65),
         ] {
-            assert!(super::check_name(bad).is_err(), "{bad}");
+            assert!(check_name(bad).is_err(), "{bad}");
         }
     }
 }

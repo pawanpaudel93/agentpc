@@ -33,8 +33,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 | `run_command(name, command, timeout?, background?)` | Shell command: PowerShell on Windows, bash on Ubuntu and Arch. Returns `exit code: N` plus stdout and stderr, each trimmed to its first and last 10,000 characters. Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` (servers, long jobs) returns a job id to poll with `get_job_status` |
 | `get_job_status(name, id, tail_lines?)` | Background job's state (running, or exited with its code) plus its log tail |
 | `upload_file` / `download_file` | Copy files or folders between this Mac and a VM |
-| `forward_port(name, guest_port, host_port?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). SSH tunnel: reaches a server on the guest's own `127.0.0.1`; lasts until the VM stops |
-| `list_forwards(name)` / `delete_forward(name, host_port)` | List a VM's forwards / stop one |
+| `forward_port(name, guest_port, host_port?, protocol?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). TCP (default) is an SSH tunnel: reaches a server on the guest's own `127.0.0.1`. `protocol: "udp"` is a QEMU host forward: the guest server must listen on `0.0.0.0`; not on offline VMs. Lasts until the VM stops |
+| `list_forwards(name)` / `delete_forward(name, host_port, protocol?)` | List a VM's forwards (with protocol) / stop one |
 | `read_vm_log(name, which, tail_lines?)` | Tail a VM's `qemu` or `serial` log when it won't boot or the desktop is unreachable |
 | `list_desktop_tools(name, tool?)` | Desktop-control tools in that VM with their required arguments and read-only marks, or one tool's full schema |
 | `use_desktop_tool(name, tool, arguments?)` | Call a GUI tool: click, type, launch apps, read the UI tree. A wrong name returns close matches |
@@ -47,7 +47,7 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
    Use `upload_file` to bring in what you need to test (an installer, a script, a build).
 3. Before a risky or slow-to-redo step (an installer, a config change), `checkpoint_vm` so
    `restore_vm` can undo it in seconds instead of rebuilding from `reset_vm`. Port forwards
-   must be set up again after a restore.
+   (TCP and UDP) must be set up again after a restore.
 4. For GUI work, loop: look (`take_screenshot` or a UI-snapshot tool), act (`use_desktop_tool`), then
    look again to verify.
 5. Call `list_desktop_tools` once per VM to learn the exact tool names and required arguments.
@@ -84,7 +84,9 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 - `run_command` runs PowerShell as the `agent` administrator. The screen is 1280x800.
 - Processes started over `run_command` end when the command returns: start servers and GUI apps
   with `background: true`. `forward_port` tunnels over SSH, so it reaches a server on the guest's
-  own `127.0.0.1` with no Windows firewall change.
+  own `127.0.0.1` with no Windows firewall change; a `protocol: "udp"` forward reaches the
+  guest's network address, so its server must listen on `0.0.0.0` and be allowed through the
+  firewall (`New-NetFirewallRule -Direction Inbound -Protocol UDP -LocalPort <port> -Action Allow`).
 - SmartScreen, Windows Update and first-run pop-ups are turned off. Edge is the browser.
 - It's a clean install: no Visual C++ redistributable, no .NET (only .NET Framework 4.8.1),
   no PowerShell 7. A missing `VCRUNTIME140.dll` means the app under test doesn't ship its
@@ -125,7 +127,9 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 - **Reaching the Mac / other VMs.** From a guest, `10.0.2.2` is the Mac host (a Mac dev server
   on `127.0.0.1` or `0.0.0.0` is reachable there). VMs can't reach each other directly: to let VM
   A hit a server in VM B, `forward_port(B, guest_port, host_port)`, then from A connect to
-  `10.0.2.2:<host_port>`. An `offline: true` VM can't reach `10.0.2.2`; its forwarded ports still work.
+  `10.0.2.2:<host_port>`; for UDP pass `protocol: "udp"` and have B's server listen on `0.0.0.0`
+  (a Windows guest also needs a firewall rule for it). An `offline: true` VM can't reach
+  `10.0.2.2`; its forwarded TCP ports still work (UDP forwards don't).
 - **Reboots.** A reboot (Windows Update, some installers) drops SSH. Call `start_vm` on the same
   VM — it waits until the desktop is ready again — or just retry `run_command`.
 - **GUI installers** return immediately; run them silently and wait:
@@ -173,6 +177,9 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   (VS Code, Slack, ...) need `--no-sandbox`. A missing x86 library on Ubuntu: `sudo apt install
   libfoo:amd64`. Arch has no multiarch: x86 programs there use FEX's x86 Arch Linux tree, and
   `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs more x86 packages into it.
+  x86 systemd services run too; if the unit sets `MemoryDenyWriteExecute=` or
+  `LockPersonality=` (which stop FEX, as they stop any JIT), `sudo fex-unit <unit>` adds a
+  drop-in that relaxes just those two.
   `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or `emulated`. The first
   create downloads the image, or builds it locally (~8 min Ubuntu, ~10 min Arch) if the
   download fails.

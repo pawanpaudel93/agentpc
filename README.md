@@ -179,8 +179,8 @@ pick the server up automatically.
 | `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu and Arch); returns exit code, stdout and stderr. A foreground run is killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id for `get_job_status` |
 | `get_job_status` | Check a background job by its id: still running or exited (with its code), plus the tail of its log |
 | `upload_file` / `download_file` | Copy files or folders between your Mac and a VM |
-| `forward_port` | Reach a server running in a VM from your Mac (SSH tunnel; works even for servers bound to the guest's own `127.0.0.1`) |
-| `list_forwards` / `delete_forward` | List a VM's active port forwards / stop one by its host port |
+| `forward_port` | Reach a server running in a VM from your Mac (TCP over an SSH tunnel, works even for servers bound to the guest's own `127.0.0.1`; or `protocol: "udp"` for a UDP server listening on `0.0.0.0`) |
+| `list_forwards` / `delete_forward` | List a VM's active port forwards / stop one by its host port (and optional protocol) |
 | `read_vm_log` | Read the tail of a VM's `qemu` or `serial` log, for when a VM won't boot or the desktop is unreachable |
 | `list_desktop_tools` | List the desktop-control tools inside a VM, with each one's required arguments and whether it's read-only; a wrong name returns close matches |
 | `use_desktop_tool` | Call one of them: click, type, launch apps, read the UI tree, … A call with wrong arguments or a wrong name returns the tool's arguments or close matches |
@@ -236,7 +236,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 | `agentpc ssh <name> [command]` | Run a command, or open a shell with no command |
 | `agentpc screenshot <name> [file]` | Save a PNG screenshot |
 | `agentpc cp <src> <dst>` | Copy files; the VM side is `<name>:<path>`, e.g. `agentpc cp app.msi windows-1:Downloads/` |
-| `agentpc forward <name> <guest-port> [host-port]` | Forward `127.0.0.1:<host-port>` to a port in a running VM (over SSH). `--list` shows a VM's forwards; `--rm <host-port>` stops one |
+| `agentpc forward <name> <guest-port> [host-port]` | Forward `127.0.0.1:<host-port>` to a port in a running VM (over SSH). `--udp` forwards UDP instead (to a guest server on `0.0.0.0`). `--list` shows a VM's forwards; `--rm <host-port>` stops one (add `--udp`/`--tcp` to pick a protocol) |
 
 ### Image commands
 
@@ -410,7 +410,8 @@ The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
 - **x86apps build.** On `ubuntu-x86apps` and `arch-x86apps`, `guests/<os>/x86apps.sh` builds
   [FEX](https://fex-emu.com) (tag and commit pinned there) from source as a static-pie with
   `guests/ubuntu/fex.patch` (so x86 containers work) and installs an x86 root filesystem: Ubuntu's
-  as a squashfs, Arch Linux's unpacked so `fex-pacman` can add packages to it.
+  as a squashfs the kernel mounts read-only at boot (not FEX through FUSE, which a sandboxed
+  service can't), Arch Linux's unpacked so `fex-pacman` can add packages to it.
   QEMU for these VMs loads `src/hvf_tso.c`, which turns on the CPU's TSO mode; agentpc checks
   the result after each boot and tells FEX, which falls back to emulating x86 memory ordering
   when TSO is off.
@@ -446,14 +447,20 @@ Mac's network (a VPN or proxy configured on the Mac applies to a VM's outbound t
   reaches a server bound to the guest's own `127.0.0.1` and the Windows firewall doesn't apply.
   A forward lasts until the VM stops or you remove it (`--rm <host-port>` / `delete_forward`);
   `--list` (MCP: `list_forwards`) shows a VM's forwards.
+- **UDP servers** (games, DNS, QUIC, relays): add `--udp` (MCP: `protocol: "udp"`). A UDP
+  forward is a QEMU host forward rather than an SSH tunnel, so it reaches the guest's network
+  address (`10.0.2.15`): the server must listen on `0.0.0.0`, not `127.0.0.1`, and on Windows
+  it needs a firewall rule. It's dropped on stop, restore and reset like a TCP forward, and
+  isn't available on offline VMs.
 - **Reach the Mac from a guest:** `10.0.2.2` is the Mac host — the NAT maps it to the Mac's
   loopback, so a dev server listening on `127.0.0.1` or `0.0.0.0` is reachable at
   `10.0.2.2:<port>` from inside the VM.
 - **VM to VM:** there's no direct route. Forward the server VM's port to the Mac
   (`forward_port(B, guest_port, host_port)`), then from the other VM connect to
-  `10.0.2.2:<host_port>`.
+  `10.0.2.2:<host_port>`. For UDP pass `protocol: "udp"` and have B's server listen on `0.0.0.0`.
 - **Offline VMs** (`--offline` / `offline: true`) can't reach `10.0.2.2` or the internet, but
-  ports you forward from the Mac still reach them.
+  TCP ports you forward from the Mac still reach them. UDP forwards don't work there: the
+  offline network drops every UDP datagram the guest sends, replies included.
 - **Corporate proxy / CA:** a guest inherits no proxy settings from the Mac. Set `HTTP_PROXY`
   and `HTTPS_PROXY` inside the guest, and import your corporate root CA with
   `Import-Certificate` (Windows), `update-ca-certificates` (Ubuntu) or
@@ -529,6 +536,11 @@ to arm64 as it runs; the kernel and desktop stay native. Run the program directl
 - **x86 containers** work: install Docker or Podman (on Arch: `sudo pacman -Syu --noconfirm
   docker && sudo systemctl start docker`) and run `docker run --platform linux/amd64 <image>`.
   FEX runs them from the image's own x86 files.
+- **x86 services** run under systemd, as system users without a home too (FEX then keeps its
+  config and code cache in the unit's `StateDirectory=` or a private `/tmp/fex-emu-<uid>`). A
+  unit with `MemoryDenyWriteExecute=` or `LockPersonality=` stops FEX, as it stops any JIT:
+  `sudo fex-unit <unit>` adds a drop-in that relaxes those two (`--undo` removes it). With
+  `ProtectSystem=strict`, give the unit a writable directory (`StateDirectory=` or `PrivateTmp=`).
 - **Not covered:** x86 kernel modules and drivers. It's translation, not an x86 machine.
 
 ### Hardware limits

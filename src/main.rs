@@ -132,7 +132,8 @@ enum Cmd {
         /// Destination: a path on this Mac, or <vm>:<path>
         dst: String,
     },
-    /// Forward 127.0.0.1:<host_port> to a port inside a running VM (free port if omitted)
+    /// Forward 127.0.0.1:<host_port> to a port inside a running VM (free port if omitted).
+    /// TCP reaches servers on the guest's own 127.0.0.1; --udp needs the server on 0.0.0.0
     Forward {
         /// VM name
         name: String,
@@ -143,9 +144,15 @@ enum Cmd {
         /// List this VM's active forwards instead of adding one
         #[arg(long)]
         list: bool,
-        /// Stop forwarding this host port
+        /// Stop forwarding this host port (both protocols unless --udp or --tcp is given)
         #[arg(long, value_name = "HOST_PORT")]
         rm: Option<u16>,
+        /// Forward UDP (a QEMU host forward) instead of TCP; not on --offline VMs
+        #[arg(long, conflicts_with = "tcp")]
+        udp: bool,
+        /// With --rm: only the TCP forward on that port
+        #[arg(long, requires = "rm")]
+        tcp: bool,
     },
     /// Save a PNG screenshot
     Screenshot {
@@ -334,16 +341,27 @@ fn run(cli: Cli) -> Result<()> {
             host_port,
             list,
             rm,
+            udp,
+            tcp,
         } => {
             let inst = Instance::load(&name)?;
+            let protocol = if udp {
+                ops::Protocol::Udp
+            } else {
+                ops::Protocol::Tcp
+            };
             if list {
                 out(Ok(ops::forwards_text(&inst)))
             } else if let Some(port) = rm {
-                out(ops::remove_forward(&inst, port))
+                out(ops::remove_forward(
+                    &inst,
+                    port,
+                    (udp || tcp).then_some(protocol),
+                ))
             } else {
                 let guest_port =
                     guest_port.context("guest_port is required (or use --list / --rm)")?;
-                out(ops::forward(&inst, guest_port, host_port))
+                out(ops::forward(&inst, guest_port, host_port, protocol))
             }
         }
         Cmd::Screenshot { name, out: path } => {

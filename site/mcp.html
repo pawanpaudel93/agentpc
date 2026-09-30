@@ -200,7 +200,7 @@ tool_timeout_sec = 900</code></pre>
                 </tr>
                 <tr>
                   <td><code translate="no">restore_vm</code></td>
-                  <td>Go back to a checkpoint exactly as it was and start it, in seconds. Port forwards must be set up again.</td>
+                  <td>Go back to a checkpoint exactly as it was and start it, in seconds. Port forwards (TCP and UDP) must be set up again.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">delete_checkpoint</code></td>
@@ -238,11 +238,13 @@ tool_timeout_sec = 900</code></pre>
                     Reach a server in the VM from the Mac at <code translate="no">127.0.0.1:&lt;host_port&gt;</code>.
                     An SSH tunnel, so it reaches servers bound to the guest's own
                     <code translate="no">127.0.0.1</code>. Lasts until the VM stops.
+                    <code translate="no">protocol: "udp"</code> forwards UDP instead, to a guest server listening
+                    on <code translate="no">0.0.0.0</code> (not on offline VMs).
                   </td>
                 </tr>
                 <tr>
                   <td><code translate="no">list_forwards</code> / <code translate="no">delete_forward</code></td>
-                  <td>List a VM's forwards and whether each tunnel is alive / stop one by its host port.</td>
+                  <td>List a VM's forwards, their protocol and whether each is alive / stop one by its host port (and optional protocol).</td>
                 </tr>
               </tbody>
             </table>
@@ -352,7 +354,9 @@ tool_timeout_sec = 900</code></pre>
               x86 Electron/Chromium apps need <code translate="no">--no-sandbox</code>. On Ubuntu, a missing x86 library
               installs with <code translate="no">sudo apt install libfoo:amd64</code>; on Arch (no multiarch) x86
               programs use the image's x86 Arch Linux tree, and
-              <code translate="no">sudo fex-pacman -Sy --noconfirm --needed &lt;pkg&gt;</code> installs more x86 packages into it. <code translate="no">list_vms</code> shows
+              <code translate="no">sudo fex-pacman -Sy --noconfirm --needed &lt;pkg&gt;</code> installs more x86 packages into it.
+              x86 systemd services run too (<code translate="no">sudo fex-unit &lt;unit&gt;</code> if the unit sets
+              <code translate="no">MemoryDenyWriteExecute=</code> or <code translate="no">LockPersonality=</code>). <code translate="no">list_vms</code> shows
               <code translate="no">x86_tso</code>: <code translate="no">hardware</code> (needs macOS 15+) or
               <code translate="no">emulated</code>.
             </p>

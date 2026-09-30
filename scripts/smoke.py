@@ -26,6 +26,7 @@ import platform
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -328,6 +329,35 @@ def lifecycle(m, vm, r, guest):
         _, listing = m.tool("list_forwards", name=vm)
         r.check("delete_forward removes it", ok and f"127.0.0.1:{port}" not in listing, f"{out[:150]} | {listing[:150]}")
 
+    # UDP: a QEMU host forward, which reaches a server on the guest's 0.0.0.0 (perl on both images).
+    sh(
+        "exec perl -MIO::Socket::INET -e '$s = IO::Socket::INET->new(LocalAddr => \"0.0.0.0\", "
+        "LocalPort => 8766, Proto => \"udp\") or die; while ($s->recv($d, 2048)) "
+        "{ $s->send(\"echo:$d\") }'",
+        background=True,
+    )
+    ok, out = m.tool("forward_port", name=vm, guest_port=8766, protocol="udp")
+    fwd = re.search(r"udp 127\.0\.0\.1:(\d+)", out) if ok else None
+    if r.check("forward_port with protocol udp", fwd, out[:200]):
+        port = int(fwd.group(1))
+
+        def echo():
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(3)
+            try:
+                s.sendto(b"smoke-udp", ("127.0.0.1", port))
+                return s.recvfrom(64)[0] == b"echo:smoke-udp"
+            except OSError:
+                return False
+            finally:
+                s.close()
+        r.check("the UDP forward reaches a server on the guest's 0.0.0.0 and back", poll(echo, 20))
+        ok, out = m.tool("list_forwards", name=vm)
+        r.check("list_forwards lists the udp forward", ok and f"udp 127.0.0.1:{port}" in out, out[:200])
+        ok, out = m.tool("delete_forward", name=vm, host_port=port, protocol="udp")
+        _, listing = m.tool("list_forwards", name=vm)
+        r.check("delete_forward removes the udp forward", ok and f"127.0.0.1:{port}" not in listing, f"{out[:150]} | {listing[:150]}")
+
     sh("echo before > ~/smoke-marker")
     ok, out = m.tool("checkpoint_vm", name=vm, label="smoke")
     if r.check("checkpoint_vm", ok, out[:200]):
@@ -390,6 +420,25 @@ def x86apps(m, vm, r, guest="ubuntu"):
 
     ok, out = sh("sudo /tmp/node-v22.20.0-linux-x64/bin/node -p process.arch")
     r.check("x86 programs run as root too", ok and out.strip().endswith("x64"), out[-300:])
+
+    # An x86 service: a hardened systemd unit (a relay's options) running as nobody, whose home
+    # doesn't exist. FEX falls back to a writable directory and reads its RootFS without FUSE or
+    # openat2; MemoryDenyWriteExecute= and LockPersonality= still stop any JIT, so fex-unit relaxes them.
+    unit = "\n".join([
+        "[Service]", "Type=oneshot", "User=nobody",
+        "ExecStart=/usr/local/lib/smoke-node/bin/node -p process.arch",
+        "NoNewPrivileges=yes", "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes",
+        "PrivateDevices=yes", "RestrictSUIDSGID=yes", "RestrictNamespaces=yes",
+        "MemoryDenyWriteExecute=yes", "LockPersonality=yes",
+    ])
+    ok, out = sh(
+        "sudo rm -rf /usr/local/lib/smoke-node && sudo cp -r /tmp/node-v22.20.0-linux-x64 /usr/local/lib/smoke-node"
+        f" && printf '%s\\n' '{unit}' | sudo tee /etc/systemd/system/smoke-x86.service >/dev/null"
+        " && sudo fex-unit smoke-x86 >/dev/null && sudo systemctl start smoke-x86"
+        " && sudo journalctl -u smoke-x86 -n 5 --no-pager -o cat"
+    )
+    r.check("a hardened systemd unit runs an x86 program (with fex-unit)", ok and "x64" in stdout(out).split(), out[-300:])
+    sh("sudo fex-unit smoke-x86 --undo >/dev/null; sudo rm -rf /etc/systemd/system/smoke-x86.service /usr/local/lib/smoke-node; sudo systemctl daemon-reload")
 
     # x86 libraries the RootFS lacks: on Ubuntu from apt (multiarch), on Arch (no multiarch)
     # installed into the x86 root filesystem with fex-pacman. Either way FEX finds them.

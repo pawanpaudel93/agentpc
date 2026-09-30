@@ -14,7 +14,10 @@ export DEBIAN_FRONTEND=noninteractive
 fex_version=2609.1
 # The commit the FEX-$fex_version tag points to (its peeled ^{} commit): a moved tag fails the build.
 fex_commit=9fbdc00bd6401aff3b32d79e78ff98b8a13e4dcf
-if [ "$(cat /var/lib/agentpc/fex-version 2>/dev/null)" != "$fex_version" ]; then
+# The patch is part of the build: a changed one rebuilds FEX like a new version does.
+fex_patch=$(sha256sum /tmp/agentpc-fex.patch | cut -d" " -f1)
+if [ "$(cat /var/lib/agentpc/fex-version 2>/dev/null)" != "$fex_version" ] ||
+    [ "$(cat /var/lib/agentpc/fex-patch 2>/dev/null)" != "$fex_patch" ]; then
     # Images from before the pin had FEX from its PPA.
     if dpkg -s fex-emu-armv8.4 >/dev/null 2>&1; then
         dpkg-divert --quiet --local --rename --remove /usr/bin/FEX 2>/dev/null || true
@@ -49,16 +52,20 @@ if [ "$(cat /var/lib/agentpc/fex-version 2>/dev/null)" != "$fex_version" ]; then
     apt-get purge -y -q --autoremove $build_deps >/dev/null
     mkdir -p /var/lib/agentpc
     echo "$fex_version" > /var/lib/agentpc/fex-version
+    echo "$fex_patch" > /var/lib/agentpc/fex-patch
     # binfmt_misc's F flag holds the interpreter open: re-register the new one.
     systemctl restart systemd-binfmt
 fi
 rm -f /tmp/agentpc-fex.patch
 
 # The x86 libraries programs load (libc, libstdc++, ...): FEX's squashfs of an x86 Ubuntu,
-# which FEX mounts on first use. 0.5 GB instead of 1.9 GB unpacked, and no slower to start.
+# 0.5 GB instead of 1.9 GB unpacked. The kernel mounts it read-only at boot (fstab), rather
+# than FEX through FUSE at each start, which a systemd service with PrivateDevices= or
+# NoNewPrivileges= can't do.
 . /etc/os-release
 name="Ubuntu_$(echo "$VERSION_ID" | tr . _)"
 rootfs=/usr/share/fex-emu/RootFS/$name.sqsh
+mnt=/usr/share/fex-emu/RootFS/$name
 # Pinned and checked per release (sha256 of the file rootfs.fex-emu.gg lists; its own hash
 # is xxh3); a stamp records the installed pin, so a bump reaches existing images.
 case "$VERSION_ID" in
@@ -76,6 +83,7 @@ if [ -n "$rootfs_url" ]; then
         if ! { [ -f "$rootfs" ] && echo "$rootfs_sha256  $rootfs" | sha256sum -c --quiet >/dev/null 2>&1; }; then
             curl -fsSL -o "$rootfs.tmp" "$rootfs_url"
             echo "$rootfs_sha256  $rootfs.tmp" | sha256sum -c --quiet
+            umount "$mnt" 2>/dev/null || true
             mv "$rootfs.tmp" "$rootfs"
         fi
         echo "$rootfs_url:$rootfs_sha256" > "$rootfs_stamp"
@@ -86,11 +94,19 @@ elif [ ! -f "$rootfs" ]; then
     HOME=$tmp XDG_DATA_HOME=$tmp/data XDG_CONFIG_HOME=$tmp/config FEXRootFSFetcher -y -a \
         --distro-name=ubuntu --distro-version="$VERSION_ID" --distro-list-first \
         --force-ui=tty >/dev/null
+    umount "$mnt" 2>/dev/null || true
     mv "$tmp/data/fex-emu/RootFS/$name.sqsh" "$rootfs"
     rm -rf "$tmp"
 fi
-# Images built before the squashfs had it unpacked.
-rm -rf "/usr/share/fex-emu/RootFS/$name"
+if ! mountpoint -q "$mnt"; then
+    # Images built before the squashfs had it unpacked here.
+    rm -rf "$mnt"
+    mkdir -p "$mnt"
+fi
+sed -i "\\#^$rootfs #d" /etc/fstab
+echo "$rootfs $mnt squashfs loop,ro,nofail 0 0" >> /etc/fstab
+systemctl daemon-reload
+mountpoint -q "$mnt" || mount "$mnt"
 
 # The global config, so every user (root too) gets it. DiskCache keeps translated code in
 # ~/.cache/fex-emu: agents relaunch the same tools, and a warm start is ~5x faster. Go
@@ -107,11 +123,37 @@ case "\${1:-}" in
     *) echo "usage: agentpc-fex-tso hardware|emulated" >&2; exit 2 ;;
 esac
 printf '{"Config": {"RootFS": "%s", "DiskCache": "1", "Env": "GODEBUG=asyncpreemptoff=1"%s}}\n' \\
-    "$rootfs" "\$tso" > /usr/share/fex-emu/Config.json.tmp
+    "$mnt" "\$tso" > /usr/share/fex-emu/Config.json.tmp
 mv /usr/share/fex-emu/Config.json.tmp /usr/share/fex-emu/Config.json
 EOF
 chmod 755 /usr/local/sbin/agentpc-fex-tso
 /usr/local/sbin/agentpc-fex-tso emulated
+
+# `sudo fex-unit <unit>` lets a systemd service run an x86 program. FEX translates x86 code
+# as the program runs, so it writes code and then executes it, and it sets the process
+# personality: MemoryDenyWriteExecute= and LockPersonality= forbid both, and the program then
+# dies at start without a message. fex-unit adds a drop-in that allows them (--undo removes it).
+cat > /usr/local/bin/fex-unit <<'EOF'
+#!/bin/sh
+# Let a systemd service run an x86 program through FEX: sudo fex-unit <unit> [--undo]
+set -eu
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+unit=${1:?usage: fex-unit <unit> [--undo]}
+case $unit in *.*) ;; *) unit=$unit.service ;; esac
+dir=/etc/systemd/system/$unit.d
+if [ "${2:-}" = --undo ]; then
+    rm -f "$dir/fex.conf"
+    rmdir "$dir" 2>/dev/null || true
+    echo "removed $dir/fex.conf"
+else
+    mkdir -p "$dir"
+    printf '%s\n' '# From fex-unit: FEX (x86 translation) writes and runs code, and sets the personality.' \
+        '[Service]' 'MemoryDenyWriteExecute=no' 'LockPersonality=no' > "$dir/fex.conf"
+    echo "wrote $dir/fex.conf; restart $unit to apply it"
+fi
+systemctl daemon-reload
+EOF
+chmod 755 /usr/local/bin/fex-unit
 
 # x86 libraries a program needs beyond the RootFS: `sudo apt install libfoo:amd64` (or an
 # amd64 .deb). FEX looks in the RootFS first, then the real filesystem, so they load from

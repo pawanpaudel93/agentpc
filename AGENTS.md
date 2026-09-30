@@ -19,8 +19,8 @@ can run `agentpc mcp-install` (or install first: see README.md).
 | `run_command(name, command, timeout?, background?)` | Shell over SSH: PowerShell on windows, bash on ubuntu and arch. Returns exit code, stdout, stderr (long output trimmed). Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id you poll with `get_job_status`. |
 | `get_job_status(name, id, tail_lines?)` | State of a background job (running, or exited with its code) plus its log tail. |
 | `upload_file` / `download_file` | Copy files or folders between the Mac and a VM. |
-| `forward_port(name, guest_port, host_port?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). SSH tunnel: reaches a server on the guest's own `127.0.0.1`; lasts until the VM stops. |
-| `list_forwards(name)` / `delete_forward(name, host_port)` | List a VM's forwards / stop one. |
+| `forward_port(name, guest_port, host_port?, protocol?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). TCP (default) is an SSH tunnel: reaches a server on the guest's own `127.0.0.1`. `protocol: "udp"` is a QEMU host forward: the guest server must listen on `0.0.0.0`; not on offline VMs. Lasts until the VM stops. |
+| `list_forwards(name)` / `delete_forward(name, host_port, protocol?)` | List a VM's forwards (with protocol) / stop one. |
 | `read_vm_log(name, which, tail_lines?)` | Tail a VM's `qemu` or `serial` log when it won't boot or the desktop is unreachable. |
 | `list_desktop_tools(name, tool?)` | Desktop-control tools in that VM with their required arguments and read-only marks, or one tool's full schema. |
 | `use_desktop_tool(name, tool, arguments?)` | Call one of those tools (click, type, launch, snapshot…). Wrong arguments or a wrong name return the argument list or close matches. |
@@ -58,8 +58,10 @@ Guest tips:
 
 - **Networking.** VMs are isolated behind user-mode NAT. From a guest, `10.0.2.2` is the Mac
   host (a Mac server on `127.0.0.1`/`0.0.0.0` is reachable at `10.0.2.2:<port>`). For VM-to-VM,
-  `forward_port(B, guest_port, host_port)` then connect from A to `10.0.2.2:<host_port>`. An
-  offline VM can't reach `10.0.2.2` but forwarded ports still work. A guest inherits no Mac
+  `forward_port(B, guest_port, host_port)` then connect from A to `10.0.2.2:<host_port>`; for
+  UDP pass `protocol: "udp"` and have B's server listen on `0.0.0.0` (a Windows guest also needs
+  a firewall rule for it). An offline VM can't reach `10.0.2.2` but forwarded TCP ports still
+  work (UDP forwards don't: its network drops the guest's UDP). A guest inherits no Mac
   proxy; set `HTTP(S)_PROXY` and import a corporate CA in the guest itself.
 - **Reboots** (Windows Update, some installers) drop SSH: call `start_vm` (it waits until the
   VM is ready again) or retry `run_command`.
@@ -79,6 +81,9 @@ Guest tips:
   Electron/Chromium apps need `--no-sandbox`. A missing x86 library on Ubuntu: `sudo apt install
   libfoo:amd64`. Arch has no multiarch: x86 programs there use FEX's x86 Arch Linux tree, and
   `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs more x86 packages into it.
+  x86 systemd services run too; if the unit sets `MemoryDenyWriteExecute=` or
+  `LockPersonality=` (which stop FEX, as they stop any JIT), `sudo fex-unit <unit>` adds a
+  drop-in that relaxes just those two.
   `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or `emulated`.
 - Guests are 1280x800 with a 2D-only GPU (no acceleration) and no audio device.
 

@@ -557,6 +557,16 @@ impl Qmp {
         }
     }
 
+    /// Run a human monitor (HMP) command, e.g. `hostfwd_add`, and return what it printed.
+    /// HMP reports its own failures as printed text, not as a QMP error.
+    pub fn hmp(&mut self, command: &str) -> Result<String> {
+        let r = self.execute(
+            "human-monitor-command",
+            Some(json!({ "command-line": command })),
+        )?;
+        Ok(r.as_str().unwrap_or_default().trim().to_string())
+    }
+
     pub fn send_key(&mut self, qcode: &str) -> Result<()> {
         self.execute(
             "send-key",

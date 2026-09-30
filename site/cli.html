@@ -194,7 +194,7 @@
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc forward &lt;name&gt; &lt;guest-port&gt; [host-port]</code></td>
-                  <td>Forward <code translate="no">127.0.0.1:&lt;host-port&gt;</code> to a port in a running VM over SSH. <code translate="no">--list</code> shows a VM's forwards; <code translate="no">--rm &lt;host-port&gt;</code> stops one.</td>
+                  <td>Forward <code translate="no">127.0.0.1:&lt;host-port&gt;</code> to a port in a running VM over SSH. <code translate="no">--udp</code> forwards UDP instead (to a guest server on <code translate="no">0.0.0.0</code>). <code translate="no">--list</code> shows a VM's forwards; <code translate="no">--rm &lt;host-port&gt;</code> stops one (add <code translate="no">--udp</code>/<code translate="no">--tcp</code> to pick a protocol).</td>
                 </tr>
               </tbody>
             </table>

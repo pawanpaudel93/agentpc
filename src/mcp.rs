@@ -50,6 +50,8 @@ create ubuntu or arch with version \"x86apps\": they run through FEX translation
 && sudo systemctl start docker on Arch); x86 Electron/Chromium apps need --no-sandbox. On Ubuntu,
 x86 libraries install with sudo apt install libfoo:amd64; on Arch (no multiarch), sudo fex-pacman
 -Sy --noconfirm --needed <pkg> installs x86 packages into the x86 Arch tree FEX runs them in.
+x86 systemd services run too; if the unit sets MemoryDenyWriteExecute= or LockPersonality=
+(they stop FEX, as they stop any JIT), sudo fex-unit <unit> relaxes just those two.
 list_vms shows x86_tso: hardware (fast; needs macOS 15+) or emulated.
 An Arch Linux ARM guest (os \"arch\") works like Ubuntu (XFCE, bash, the same desktop tools), but
 packages come from pacman (sudo pacman -Syu --noconfirm <pkg>: Arch doesn't support partial
@@ -94,7 +96,8 @@ Rules:
   and returns a job id); poll it with get_job_status. Foreground run_command times out (default 120 s).
 - Reach a server in the VM from the Mac with forward_port (works even for servers bound to the
   guest's own 127.0.0.1); it returns a 127.0.0.1:<port> address and lasts until the VM stops.
-  list_forwards / delete_forward manage them. From inside the guest, 10.0.2.2 reaches this Mac.
+  For a UDP server pass protocol: \"udp\"; it must listen on 0.0.0.0. list_forwards /
+  delete_forward manage them. From inside the guest, 10.0.2.2 reaches this Mac.
 - Don't start a Windows image build yourself -- if no Windows image exists, ask the user to
   build one (~12 min).
 - Output from run_command is trimmed to the first and last 10,000 characters per stream; write big
@@ -244,7 +247,7 @@ struct CreateArgs {
     #[schemars(range(min = 1, max = 16))]
     cpus: Option<u32>,
     /// Cut the VM off from the internet and this Mac; run_command, files, the desktop tools
-    /// and forward_port still work. For testing offline behaviour or untrusted software.
+    /// and forward_port (TCP only) still work. For testing offline behaviour or untrusted software.
     #[serde(default)]
     offline: bool,
 }
@@ -292,6 +295,23 @@ struct DownloadArgs {
     host_path: String,
 }
 
+#[derive(Deserialize, JsonSchema, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+#[schemars(inline)]
+enum ProtocolArg {
+    Tcp,
+    Udp,
+}
+
+impl From<ProtocolArg> for ops::Protocol {
+    fn from(p: ProtocolArg) -> Self {
+        match p {
+            ProtocolArg::Tcp => ops::Protocol::Tcp,
+            ProtocolArg::Udp => ops::Protocol::Udp,
+        }
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct ForwardArgs {
     name: String,
@@ -299,6 +319,9 @@ struct ForwardArgs {
     guest_port: u16,
     /// Port on 127.0.0.1 of this Mac; a free one is picked if omitted.
     host_port: Option<u16>,
+    /// "tcp" (default) or "udp". A UDP forward reaches a server listening on the guest's
+    /// 0.0.0.0 (its 10.0.2.15 address), not on its 127.0.0.1; not available on offline VMs.
+    protocol: Option<ProtocolArg>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -327,6 +350,8 @@ struct RemoveForwardArgs {
     name: String,
     /// The 127.0.0.1 host port to stop forwarding.
     host_port: u16,
+    /// "tcp" or "udp"; omitted, the forwards of both protocols on that port are removed.
+    protocol: Option<ProtocolArg>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -685,7 +710,10 @@ impl Gateway {
     #[tool(
         title = "Forward port",
         description = "Make a server running inside a VM reachable from this Mac: forwards a port on\n\
-                          127.0.0.1 to the guest port until the VM stops. Returns the host address.",
+                          127.0.0.1 to the guest port until the VM stops. Returns the host address. TCP (default)\n\
+                          reaches servers on the guest's own 127.0.0.1. protocol \"udp\" (game, DNS, QUIC, relay\n\
+                          servers) needs the guest server listening on 0.0.0.0 and doesn't work on offline VMs.\n\
+                          Other VMs reach a forward at 10.0.2.2:<host_port>.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -696,7 +724,8 @@ impl Gateway {
         text(
             async {
                 let inst = load(&a.name)?;
-                blocking(move || ops::forward(&inst, a.guest_port, a.host_port)).await
+                let protocol = a.protocol.map_or(ops::Protocol::Tcp, Into::into);
+                blocking(move || ops::forward(&inst, a.guest_port, a.host_port, protocol)).await
             }
             .await,
         )
@@ -894,8 +923,8 @@ impl Gateway {
 
     #[tool(
         title = "List port forwards",
-        description = "List the active port forwards for a VM: each host port on 127.0.0.1, the guest port it\n\
-                          reaches, and whether its tunnel is still alive.",
+        description = "List the active port forwards for a VM: each one's protocol (tcp/udp), host port on\n\
+                          127.0.0.1, the guest port it reaches, and whether it is still alive.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_forwards(&self, Parameters(a): Parameters<NameArgs>) -> CallToolResult {
@@ -911,7 +940,8 @@ impl Gateway {
     #[tool(
         name = "delete_forward",
         title = "Delete port forward",
-        description = "Stop forwarding a host port set up by forward_port; other forwards keep running.",
+        description = "Stop forwarding a host port set up by forward_port (only the given protocol's forward\n\
+                          if protocol is set); other forwards keep running.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -922,7 +952,8 @@ impl Gateway {
         text(
             async {
                 let inst = load(&a.name)?;
-                blocking(move || ops::remove_forward(&inst, a.host_port)).await
+                let protocol = a.protocol.map(Into::into);
+                blocking(move || ops::remove_forward(&inst, a.host_port, protocol)).await
             }
             .await,
         )
