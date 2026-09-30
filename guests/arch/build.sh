@@ -137,7 +137,8 @@ su - agent -c 'set -e; d=$(mktemp -d); cd "$d"
 # agentpc's readiness check looks for this, as on the cloud-init-provisioned Ubuntu image.
 mkdir -p /var/lib/cloud
 touch /var/lib/cloud/agent-ready
-yes | pacman -Scc >/dev/null
+# Downloaded packages (pacman -Scc asks twice, and yes would die of SIGPIPE under pipefail).
+rm -rf /var/cache/pacman/pkg/*
 SETUP
 chmod 755 "$root/root/setup.sh"
 arch-chroot "$root" /root/setup.sh
