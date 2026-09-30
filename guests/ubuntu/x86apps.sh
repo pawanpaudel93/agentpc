@@ -137,9 +137,15 @@ cat > /usr/local/bin/fex-unit <<'EOF'
 #!/bin/sh
 # Let a systemd service run an x86 program through FEX: sudo fex-unit <unit> [--undo]
 set -eu
+usage="usage: fex-unit <unit> [--undo]"
+unit=${1:?$usage}
+case $unit in
+    -h|--help) echo "$usage"; exit 0 ;;
+    -*) echo "$usage" >&2; exit 2 ;;
+    *.*) ;;
+    *) unit=$unit.service ;;
+esac
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
-unit=${1:?usage: fex-unit <unit> [--undo]}
-case $unit in *.*) ;; *) unit=$unit.service ;; esac
 dir=/etc/systemd/system/$unit.d
 if [ "${2:-}" = --undo ]; then
     rm -f "$dir/fex.conf"
