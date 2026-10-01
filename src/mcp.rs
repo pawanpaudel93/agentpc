@@ -55,7 +55,8 @@ x86 systemd services run too, hardened ones included: a generator relaxes
 MemoryDenyWriteExecute=/LockPersonality= (which stop FEX, as any JIT) for units whose ExecStart is
 an x86 program. If a unit runs its x86 program through a script and dies at start with a SIGSEGV
 inside FEX, sudo fex-unit <unit> does the same. An installer
-that refuses non-x86_64 (uname -m) runs unmodified under the x86 bash: sudo FEXBash ./install.sh.
+that refuses non-x86_64 (uname -m) runs unmodified under the x86 bash: sudo FEXBash ./install.sh;
+for a paste block (curl ... | sudo bash -s), start FEXBash and paste it there.
 list_vms shows x86_tso: hardware (fast; needs macOS 15+) or emulated.
 An Arch Linux ARM guest (os \"arch\") works like Ubuntu (XFCE, bash, the same desktop tools), but
 packages come from pacman (sudo pacman -Syu --noconfirm <pkg>: Arch doesn't support partial

@@ -429,9 +429,20 @@ def x86apps(m, vm, r, guest="ubuntu"):
     )
     ok, out = sh(
         f"printf '{script}' > ~/smoke-install.sh && chmod +x ~/smoke-install.sh"
-        " && sudo FEXBash ~/smoke-install.sh; rm -f ~/smoke-install.sh"
+        " && sudo FEXBash ~/smoke-install.sh"
     )
     r.check("an x86-only bash installer runs unmodified under FEXBash", ok and "installer-ok" in stdout(out), out[-300:])
+    # The paste-block shape, `curl ... | sudo VAR=... bash -s -- args`: the real sudo is setuid and
+    # runs natively, so FEXBash's own sudo keeps the command x86 (and the variable and argument).
+    ok, out = sh(
+        "sudo FEXBash -c 'cat /home/agent/smoke-install.sh | sudo SMOKE_VAR=7 bash -s -- arg1"
+        " && sudo SMOKE_VAR=7 bash -c \"echo var=\\$SMOKE_VAR user=\\$(id -un)\"'; rm -f ~/smoke-install.sh"
+    )
+    r.check(
+        "curl | sudo bash -s inside FEXBash stays x86 (FEXBash's sudo)",
+        ok and "installer-ok" in stdout(out) and "var=7 user=root" in stdout(out),
+        out[-300:],
+    )
 
     # An x86 service: a hardened systemd unit (a relay's options) running as nobody, whose home
     # doesn't exist. FEX falls back to a writable directory and reads its RootFS without FUSE or

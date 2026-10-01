@@ -86,7 +86,8 @@ Guest tips:
   FEX, as they stop any JIT). If a unit runs its x86 program another way (a script) and dies
   at start with a SIGSEGV inside FEX, `sudo fex-unit <unit>` does the same. An installer that refuses non-x86_64 (`uname -m`) runs
   unmodified under the x86 bash: `sudo FEXBash ./install.sh` (its `uname` and tools then run as
-  x86 programs).
+  x86 programs). For a paste block (`curl ... | sudo bash -s`), start `FEXBash` and paste it
+  there: FEXBash's `sudo` keeps the command x86.
   `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or `emulated`.
 - Guests are 1280x800 with a 2D-only GPU (no acceleration) and no audio device.
 

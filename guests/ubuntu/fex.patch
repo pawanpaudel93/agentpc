@@ -7,7 +7,137 @@
 # 4. Open files inside the RootFS when a seccomp filter refuses openat2 (systemd's
 #    RestrictSUIDSGID=), instead of falling through to the host's files.
 # 5. FEXBash runs scripts and -c with the RootFS's /bin/bash, not /bin/sh (dash on Ubuntu).
+# 6. FEXBash puts /usr/libexec/agentpc/fexbash first on PATH, for a sudo that keeps commands x86.
 
+diff --git a/FEXCore/Source/Utils/Allocator/64BitAllocator.cpp b/FEXCore/Source/Utils/Allocator/64BitAllocator.cpp
+index b136ec5..2ae8a21 100644
+--- a/FEXCore/Source/Utils/Allocator/64BitAllocator.cpp
++++ b/FEXCore/Source/Utils/Allocator/64BitAllocator.cpp
+@@ -123,7 +123,10 @@ private:
+ 
+       // Use madvise to set the full tracking region to zero.
+       // This ensures unused pages are zero, while not having the backing pages consuming memory.
+-      auto* MemoryAsBytes = reinterpret_cast<uint8_t*>(Region->UsedPages.Memory);
++      // agentpc: ManagedSize counts from the start of the region, not from the bitmap that
++      // follows its header, so offset from the region too. Otherwise MADV_DONTNEED runs past
++      // the region's end and zeroes whatever is mapped next (FEX's own data when static-pie).
++      auto* MemoryAsBytes = reinterpret_cast<uint8_t*>(Region);
+       const auto TrackingRegionSize = Region->SlabInfo->RegionSize - ManagedSize;
+       ::madvise(MemoryAsBytes + ManagedSize, TrackingRegionSize, MADV_DONTNEED);
+ 
+diff --git a/Source/Common/Config.cpp b/Source/Common/Config.cpp
+index 676b2f5..1ae08b9 100644
+--- a/Source/Common/Config.cpp
++++ b/Source/Common/Config.cpp
+@@ -19,6 +19,8 @@
+ #ifndef _WIN32
+ #include <linux/limits.h>
+ #include <pwd.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ #endif
+ #include <optional>
+ #include <utility>
+@@ -578,6 +580,35 @@ static fextl::string FindUserHomeThroughUID() {
+ }
+ 
+ fextl::string GetHomeDirectory() {
++  // agentpc: FEX keeps its config, data and code cache under the home, so it needs one it can
++  // write. A system user (a service) often has none, or one hidden by ProtectHome=: use the
++  // service's own directories, else a private per-user directory in /tmp.
++  const auto Usable = [](const char* Path) {
++    return Path && *Path && FHU::Filesystem::Exists(Path) && access(Path, W_OK) == 0;
++  };
++  if (const char* Home = getenv("HOME"); Usable(Home)) {
++    return Home;
++  }
++  if (auto UIDHome = FindUserHomeThroughUID(); Usable(UIDHome.c_str())) {
++    return UIDHome;
++  }
++  // systemd's StateDirectory= and friends (each may list several; the first is the unit's).
++  for (const char* Var : {"STATE_DIRECTORY", "CACHE_DIRECTORY", "RUNTIME_DIRECTORY"}) {
++    if (const char* Dirs = getenv(Var)) {
++      fextl::string Dir(Dirs, strcspn(Dirs, ":"));
++      if (Usable(Dir.c_str())) {
++        return Dir;
++      }
++    }
++  }
++  // /tmp is shared (unless PrivateTmp=), so only use the directory if it's ours and private.
++  const auto Tmp = fextl::fmt::format("/tmp/fex-emu-{}", getuid());
++  mkdir(Tmp.c_str(), 0700);
++  struct stat St {};
++  if (lstat(Tmp.c_str(), &St) == 0 && S_ISDIR(St.st_mode) && St.st_uid == getuid() && (St.st_mode & 077) == 0) {
++    return Tmp;
++  }
++
+   const char* HomeDir = getenv("HOME");
+ 
+   // Try to get home directory from uid
+diff --git a/Source/Common/FEXServerClient.cpp b/Source/Common/FEXServerClient.cpp
+index 6e2d084..845b3fb 100644
+--- a/Source/Common/FEXServerClient.cpp
++++ b/Source/Common/FEXServerClient.cpp
+@@ -95,6 +95,19 @@ fextl::string GetTempFolder() {
+     }
+   }
+ 
++  // agentpc: /tmp is read-only for a systemd service with ProtectSystem=strict and no
++  // PrivateTmp=; use the service's own directories then.
++  if (access("/tmp", W_OK) != 0) {
++    for (const char* Var : {"RUNTIME_DIRECTORY", "STATE_DIRECTORY", "CACHE_DIRECTORY"}) {
++      if (const char* Dirs = getenv(Var)) {
++        fextl::string Dir(Dirs, strcspn(Dirs, ":"));
++        if (access(Dir.c_str(), W_OK) == 0) {
++          return Dir;
++        }
++      }
++    }
++  }
++
+   // Fallback to `/tmp/` if no env vars are set.
+   // Might not be ideal but we don't have much of a choice.
+   return fextl::string {"/tmp"};
+diff --git a/Source/Tools/FEXBash/FEXBash.cpp b/Source/Tools/FEXBash/FEXBash.cpp
+index ea18986..0905849 100644
+--- a/Source/Tools/FEXBash/FEXBash.cpp
++++ b/Source/Tools/FEXBash/FEXBash.cpp
+@@ -46,8 +46,9 @@ int main(int argc, char** argv, char** const envp) {
+   const bool EmptyArgs = argc == 1;
+ 
+   // FEX will handle finding bash in the rootfs
+-  // Use /bin/bash for interactive mode and /bin/sh when running a script or when using -c
+-  const char* BashPath = EmptyArgs ? "/bin/bash" : "/bin/sh";
++  // agentpc: always /bin/bash. Upstream runs scripts and -c with /bin/sh, which is dash on an
++  // Ubuntu RootFS, so `FEXBash ./install.sh` broke on bash scripts (set -o pipefail, arrays).
++  const char* BashPath = "/bin/bash";
+ 
+   auto FEXPath = std::filesystem::path(argv[0]).replace_filename("FEX");
+ 
+@@ -87,16 +88,23 @@ int main(int argc, char** argv, char** const envp) {
+   // To get the shell variables as an environment variable then you can do `PS1=$PS1 FEXBash`
+   std::vector<const char*> Envp {};
+   char* PS1Env {};
++  // agentpc: put a sudo first on PATH that keeps the command emulated (the real sudo is
++  // setuid, so it and everything it starts would run natively, and see aarch64).
++  const char* PathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+   for (unsigned i = 0;; ++i) {
+     if (envp[i] == nullptr) {
+       break;
+     }
+     if (strstr(envp[i], "PS1=") == envp[i]) {
+       PS1Env = envp[i];
++    } else if (strstr(envp[i], "PATH=") == envp[i]) {
++      PathEnv = envp[i] + strlen("PATH=");
+     } else {
+       Envp.emplace_back(envp[i]);
+     }
+   }
++  const std::string Path = std::string("PATH=/usr/libexec/agentpc/fexbash:") + PathEnv;
++  Envp.emplace_back(Path.c_str());
+   // Keep the string alive until after execve.
+   const std::string PS1 = EnchantedPS1(PS1Env);
+   Envp.emplace_back(PS1.c_str());
 diff --git a/Source/Tools/FEXInterpreter/FEXInterpreter.cpp b/Source/Tools/FEXInterpreter/FEXInterpreter.cpp
 index c2eb2fb..9986222 100644
 --- a/Source/Tools/FEXInterpreter/FEXInterpreter.cpp
@@ -61,97 +191,6 @@ index c2eb2fb..9986222 100644
    FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, Loader.Is64BitMode() ? "1" : "0");
  
    if (!Loader.ELFWasLoaded()) {
-diff --git a/FEXCore/Source/Utils/Allocator/64BitAllocator.cpp b/FEXCore/Source/Utils/Allocator/64BitAllocator.cpp
-index b136ec5..2ae8a21 100644
---- a/FEXCore/Source/Utils/Allocator/64BitAllocator.cpp
-+++ b/FEXCore/Source/Utils/Allocator/64BitAllocator.cpp
-@@ -123,7 +123,10 @@ private:
- 
-       // Use madvise to set the full tracking region to zero.
-       // This ensures unused pages are zero, while not having the backing pages consuming memory.
--      auto* MemoryAsBytes = reinterpret_cast<uint8_t*>(Region->UsedPages.Memory);
-+      // agentpc: ManagedSize counts from the start of the region, not from the bitmap that
-+      // follows its header, so offset from the region too. Otherwise MADV_DONTNEED runs past
-+      // the region's end and zeroes whatever is mapped next (FEX's own data when static-pie).
-+      auto* MemoryAsBytes = reinterpret_cast<uint8_t*>(Region);
-       const auto TrackingRegionSize = Region->SlabInfo->RegionSize - ManagedSize;
-       ::madvise(MemoryAsBytes + ManagedSize, TrackingRegionSize, MADV_DONTNEED);
- 
-
-diff --git a/Source/Common/Config.cpp b/Source/Common/Config.cpp
-index 676b2f5..1ae08b9 100644
---- a/Source/Common/Config.cpp
-+++ b/Source/Common/Config.cpp
-@@ -19,6 +19,8 @@
- #ifndef _WIN32
- #include <linux/limits.h>
- #include <pwd.h>
-+#include <sys/stat.h>
-+#include <unistd.h>
- #endif
- #include <optional>
- #include <utility>
-@@ -578,6 +580,35 @@ static fextl::string FindUserHomeThroughUID() {
- }
- 
- fextl::string GetHomeDirectory() {
-+  // agentpc: FEX keeps its config, data and code cache under the home, so it needs one it can
-+  // write. A system user (a service) often has none, or one hidden by ProtectHome=: use the
-+  // service's own directories, else a private per-user directory in /tmp.
-+  const auto Usable = [](const char* Path) {
-+    return Path && *Path && FHU::Filesystem::Exists(Path) && access(Path, W_OK) == 0;
-+  };
-+  if (const char* Home = getenv("HOME"); Usable(Home)) {
-+    return Home;
-+  }
-+  if (auto UIDHome = FindUserHomeThroughUID(); Usable(UIDHome.c_str())) {
-+    return UIDHome;
-+  }
-+  // systemd's StateDirectory= and friends (each may list several; the first is the unit's).
-+  for (const char* Var : {"STATE_DIRECTORY", "CACHE_DIRECTORY", "RUNTIME_DIRECTORY"}) {
-+    if (const char* Dirs = getenv(Var)) {
-+      fextl::string Dir(Dirs, strcspn(Dirs, ":"));
-+      if (Usable(Dir.c_str())) {
-+        return Dir;
-+      }
-+    }
-+  }
-+  // /tmp is shared (unless PrivateTmp=), so only use the directory if it's ours and private.
-+  const auto Tmp = fextl::fmt::format("/tmp/fex-emu-{}", getuid());
-+  mkdir(Tmp.c_str(), 0700);
-+  struct stat St {};
-+  if (lstat(Tmp.c_str(), &St) == 0 && S_ISDIR(St.st_mode) && St.st_uid == getuid() && (St.st_mode & 077) == 0) {
-+    return Tmp;
-+  }
-+
-   const char* HomeDir = getenv("HOME");
- 
-   // Try to get home directory from uid
-
-diff --git a/Source/Common/FEXServerClient.cpp b/Source/Common/FEXServerClient.cpp
-index 6e2d084..845b3fb 100644
---- a/Source/Common/FEXServerClient.cpp
-+++ b/Source/Common/FEXServerClient.cpp
-@@ -95,6 +95,19 @@ fextl::string GetTempFolder() {
-     }
-   }
- 
-+  // agentpc: /tmp is read-only for a systemd service with ProtectSystem=strict and no
-+  // PrivateTmp=; use the service's own directories then.
-+  if (access("/tmp", W_OK) != 0) {
-+    for (const char* Var : {"RUNTIME_DIRECTORY", "STATE_DIRECTORY", "CACHE_DIRECTORY"}) {
-+      if (const char* Dirs = getenv(Var)) {
-+        fextl::string Dir(Dirs, strcspn(Dirs, ":"));
-+        if (access(Dir.c_str(), W_OK) == 0) {
-+          return Dir;
-+        }
-+      }
-+    }
-+  }
-+
-   // Fallback to `/tmp/` if no env vars are set.
-   // Might not be ideal but we don't have much of a choice.
-   return fextl::string {"/tmp"};
 diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/FileManagement.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/FileManagement.cpp
 index 7172460..7ac79e1 100644
 --- a/Source/Tools/LinuxEmulation/LinuxSyscalls/FileManagement.cpp
@@ -178,20 +217,3 @@ index 7172460..7ac79e1 100644
          // This means a magic symlink (/proc/foo) was involved. In this case we
          // just punt and do the access without RESOLVE_IN_ROOT.
          fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, flags, mode);
-
-diff --git a/Source/Tools/FEXBash/FEXBash.cpp b/Source/Tools/FEXBash/FEXBash.cpp
-index ea18986..a99d7c9 100644
---- a/Source/Tools/FEXBash/FEXBash.cpp
-+++ b/Source/Tools/FEXBash/FEXBash.cpp
-@@ -46,8 +46,9 @@ int main(int argc, char** argv, char** const envp) {
-   const bool EmptyArgs = argc == 1;
- 
-   // FEX will handle finding bash in the rootfs
--  // Use /bin/bash for interactive mode and /bin/sh when running a script or when using -c
--  const char* BashPath = EmptyArgs ? "/bin/bash" : "/bin/sh";
-+  // agentpc: always /bin/bash. Upstream runs scripts and -c with /bin/sh, which is dash on an
-+  // Ubuntu RootFS, so `FEXBash ./install.sh` broke on bash scripts (set -o pipefail, arrays).
-+  const char* BashPath = "/bin/bash";
- 
-   auto FEXPath = std::filesystem::path(argv[0]).replace_filename("FEX");
- 

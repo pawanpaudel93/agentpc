@@ -325,7 +325,9 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
               any JIT); a unit that runs its x86 program through a script needs
               <code translate="no">sudo fex-unit &lt;unit&gt;</code> (else it dies with a SIGSEGV inside FEX). An installer that refuses non-x86_64
               (<code translate="no">uname -m</code>) runs unmodified under the x86 bash:
-              <code translate="no">sudo FEXBash ./install.sh</code>. x86 containers work too:
+              <code translate="no">sudo FEXBash ./install.sh</code>; for a paste block
+              (<code translate="no">curl … | sudo bash -s</code>), start <code translate="no">FEXBash</code> and paste it there.
+              x86 containers work too:
               <code translate="no">docker run --platform linux/amd64 &lt;image&gt;</code> (install Docker first:
               <code translate="no">sudo apt install docker.io</code> on Ubuntu, <code translate="no">sudo pacman -Syu --noconfirm docker &amp;&amp; sudo systemctl start docker</code> on Arch). x86 kernel modules don't run: it's translation, not an x86 machine.
             </p>

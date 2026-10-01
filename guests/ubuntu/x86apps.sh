@@ -161,6 +161,43 @@ systemctl daemon-reload
 EOF
 chmod 755 /usr/local/bin/fex-unit
 
+# FEXBash puts /usr/libexec/agentpc/fexbash first on PATH, for this sudo: the real sudo is
+# setuid, so it runs natively, and so would everything it starts (`curl ... | sudo bash -s`
+# would see aarch64 again). It keeps sudo's options and VAR=value assignments but has sudo start
+# the command through FEXBash, so the command stays x86.
+mkdir -p /usr/libexec/agentpc/fexbash
+cat > /usr/libexec/agentpc/fexbash/sudo <<'EOF'
+#!/bin/sh
+# sudo inside FEXBash: sudo [options] [VAR=value...] command -> the real sudo, same options,
+# running `FEXBash -c 'exec "$@"' command`, so the command runs as an x86 program.
+n=0 arg=0
+for a do
+    if [ "$arg" = 1 ]; then arg=0; n=$((n + 1)); continue; fi
+    case $a in
+        --) n=$((n + 1)); break ;;
+        -[ugpCDrRtTU] | --user | --group | --prompt | --close-from | --chdir | --role | --type | \
+            --command-timeout | --other-user | --chroot | --host) arg=1 ;;
+        # Modes that run no command.
+        -l | -v | -k | -K | -V | -e | -h | --list | --validate | --reset-timestamp | \
+            --remove-timestamp | --version | --edit | --help) exec /usr/bin/sudo "$@" ;;
+        -* | *=*) ;;
+        *) break ;;
+    esac
+    n=$((n + 1))
+done
+total=$# i=0
+for a do
+    i=$((i + 1))
+    if [ "$i" -eq $((n + 1)) ]; then set -- "$@" /usr/bin/FEXBash -c 'exec "$@"' fexbash; fi
+    set -- "$@" "$a"
+done
+# No command (sudo -s, sudo -i): an interactive x86 bash.
+if [ "$n" -eq "$total" ]; then set -- "$@" /usr/bin/FEXBash; fi
+shift "$total"
+exec /usr/bin/sudo "$@"
+EOF
+chmod 755 /usr/libexec/agentpc/fexbash/sudo
+
 # A systemd generator does what fex-unit does for every service whose ExecStart is an x86
 # program, so hardened x86 services work as installed. It runs at boot and on every
 # `systemctl daemon-reload`; arm64 services keep their settings. fex-unit stays for units

@@ -517,7 +517,7 @@ pub fn info(inst: &Instance) -> String {
         };
         format!(
             "\n  x86 programs: FEX, {tso}\
-             \n  x86-only installer (uname -m): sudo FEXBash ./install.sh; \
+             \n  x86-only installer (uname -m): sudo FEXBash ./install.sh, or paste it into FEXBash; \
              x86 service started by a script: sudo fex-unit <unit>"
         )
     } else {
