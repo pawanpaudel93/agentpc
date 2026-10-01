@@ -113,6 +113,9 @@ pub fn forward(
     host_port: Option<u16>,
     protocol: Protocol,
 ) -> Result<String> {
+    if guest_port == 0 || host_port == Some(0) {
+        bail!("ports are 1-65535 (leave host_port out for a free one)");
+    }
     if !inst.running() {
         bail!("{} is not running; start it first", inst.name);
     }
@@ -129,7 +132,7 @@ pub fn forward(
     std::fs::create_dir_all(&dir)?;
     let pid_file = dir.join(format!("{host_port}.pid"));
     // A live tunnel already on this host port: reuse it rather than start a second one.
-    if read_forward(&pid_file).is_some_and(|(pid, _)| pid_alive(pid)) {
+    if read_forward(&pid_file).is_some_and(|(pid, _)| tunnel_alive(pid, host_port)) {
         return Ok(forward_url(inst, host_port, guest_port));
     }
     let log_path = dir.join(format!("{host_port}.log"));
@@ -557,6 +560,7 @@ pub fn create(
     memory: Option<u32>,
     cpus: Option<u32>,
     offline: bool,
+    owner: Option<&str>,
 ) -> Result<String> {
     let os = image.os;
     // Checked before a download or build that can take minutes; rechecked below for races.
@@ -594,12 +598,22 @@ pub fn create(
             }
             Ok(())
         })
-        .and_then(|()| clone_image_disk(&inst));
+        .and_then(|()| clone_image_disk(&inst))
+        // Before the first boot, so a VM that never becomes ready is still its owner's: a
+        // retried create_vm boots it again, and the owner's exit stops it.
+        .and_then(|()| owner.map_or(Ok(()), |o| set_owner(&inst, o)));
     if let Err(e) = made {
         let _ = std::fs::remove_dir_all(&inst.dir);
         return Err(e);
     }
-    boot(&inst)
+    boot(&inst).map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#}\nThe VM '{name}' was created but didn't become ready (read_vm_log, or \
+             {}, shows why). Starting it again retries, as does create_vm with the same name \
+             from the same session; deleting it starts over.",
+            inst.dir.join("qemu.log").display()
+        )
+    })
 }
 
 /// `clone_disk` under the image lock, so a build, pull or snapshot can't replace the files
@@ -1017,6 +1031,10 @@ pub fn list_json() -> Result<String> {
                 "checkpoints": checkpoints(i),
                 "owner": owner(i),
             });
+            // false: the MCP server that owns it has exited, so the VM is no one's now.
+            if let Some(alive) = owner_alive(i) {
+                obj["owner_running"] = json!(alive);
+            }
             // A stopped VM has no viewer to point at.
             if running {
                 obj["viewer"] = json!(viewer::url(i));
@@ -1070,10 +1088,70 @@ pub fn list_table() -> Result<String> {
 
 // --- Ownership (who created a VM through MCP) -------------------------------------------
 
-/// Record an owner string (MCP client name + session id) on a VM.
+/// Record an owner string (MCP client name + session id) on a VM, with this process's id and
+/// start time (`owner.pid`), so a later server can tell whether the owner is still running.
+/// "keep" marks an owner run with AGENTPC_KEEP_RUNNING=1, whose VMs outlive it on purpose.
 pub fn set_owner(inst: &Instance, owner: &str) -> Result<()> {
     std::fs::write(inst.dir.join("owner"), owner)?;
+    let pid = std::process::id();
+    let start = process_start(pid).unwrap_or_default();
+    let keep = if keep_running() { "\nkeep" } else { "" };
+    std::fs::write(
+        inst.dir.join("owner.pid"),
+        format!("{pid}\n{start}{keep}\n"),
+    )?;
     Ok(())
+}
+
+/// AGENTPC_KEEP_RUNNING=1: VMs an MCP server starts outlive it.
+pub fn keep_running() -> bool {
+    std::env::var_os("AGENTPC_KEEP_RUNNING").is_some_and(|v| v == "1")
+}
+
+/// A process's start time as `ps` prints it, which tells it apart from a later process that
+/// was given the same pid.
+fn process_start(pid: u32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !s.is_empty()).then_some(s)
+}
+
+/// Whether the MCP server that owns a VM is still running. None when that isn't recorded: a
+/// CLI-made VM, or one owned before agentpc recorded it.
+pub fn owner_alive(inst: &Instance) -> Option<bool> {
+    let s = std::fs::read_to_string(inst.dir.join("owner.pid")).ok()?;
+    let mut lines = s.lines();
+    let pid: u32 = lines.next()?.trim().parse().ok()?;
+    let start = lines.next()?.trim();
+    Some(!start.is_empty() && process_start(pid).as_deref() == Some(start))
+}
+
+/// Whether a VM's owner asked for its VMs to outlive it (AGENTPC_KEEP_RUNNING=1).
+fn owner_keeps(inst: &Instance) -> bool {
+    std::fs::read_to_string(inst.dir.join("owner.pid"))
+        .is_ok_and(|s| s.lines().any(|l| l.trim() == "keep"))
+}
+
+/// Stop the running VMs whose MCP server ended without stopping them (it was killed, or
+/// crashed), as that server would have on a normal exit. Their owner tag stays, so
+/// `list_vms` shows whose they were. Returns the names stopped.
+pub fn stop_orphans() -> Vec<String> {
+    let Ok(all) = Instance::list() else {
+        return vec![];
+    };
+    let mut stopped = vec![];
+    for inst in all {
+        if inst.running() && owner_alive(&inst) == Some(false) && !owner_keeps(&inst) {
+            stop_forwards(&inst);
+            if stop(&inst).is_ok() {
+                stopped.push(inst.name.clone());
+            }
+        }
+    }
+    stopped
 }
 
 /// The owner recorded on a VM, if any (CLI-created VMs have none).
@@ -1099,6 +1177,26 @@ fn pid_alive(pid: i32) -> bool {
     unsafe { c_kill(pid, 0) == 0 }
 }
 
+/// Whether `pid` is still the SSH tunnel for `host_port`. The pid file outlives a tunnel that
+/// died with its server, and macOS hands its pid to another process sooner or later; that one
+/// must not be reported as the tunnel, or sent its SIGTERM.
+fn tunnel_alive(pid: i32, host_port: u16) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    let Ok(out) = Command::new("ps")
+        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+    let cmd = String::from_utf8_lossy(&out.stdout);
+    cmd.split_whitespace()
+        .next()
+        .is_some_and(|c| c.ends_with("ssh"))
+        && cmd.contains(&format!("127.0.0.1:{host_port}:"))
+}
+
 /// Active forwards on a VM as `(host_port, protocol, guest_port, alive)`, sorted by host port.
 /// A TCP forward is alive while its tunnel runs, a UDP one while the QEMU that holds it does.
 pub fn list_forwards(inst: &Instance) -> Vec<(u16, Protocol, u16, bool)> {
@@ -1114,7 +1212,7 @@ pub fn list_forwards(inst: &Instance) -> Vec<(u16, Protocol, u16, bool)> {
                 continue;
             };
             let alive = match protocol {
-                Protocol::Tcp => pid_alive(pid),
+                Protocol::Tcp => tunnel_alive(pid, host),
                 Protocol::Udp => *qemu_pid.get_or_insert_with(|| inst.pid()) == Some(pid),
             };
             out.push((host, protocol, guest, alive));
@@ -1172,7 +1270,9 @@ pub fn remove_forward(
         };
         match p {
             Protocol::Tcp => {
-                crate::instance::kill(pid, 15);
+                if tunnel_alive(pid, host_port) {
+                    crate::instance::kill(pid, 15);
+                }
                 let _ = std::fs::remove_file(dir.join(format!("{host_port}.log")));
             }
             // Only the QEMU that added the hostfwd holds it; an older record is already dead.
@@ -1209,6 +1309,8 @@ pub fn stop_forwards(inst: &Instance) {
             let p = e.path();
             if p.extension().is_some_and(|x| x == "pid")
                 && let Some((pid, _)) = read_forward(&p)
+                && let Some((_, host)) = forward_record_name(&p)
+                && tunnel_alive(pid, host)
             {
                 crate::instance::kill(pid, 15);
             }

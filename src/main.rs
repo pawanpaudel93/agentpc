@@ -299,6 +299,7 @@ fn run(cli: Cli) -> Result<()> {
             memory,
             cpus,
             offline,
+            None,
         )),
         Cmd::List { json } => out(if json {
             ops::list_json()

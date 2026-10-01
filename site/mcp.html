@@ -408,7 +408,7 @@ forward_port    { "name": "ubuntu-1", "guest_port": 3000 }  <span class="comment
             <h2>Session lifecycle</h2>
             <ul>
               <li>VMs a session created, started, reset or restored are <strong>stopped, never deleted</strong>, when the session ends. Set <code translate="no">AGENTPC_KEEP_RUNNING=1</code> to keep them running.</li>
-              <li><code translate="no">list_vms</code> shows each VM's owner. Agents should create their own uniquely named VM per task, and never reset, restore or delete one they didn't create.</li>
+              <li><code translate="no">list_vms</code> shows each VM's owner. Agents should create their own uniquely named VM per task, and never reset, restore or delete one they didn't create. A VM whose session ended without stopping it (its server was killed) is stopped by the next MCP server and shows <code translate="no">owner_running: false</code>; <code translate="no">create_vm</code> with its name and image hands it back to the agent that made it.</li>
               <li>Each running VM takes 4 GB (Ubuntu, Arch) or 8 GB (Windows) of RAM, so delete VMs when done.</li>
               <li>The guest login is <code translate="no">agent</code> / <code translate="no">agent</code>.</li>
             </ul>

@@ -97,7 +97,9 @@ Rules:
 - Ownership: create your OWN uniquely named VM and work in it. Never reset/delete/restore a VM you
   did not create (list_vms shows each VM's owner) unless the user asks. Delete the VMs you created
   when you're done, unless the user wants them kept. VMs you created, started, reset or restored
-  may be stopped automatically when this session ends.
+  may be stopped automatically when this session ends. A VM with owner_running: false belongs to
+  a session that is gone; if it was yours (your session restarted), create_vm with its name and
+  image takes it back.
 - Long jobs and servers: use run_command with background: true (it keeps running after the call
   and returns a job id); poll it with get_job_status. Foreground run_command times out (default 120 s).
 - Reach a server in the VM from the Mac with forward_port (works even for servers bound to the
@@ -114,6 +116,20 @@ Rules:
 pub async fn serve() -> Result<()> {
     let out = protocol_stdout()?;
     let gateway = Gateway::new();
+    // A server that was killed (or crashed) couldn't stop its VMs on the way out; stop them
+    // now, in the background so the client's handshake isn't held up.
+    if !ops::keep_running() {
+        tokio::task::spawn_blocking(|| {
+            let stopped = ops::stop_orphans();
+            if !stopped.is_empty() {
+                crate::log!(
+                    "stopped {} VM(s) whose MCP server exited without stopping them: {}",
+                    stopped.len(),
+                    stopped.join(", ")
+                );
+            }
+        });
+    }
     let running = gateway.clone().serve((tokio::io::stdin(), out)).await?;
     running.waiting().await?;
     // Client disconnected / stdin EOF: stop the VMs this process left running so they don't
@@ -206,10 +222,19 @@ impl Gateway {
         format!("{client} [{}]", self.session_id)
     }
 
+    /// Make this session a VM's owner: its tag (with this process, for `owner_running`) and
+    /// the auto-stop set agree.
+    fn claim(&self, name: &str, ctx: &RequestContext<RoleServer>) {
+        if let Ok(inst) = load(name) {
+            let _ = ops::set_owner(&inst, &self.owner_tag(ctx));
+        }
+        self.owned.lock().unwrap().insert(name.to_string());
+    }
+
     /// Best-effort, bounded shutdown: gracefully stop the VMs this session left running, unless
     /// AGENTPC_KEEP_RUNNING=1. Force-quit any that don't stop in time so the process can exit.
     async fn shutdown(&self) {
-        if std::env::var_os("AGENTPC_KEEP_RUNNING").is_some_and(|v| v == "1") {
+        if ops::keep_running() {
             return;
         }
         let names: Vec<String> = self.owned.lock().unwrap().iter().cloned().collect();
@@ -428,7 +453,8 @@ impl Gateway {
         title = "List VMs",
         description = "List VM instances (name, image, state, size, checkpoints, owner, viewer URL and, for\n\
                           running x86apps VMs, x86_tso: hardware|emulated) and which images exist.\n\
-                          Each VM shows its owner; only reset/delete/restore a VM you created, unless the user asks otherwise.",
+                          Each VM shows its owner (owner_running: false once that session is gone); only\n\
+                          reset/delete/restore a VM you created, unless the user asks otherwise.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_vms(&self) -> CallToolResult {
@@ -470,19 +496,22 @@ impl Gateway {
         };
         // Idempotent retry: a create re-sent after a client timeout finds its own VM already
         // there (of the image asked for) and returns it, booted, rather than erroring or
-        // making a second one.
+        // making a second one. The same goes for a VM whose owning server has exited (a
+        // session restarted): its creator adopts it by asking for it again.
         if let Some(name) = &a.name
             && let Ok(inst) = load(name)
-            && ops::owner(&inst).as_deref() == Some(owner.as_str())
+            && (ops::owner(&inst).as_deref() == Some(owner.as_str())
+                || ops::owner_alive(&inst) == Some(false))
             && Image::resolve(&image).is_ok_and(|i| i == inst.image)
         {
-            self.owned.lock().unwrap().insert(name.clone());
+            self.claim(name, &ctx);
             if inst.running() {
                 return text(Ok(ops::info(&inst)));
             }
             return text(with_progress(&ctx, move || ops::boot(&inst)).await);
         }
         let requested = a.name.clone();
+        let tag = owner.clone();
         let res = with_progress(&ctx, move || {
             ops::create(
                 &Image::resolve(&image)?,
@@ -490,20 +519,24 @@ impl Gateway {
                 a.memory_gb,
                 a.cpus,
                 a.offline,
+                Some(&tag),
             )
         })
         .await;
-        // Record who owns it and track it for auto-stop. Without a requested name, `info`
-        // starts with the generated one.
-        if let Ok(info) = &res
-            && let Some(name) = requested
+        // Track it for auto-stop (ops::create recorded the owner before booting), also when
+        // it was made but didn't become ready. Without a requested name, `info` starts with
+        // the generated one.
+        let made = match &res {
+            Ok(info) => requested
                 .as_deref()
                 .or_else(|| info.split_whitespace().next())
-        {
-            if let Ok(inst) = load(name) {
-                let _ = ops::set_owner(&inst, &owner);
-            }
-            self.owned.lock().unwrap().insert(name.to_string());
+                .map(str::to_string),
+            Err(_) => requested.filter(|n| {
+                load(n).is_ok_and(|i| ops::owner(&i).as_deref() == Some(owner.as_str()))
+            }),
+        };
+        if let Some(name) = made {
+            self.owned.lock().unwrap().insert(name);
         }
         let note = self.stale_note().unwrap_or_default();
         text(res.map(|s| note + &s))
@@ -526,7 +559,7 @@ impl Gateway {
     ) -> CallToolResult {
         let r = self.lifecycle(&a.name, ops::boot, &ctx).await;
         if r.is_ok() {
-            self.owned.lock().unwrap().insert(a.name.clone());
+            self.claim(&a.name, &ctx);
         }
         text(r)
     }
@@ -565,7 +598,7 @@ impl Gateway {
     ) -> CallToolResult {
         let r = self.lifecycle(&a.name, ops::reset, &ctx).await;
         if r.is_ok() {
-            self.owned.lock().unwrap().insert(a.name.clone());
+            self.claim(&a.name, &ctx);
         }
         text(r)
     }
@@ -636,7 +669,7 @@ impl Gateway {
         }
         .await;
         if r.is_ok() {
-            self.owned.lock().unwrap().insert(name);
+            self.claim(&name, &ctx);
         }
         text(r)
     }
@@ -1191,7 +1224,6 @@ const OUTPUT_KEEP: usize = 10_000;
 const DESKTOP_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 async fn exec(name: &str, command: &str, timeout: u64, desktop_env: bool) -> Result<String> {
-    use tokio::io::AsyncReadExt;
     let inst = load(name)?;
     if !inst.running() {
         bail!("VM {name} is not running; start_vm first");
@@ -1212,18 +1244,10 @@ async fn exec(name: &str, command: &str, timeout: u64, desktop_env: bool) -> Res
         .spawn()
         .context("run ssh")?;
     // Drain both pipes concurrently so a timeout kill still yields whatever the command printed.
-    let mut so = child.stdout.take().unwrap();
-    let mut se = child.stderr.take().unwrap();
-    let read_out = tokio::spawn(async move {
-        let mut b = Vec::new();
-        let _ = so.read_to_end(&mut b).await;
-        b
-    });
-    let read_err = tokio::spawn(async move {
-        let mut b = Vec::new();
-        let _ = se.read_to_end(&mut b).await;
-        b
-    });
+    let so = child.stdout.take().unwrap();
+    let se = child.stderr.take().unwrap();
+    let read_out = tokio::spawn(drain_ends(so));
+    let read_err = tokio::spawn(drain_ends(se));
     let status = tokio::time::timeout(Duration::from_secs(timeout), child.wait()).await;
     let timed_out = status.is_err();
     if timed_out {
@@ -1238,18 +1262,18 @@ async fn exec(name: &str, command: &str, timeout: u64, desktop_env: bool) -> Res
     };
     let head = if timed_out {
         format!(
-            "timed out after {timeout}s; the command was killed. \
-             Use background: true for long jobs.\n(partial output below)"
+            "timed out after {timeout}s. The SSH session was closed, but the command may still \
+             be running in the VM (find it with ps or Get-Process). Use background: true for \
+             long jobs.\n(partial output below)"
         )
     } else {
         format!("exit code: {code}")
     };
     let mut text = head;
-    for (label, bytes) in [("stdout", &stdout), ("stderr", &stderr)] {
-        let s = String::from_utf8_lossy(bytes);
-        let s = s.trim_end();
+    for (label, out) in [("stdout", &stdout), ("stderr", &stderr)] {
+        let s = out.text();
         if !s.is_empty() {
-            text += &format!("\n--- {label} ---\n{}", clip(s, OUTPUT_KEEP));
+            text += &format!("\n--- {label} ---\n{s}");
         }
     }
     if timed_out || code != 0 {
@@ -1267,9 +1291,7 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
     if !inst.running() {
         bail!("VM {name} is not running; start_vm first");
     }
-    let id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis();
+    let id = job_id();
     let b64 = base64::engine::general_purpose::STANDARD.encode(command);
     let script = match inst.os {
         // Separate lines: `a && b &` would background the whole list, and that shell would
@@ -1333,6 +1355,83 @@ if (Test-Path $exit) {{ "STATE: exited $((Get-Content $exit -Raw).Trim())" }} el
 }
 
 /// Keep the first and last `keep` characters of `s`, noting how much was cut.
+/// A background job's id: the time in milliseconds, but never the same twice in this
+/// process, since two jobs started in one millisecond would share their files.
+fn job_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let prev = LAST
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
+            Some(now.max(last + 1))
+        })
+        .unwrap_or(0);
+    now.max(prev + 1)
+}
+
+/// What a command printed on one stream: only its first and last bytes are kept while
+/// reading, so a command that prints gigabytes can't exhaust this server's memory.
+#[derive(Default)]
+struct Captured {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    total: usize,
+}
+
+/// Bytes kept from each end of a stream: enough for OUTPUT_KEEP characters of any UTF-8.
+const CAPTURE_KEEP: usize = 4 * OUTPUT_KEEP;
+
+async fn drain_ends<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> Captured {
+    use tokio::io::AsyncReadExt;
+    let mut c = Captured::default();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        c.push(&buf[..n]);
+    }
+    c
+}
+
+impl Captured {
+    fn push(&mut self, mut chunk: &[u8]) {
+        self.total += chunk.len();
+        if self.head.len() < CAPTURE_KEEP {
+            let take = (CAPTURE_KEEP - self.head.len()).min(chunk.len());
+            self.head.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+        }
+        self.tail.extend(chunk);
+        let over = self.tail.len().saturating_sub(CAPTURE_KEEP);
+        self.tail.drain(..over);
+    }
+
+    /// The output for a reply: whole if it is short, else its two ends.
+    fn text(&self) -> String {
+        let tail: Vec<u8> = self.tail.iter().copied().collect();
+        if self.total == self.head.len() + tail.len() {
+            let mut all = self.head.clone();
+            all.extend_from_slice(&tail);
+            return clip(String::from_utf8_lossy(&all).trim_end(), OUTPUT_KEEP);
+        }
+        let head = String::from_utf8_lossy(&self.head);
+        let tail = String::from_utf8_lossy(&tail);
+        let head: String = head.chars().take(OUTPUT_KEEP).collect();
+        let n = tail.chars().count();
+        let tail: String = tail.chars().skip(n.saturating_sub(OUTPUT_KEEP)).collect();
+        format!(
+            "{head}\n[... middle omitted: {} bytes of output in all ...]\n{}",
+            self.total,
+            tail.trim_end()
+        )
+    }
+}
+
 fn clip(s: &str, keep: usize) -> String {
     let n = s.chars().count();
     if n <= 2 * keep {
@@ -1524,6 +1623,36 @@ fn reply(r: Result<Vec<ContentBlock>>) -> CallToolResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn captures_short_output_whole() {
+        let mut c = super::Captured::default();
+        c.push(b"hello ");
+        c.push(b"world\n");
+        assert_eq!(c.text(), "hello world");
+    }
+
+    #[test]
+    fn captures_only_the_ends_of_huge_output() {
+        let mut c = super::Captured::default();
+        c.push(b"START");
+        for _ in 0..1000 {
+            c.push(&[b'x'; 4096]);
+        }
+        c.push(b"END");
+        // Bounded memory, whatever was printed.
+        assert!(c.head.len() <= super::CAPTURE_KEEP && c.tail.len() <= super::CAPTURE_KEEP);
+        let t = c.text();
+        assert!(t.starts_with("START"), "{}", &t[..20]);
+        assert!(t.ends_with("END"));
+        assert!(t.contains(&format!("{} bytes of output in all", 5 + 1000 * 4096 + 3)));
+    }
+
+    #[test]
+    fn job_ids_never_repeat() {
+        let ids: Vec<u64> = (0..1000).map(|_| super::job_id()).collect();
+        assert!(ids.windows(2).all(|w| w[1] > w[0]));
+    }
+
     #[test]
     fn clips_long_output_keeping_both_ends() {
         assert_eq!(super::clip("short", 10), "short");

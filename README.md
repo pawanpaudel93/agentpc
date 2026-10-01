@@ -189,7 +189,9 @@ If a desktop-tool reply starts with a reconnect note (the VM or its driver resta
 snapshot ids and browser sessions are gone: take a new snapshot and run `browser_prepare` again.
 
 VMs an MCP session created, started, reset or restored are stopped (never deleted) when the
-session ends, unless `AGENTPC_KEEP_RUNNING=1`.
+session ends, unless `AGENTPC_KEEP_RUNNING=1`. If the session's server was killed instead, the
+next MCP server to start stops them; `list_vms` marks such VMs `owner_running: false`, and
+`create_vm` with the same name and image hands one back to the session that asks.
 
 ### Approval prompts
 
