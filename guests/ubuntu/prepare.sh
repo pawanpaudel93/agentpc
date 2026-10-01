@@ -69,6 +69,42 @@ cat > /etc/opt/chrome/policies/managed/agentpc.json <<'EOF'
 }
 EOF
 
+# Double-clicking a .deb (or xdg-open) installs it with apt, dependencies included, in a
+# terminal that shows the progress: it closes on success and stays open on a failure. Stock
+# Ubuntu would open the App Center snap, which isn't installed; the agent user has
+# passwordless sudo, so there is no password prompt.
+cat > /usr/local/bin/agentpc-install-deb <<'EOF'
+#!/bin/sh
+# agentpc: install the .deb given (a double-click), with apt, in a terminal window.
+case $1 in /*) deb=$1 ;; *) deb=$PWD/$1 ;; esac
+exec xfce4-terminal --title "Installing ${deb##*/}" -x sh -c '
+    echo "Installing $1"; echo
+    if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$1"; then
+        echo; echo "Installed."; sleep 3
+    else
+        echo; echo "Install failed. Press Enter to close."; read -r _
+    fi' sh "$deb"
+EOF
+chmod 755 /usr/local/bin/agentpc-install-deb
+cat > /usr/share/applications/agentpc-install-deb.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Install Package
+Comment=Install a .deb package with apt
+Exec=agentpc-install-deb %f
+Icon=system-software-install
+Terminal=false
+NoDisplay=true
+MimeType=application/vnd.debian.binary-package;application/x-deb;
+EOF
+mkdir -p /etc/xdg
+touch /etc/xdg/mimeapps.list
+grep -q '^\[Default Applications\]' /etc/xdg/mimeapps.list ||
+    printf '[Default Applications]\n' >> /etc/xdg/mimeapps.list
+sed -i '/^application\/vnd\.debian\.binary-package=/d; /^application\/x-deb=/d' /etc/xdg/mimeapps.list
+sed -i '/^\[Default Applications\]/a application/vnd.debian.binary-package=agentpc-install-deb.desktop\napplication/x-deb=agentpc-install-deb.desktop' /etc/xdg/mimeapps.list
+update-desktop-database -q /usr/share/applications 2>/dev/null || true
+
 # Smaller images: drop downloaded packages and old logs, then hand free blocks back to the
 # qcow2 (the disk is attached with discard). Package lists stay so `apt install` just works.
 apt-get clean

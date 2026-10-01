@@ -209,7 +209,7 @@ files on your Mac. The VMs themselves are throwaway: `reset_vm` undoes anything 
 | Guest | Desktop | Desktop-control server |
 | --- | --- | --- |
 | Windows | Windows 11 (ARM64), 1280x800, Edge | [cua-driver](https://github.com/trycua/cua) (over SSH) |
-| Ubuntu | Ubuntu 24.04 or another release, XFCE on X11, 1280x800, Google Chrome | [cua-driver](https://github.com/trycua/cua) (over SSH) |
+| Ubuntu | Ubuntu 24.04 or another release, XFCE on X11, 1280x800, Google Chrome; double-clicking a `.deb` installs it | [cua-driver](https://github.com/trycua/cua) (over SSH) |
 | Arch | Arch Linux ARM (rolling), XFCE on X11, 1280x800, Chromium; `sudo pacman -Syu --noconfirm <pkg>` | [cua-driver](https://github.com/trycua/cua) (over SSH) |
 
 [AGENTS.md](AGENTS.md) has usage tips for agents.

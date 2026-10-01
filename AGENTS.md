@@ -38,7 +38,8 @@ screenshot plus window pid/window_id values to pass to other tools. Keyboard and
 tools need `"delivery_mode": "foreground"`. `launch_app` takes a command name such as
 `xfce4-terminal`. Google Chrome is installed: `launch_app` `google-chrome` with the URL in
 `additional_arguments`, then `get_window_state`, reads a page; the `browser_*` tools drive one
-(the MCP server's instructions and the plugin skill give the call sequence).
+(the MCP server's instructions and the plugin skill give the call sequence). Opening a `.deb`
+(a double-click, or `xdg-open`) installs it with apt in a terminal window that closes on success.
 
 **Arch** (Arch Linux ARM, a community port of Arch; same XFCE desktop and tools as Ubuntu):
 the browser is Chromium, so `launch_app` `chromium` where Ubuntu uses `google-chrome`.

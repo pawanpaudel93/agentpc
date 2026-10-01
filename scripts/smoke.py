@@ -172,7 +172,31 @@ def gateway_checks(m, vm, r):
 
 def ubuntu(m, vm, r):
     linux(m, vm, r, "google-chrome", "Chrome")
+    deb_double_click(m, vm, r, "all", "")
     lifecycle(m, vm, r, "ubuntu")
+
+
+def deb_double_click(m, vm, r, arch, machine):
+    """Opening a .deb from the desktop (a double-click, i.e. xdg-open) installs it with apt in a
+    terminal window. With `machine`, the package's preinst refuses any other `uname -m`."""
+    pkg = f"smoke-click-{arch}"
+    gate = f'[ \\"\\$(uname -m)\\" = {machine} ] || exit 1\\n' if machine else ""
+    def sh(command, timeout=120):
+        return m.tool("run_command", name=vm, command=command, timeout=timeout)
+    ok, out = sh(
+        f"cd /tmp && rm -rf {pkg} && mkdir -p {pkg}/DEBIAN && printf 'Package: {pkg}\\nVersion: 1\\n"
+        f"Architecture: {arch}\\nMaintainer: s <s@s>\\nDescription: s\\n' > {pkg}/DEBIAN/control"
+        f" && printf \"#!/bin/sh\\n{gate}\" > {pkg}/DEBIAN/preinst && chmod 755 {pkg}/DEBIAN/preinst"
+        f" && mkdir -p ~/Downloads && dpkg-deb --build {pkg} ~/Downloads/{pkg}.deb >/dev/null"
+        f" && cd ~/Downloads && (DISPLAY=:0 setsid xdg-open {pkg}.deb >/dev/null 2>&1 &)"
+        " && xdg-mime query default application/vnd.debian.binary-package"
+    )
+    r.check("a .deb opens with agentpc's installer", ok and "agentpc-install-deb.desktop" in out, out[-300:])
+    status = poll(lambda: "ok installed" in stdout(sh(f"dpkg-query -W -f='${{Status}}' {pkg} 2>/dev/null; true")[1]), 120, 3)
+    label = f"double-clicking an {arch} .deb whose preinst requires {machine} installs it" if machine \
+        else "double-clicking a .deb installs it"
+    r.check(label, status, "")
+    sh(f"sudo dpkg --purge {pkg} >/dev/null 2>&1; rm -rf ~/Downloads/{pkg}.deb /tmp/{pkg}")
 
 
 def arch(m, vm, r):
@@ -470,6 +494,7 @@ def x86apps(m, vm, r, guest="ubuntu"):
     # installed into the x86 root filesystem with fex-pacman. Either way FEX finds them.
     load = " && FEXBash -c 'python3 -c \"import ctypes; ctypes.CDLL(\\\"libzmq.so.5\\\"); print(\\\"loaded\\\")\"'"
     if guest == "ubuntu":
+        deb_double_click(m, vm, r, "amd64", "x86_64")
         ok, out = sh(install("libzmq5:amd64") + load)
         r.check("apt install <lib>:amd64 gives x86 programs the library", ok and "loaded" in out.split(), out[-300:])
         # An amd64 .deb whose maintainer scripts refuse anything but x86_64: dpkg runs them

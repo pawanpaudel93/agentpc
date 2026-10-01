@@ -99,6 +99,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 - Keyboard and mouse tools need `"delivery_mode": "foreground"`.
 - `launch_app` takes a command name such as `xfce4-terminal`.
 - `run_command` runs bash as `agent`, with passwordless `sudo`. The screen is 1280x800.
+- Opening a `.deb` (a double-click, or `xdg-open`) installs it with apt in a terminal window
+  that closes on success and stays open on a failure.
 - Google Chrome is installed. To read a page: `launch_app` with `name: "google-chrome"` and
   the URL in `additional_arguments`, then `get_window_state` on its window; the page's text,
   links and fields are in the tree.
