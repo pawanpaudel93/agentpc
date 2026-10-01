@@ -511,11 +511,15 @@ pub fn info(inst: &Instance) -> String {
         format!("\n  checkpoints: {}", cps.join(", "))
     };
     let x86 = if inst.image.x86_apps() {
-        match x86_tso(inst) {
-            "hardware" => "\n  x86 programs: FEX, hardware TSO".to_string(),
-            _ => "\n  x86 programs: FEX, emulated TSO (slower; hardware TSO needs macOS 15+)"
-                .to_string(),
-        }
+        let tso = match x86_tso(inst) {
+            "hardware" => "hardware TSO",
+            _ => "emulated TSO (slower; hardware TSO needs macOS 15+)",
+        };
+        format!(
+            "\n  x86 programs: FEX, {tso}\
+             \n  x86-only installer (uname -m): sudo FEXBash ./install.sh; \
+             x86 service in a hardened unit: sudo fex-unit <unit>"
+        )
     } else {
         String::new()
     };

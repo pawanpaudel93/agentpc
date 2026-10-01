@@ -82,8 +82,9 @@ Guest tips:
   libfoo:amd64`. Arch has no multiarch: x86 programs there use FEX's x86 Arch Linux tree, and
   `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs more x86 packages into it.
   x86 systemd services run too; if the unit sets `MemoryDenyWriteExecute=` or
-  `LockPersonality=` (which stop FEX, as they stop any JIT), `sudo fex-unit <unit>` adds a
-  drop-in that relaxes just those two. An installer that refuses non-x86_64 (`uname -m`) runs
+  `LockPersonality=` (which stop FEX, as they stop any JIT: the service dies at start with a
+  SIGSEGV inside FEX and an AArch64 core dump), `sudo fex-unit <unit>` adds a drop-in that
+  relaxes just those two. An installer that refuses non-x86_64 (`uname -m`) runs
   unmodified under the x86 bash: `sudo FEXBash ./install.sh` (its `uname` and tools then run as
   x86 programs).
   `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or `emulated`.

@@ -538,8 +538,10 @@ to arm64 as it runs; the kernel and desktop stay native. Run the program directl
   FEX runs them from the image's own x86 files.
 - **x86 services** run under systemd, as system users without a home too (FEX then keeps its
   config and code cache in the unit's `StateDirectory=` or a private `/tmp/fex-emu-<uid>`). A
-  unit with `MemoryDenyWriteExecute=` or `LockPersonality=` stops FEX, as it stops any JIT:
-  `sudo fex-unit <unit>` adds a drop-in that relaxes those two (`--undo` removes it). With
+  unit with `MemoryDenyWriteExecute=` or `LockPersonality=` stops FEX, as it stops any JIT. The
+  symptom looks like an application crash: the service dies at start with a SIGSEGV inside FEX
+  and an AArch64 core dump. `sudo fex-unit <unit>` adds a drop-in that relaxes those two
+  (`--undo` removes it); relaxing only `MemoryDenyWriteExecute=` still crashes. With
   `ProtectSystem=strict`, give the unit a writable directory (`StateDirectory=` or `PrivateTmp=`).
 - **x86-only installers** that check `uname -m` run unmodified under the x86 bash:
   `sudo FEXBash ./install.sh`. Its `uname`, `useradd`, `systemctl` and other tools then run as

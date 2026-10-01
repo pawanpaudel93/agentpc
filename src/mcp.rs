@@ -51,7 +51,8 @@ create ubuntu or arch with version \"x86apps\": they run through FEX translation
 x86 libraries install with sudo apt install libfoo:amd64; on Arch (no multiarch), sudo fex-pacman
 -Sy --noconfirm --needed <pkg> installs x86 packages into the x86 Arch tree FEX runs them in.
 x86 systemd services run too; if the unit sets MemoryDenyWriteExecute= or LockPersonality=
-(they stop FEX, as they stop any JIT), sudo fex-unit <unit> relaxes just those two. An installer
+(they stop FEX, as they stop any JIT; the symptom is a SIGSEGV inside FEX with an AArch64 core
+dump), sudo fex-unit <unit> relaxes just those two. An installer
 that refuses non-x86_64 (uname -m) runs unmodified under the x86 bash: sudo FEXBash ./install.sh.
 list_vms shows x86_tso: hardware (fast; needs macOS 15+) or emulated.
 An Arch Linux ARM guest (os \"arch\") works like Ubuntu (XFCE, bash, the same desktop tools), but
@@ -147,6 +148,8 @@ struct Gateway {
     /// the old one) and whose next desktop call should say so.
     connected: Arc<Mutex<HashSet<String>>>,
     reconnected: Arc<Mutex<HashSet<String>>>,
+    /// The agentpc binary this server runs, as found at startup, to notice an update.
+    exe: Option<(std::path::PathBuf, u64)>,
 }
 
 impl Gateway {
@@ -162,7 +165,31 @@ impl Gateway {
             session_id: format!("{pid:x}{nanos:x}").into(),
             connected: Default::default(),
             reconnected: Default::default(),
+            exe: std::env::current_exe()
+                .ok()
+                .and_then(|p| exe_id(&p).map(|id| (p, id))),
         }
+    }
+
+    /// A note when the agentpc binary was replaced (updated) since this server started: an
+    /// agent otherwise trusts this older server's tools and schemas until its session restarts.
+    fn stale_note(&self) -> Option<String> {
+        let (path, id) = self.exe.as_ref()?;
+        if exe_id(path)? == *id {
+            return None;
+        }
+        let now = std::process::Command::new(path)
+            .arg("--version")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        Some(format!(
+            "Note: agentpc was updated since this MCP server started (this server is agentpc {}, \
+             the installed one is {now}); its tools and options may be out of date. Reconnect the \
+             agentpc MCP server (or restart the session) to use the update.\n",
+            env!("CARGO_PKG_VERSION")
+        ))
     }
 
     /// Owner tag stored on VMs created this session: the MCP client's name plus a per-process id.
@@ -401,7 +428,14 @@ impl Gateway {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_vms(&self) -> CallToolResult {
-        text(blocking(ops::list_json).await)
+        // The note goes in its own block, so the JSON stays parseable.
+        let note = self.stale_note();
+        reply(blocking(ops::list_json).await.map(|json| {
+            note.into_iter()
+                .chain([json])
+                .map(ContentBlock::text)
+                .collect()
+        }))
     }
 
     #[tool(
@@ -467,7 +501,8 @@ impl Gateway {
             }
             self.owned.lock().unwrap().insert(name.to_string());
         }
-        text(res)
+        let note = self.stale_note().unwrap_or_default();
+        text(res.map(|s| note + &s))
     }
 
     #[tool(
@@ -1464,6 +1499,12 @@ fn is_argument_error(msg: &str) -> bool {
     ]
     .iter()
     .any(|p| msg.contains(p))
+}
+
+/// Identifies the binary at `path` (its inode), which an update replaces.
+fn exe_id(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.ino())
 }
 
 fn text(r: Result<String>) -> CallToolResult {

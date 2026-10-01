@@ -321,7 +321,8 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
               use the image's x86 Arch Linux tree, and <code translate="no">sudo fex-pacman -Sy --noconfirm --needed &lt;pkg&gt;</code>
               installs more x86 packages into it. x86 systemd services run too; if the unit sets
               <code translate="no">MemoryDenyWriteExecute=</code> or <code translate="no">LockPersonality=</code> (which stop FEX, as
-              they stop any JIT), <code translate="no">sudo fex-unit &lt;unit&gt;</code> relaxes just those two. An installer that refuses non-x86_64
+              they stop any JIT: the service dies at start with a SIGSEGV inside FEX and an AArch64 core dump),
+              <code translate="no">sudo fex-unit &lt;unit&gt;</code> relaxes just those two. An installer that refuses non-x86_64
               (<code translate="no">uname -m</code>) runs unmodified under the x86 bash:
               <code translate="no">sudo FEXBash ./install.sh</code>. x86 containers work too:
               <code translate="no">docker run --platform linux/amd64 &lt;image&gt;</code> (install Docker first:
