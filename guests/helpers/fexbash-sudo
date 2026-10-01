@@ -1,0 +1,53 @@
+#!/bin/sh
+# agentpc: sudo inside FEXBash (installed as /usr/libexec/agentpc/fexbash/sudo, first on
+# FEXBash's PATH). The real sudo is setuid, so it runs natively, and so would everything it
+# starts (`curl ... | sudo bash -s` would see aarch64 again). This one keeps sudo's options
+# and VAR=value assignments but has sudo start the command through FEXBash:
+#   sudo [options] [VAR=value...] command args -> /usr/bin/sudo [options] [VAR=value...]
+#       /usr/bin/FEXBash -c 'exec "$@"' fexbash command args
+# AGENTPC_REAL (default /usr/bin) is where the real sudo and FEXBash are; tests point it at stubs.
+real=${AGENTPC_REAL:-/usr/bin}
+n=0 arg=0 reset=0
+for a do
+    if [ "$arg" = 1 ]; then arg=0; n=$((n + 1)); continue; fi
+    case $a in
+        --) n=$((n + 1)); break ;;
+        # Long options whose value is the next word.
+        --user | --group | --prompt | --close-from | --chdir | --role | --type | \
+            --command-timeout | --other-user | --chroot | --host) arg=1 ;;
+        # Modes that run no command.
+        --list | --validate | --remove-timestamp | --version | --edit | --help)
+            exec "$real/sudo" "$@" ;;
+        --reset-timestamp) reset=1 ;;
+        --*) ;;
+        # Short options, alone or bundled (-E, -Eu agent, -uagent): each letter is a flag,
+        # until one that takes a value, which is the rest of the word or else the next word.
+        -?*)
+            rest=${a#-}
+            while [ -n "$rest" ]; do
+                c=${rest%"${rest#?}"}
+                rest=${rest#?}
+                case $c in
+                    [ugpCDrRtTU]) [ -n "$rest" ] || arg=1; break ;;
+                    [lvKVeh]) exec "$real/sudo" "$@" ;;
+                    k) reset=1 ;;
+                esac
+            done ;;
+        *=*) ;;
+        *) break ;;
+    esac
+    n=$((n + 1))
+done
+total=$# i=0
+for a do
+    i=$((i + 1))
+    if [ "$i" -eq $((n + 1)) ]; then set -- "$@" "$real/FEXBash" -c 'exec "$@"' fexbash; fi
+    set -- "$@" "$a"
+done
+# No command: `sudo -k` alone only forgets the password; sudo -s or -i opens an x86 bash.
+if [ "$n" -eq "$total" ]; then
+    [ "$reset" = 1 ] && { shift "$total"; exec "$real/sudo" "$@"; }
+    set -- "$@" "$real/FEXBash"
+fi
+shift "$total"
+exec "$real/sudo" "$@"

@@ -1,0 +1,29 @@
+#!/bin/sh
+# Let a systemd service run an x86 program through FEX: sudo fex-unit <unit> [--undo]
+# FEX translates x86 code as the program runs, so it writes code and then executes it, and it
+# sets the process personality: MemoryDenyWriteExecute= and LockPersonality= forbid both, and
+# the program then dies at start without a message. This adds a drop-in that allows them. The
+# agentpc-fex generator does the same on its own for units whose ExecStart is an x86 program;
+# this is for units that start one some other way (a script, a wrapper).
+set -eu
+usage="usage: fex-unit <unit> [--undo]"
+unit=${1:?$usage}
+case $unit in
+    -h|--help) echo "$usage"; exit 0 ;;
+    -*) echo "$usage" >&2; exit 2 ;;
+    *.*) ;;
+    *) unit=$unit.service ;;
+esac
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+dir=/etc/systemd/system/$unit.d
+if [ "${2:-}" = --undo ]; then
+    rm -f "$dir/fex.conf"
+    rmdir "$dir" 2>/dev/null || true
+    echo "removed $dir/fex.conf"
+else
+    mkdir -p "$dir"
+    printf '%s\n' '# From fex-unit: FEX (x86 translation) writes and runs code, and sets the personality.' \
+        '[Service]' 'MemoryDenyWriteExecute=no' 'LockPersonality=no' > "$dir/fex.conf"
+    echo "wrote $dir/fex.conf; restart $unit to apply it"
+fi
+systemctl daemon-reload

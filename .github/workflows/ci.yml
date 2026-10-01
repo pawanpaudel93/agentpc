@@ -28,13 +28,14 @@ jobs:
       - name: Syntax-check guest scripts
         run: |
           bash -n guests/arch/build.sh
-          for f in guests/arch/prepare.sh guests/arch/x86apps.sh guests/ubuntu/*.sh; do
+          for f in guests/arch/prepare.sh guests/arch/x86apps.sh guests/ubuntu/*.sh guests/helpers/*; do
             sh -n "$f"
           done
       - name: shellcheck
         run: |
           command -v shellcheck >/dev/null || brew install shellcheck
-          shellcheck -S warning install.sh guests/arch/*.sh guests/ubuntu/*.sh
+          shellcheck -S warning install.sh guests/arch/*.sh guests/ubuntu/*.sh guests/helpers/* \
+            scripts/test-guest-helpers.sh
       - run: python3 -m py_compile scripts/smoke.py
       - name: Plugin manifests parse
         run: |
@@ -44,3 +45,12 @@ jobs:
         run: |
           npm install -g @anthropic-ai/claude-code@2.1.285
           claude plugin validate plugin --strict
+
+  # The helpers Linux guests install, tested against stubs with the guests' shells: dash
+  # (Ubuntu's /bin/sh) and bash (Arch's).
+  guest-helpers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: dash scripts/test-guest-helpers.sh
+      - run: bash scripts/test-guest-helpers.sh

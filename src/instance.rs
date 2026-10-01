@@ -92,6 +92,8 @@ pub struct Image {
 /// FEX): `ubuntu-24.04-x86apps` / `arch-rolling-x86apps`, or `ubuntu-x86apps` / `arch-x86apps`
 /// for the default version. A published build pins it with a date: `…-x86apps-YYYYMMDD`.
 const X86_APPS: &str = "x86apps";
+/// The Ubuntu releases `guests/ubuntu/x86apps.sh` pins an x86 root filesystem for.
+const UBUNTU_X86_RELEASES: &[&str] = &["22.04", "24.04"];
 
 /// Whether `s` is a registry build date, `YYYYMMDD`.
 fn is_date(s: &str) -> bool {
@@ -121,6 +123,15 @@ impl Image {
         }
         if os == Os::Windows && version.split('-').any(|p| p == X86_APPS) {
             bail!("Windows runs x64 and x86 apps through Prism already; use a plain windows image");
+        }
+        if os == Os::Ubuntu
+            && let Some((release, _)) = version.split_once(&format!("-{X86_APPS}"))
+            && !UBUNTU_X86_RELEASES.contains(&release)
+        {
+            bail!(
+                "x86apps images are Ubuntu {}: there is no pinned x86 root filesystem for {release}",
+                UBUNTU_X86_RELEASES.join(" or ")
+            );
         }
         // Arch is rolling: one version (plain or x86apps), plus the dated tags of published
         // builds (pinned pulls).
@@ -961,6 +972,8 @@ mod tests {
         let i: Image = "ubuntu-22.04".parse().unwrap();
         assert_eq!((i.x86_apps(), i.release()), (false, "22.04"));
         assert!("windows-x86apps".parse::<Image>().is_err());
+        assert!("ubuntu-26.04-x86apps".parse::<Image>().is_err());
+        assert!("ubuntu-22.04-x86apps".parse::<Image>().is_ok());
         assert!("windows-11-25h2-x86apps".parse::<Image>().is_err());
         let i: Image = "ubuntu-24.04-x86apps-20260930".parse().unwrap();
         assert_eq!((i.x86_apps(), i.release()), (true, "24.04"));

@@ -1,0 +1,12 @@
+#!/bin/sh
+# agentpc (Ubuntu): what opens a .deb (a double-click, or xdg-open). Installs it with apt,
+# dependencies included, in a terminal that shows the progress: it closes on success and stays
+# open on a failure. The agent user has passwordless sudo, so there is no password prompt.
+case $1 in /*) deb=$1 ;; *) deb=$PWD/$1 ;; esac
+exec xfce4-terminal --title "Installing ${deb##*/}" -x sh -c '
+    echo "Installing $1"; echo
+    if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$1"; then
+        echo; echo "Installed."; sleep 3
+    else
+        echo; echo "Install failed. Press Enter to close."; read -r _
+    fi' sh "$deb"

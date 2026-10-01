@@ -470,6 +470,14 @@ def x86apps(m, vm, r, guest="ubuntu"):
         ok and "installer-ok" in stdout(out) and "var=7 user=root" in stdout(out),
         out[-300:],
     )
+    # sudo -E keeps the caller's $HOME: root's FEX must still start (not share the agent's
+    # FEXServer), and bundled options (-Eu root) must still reach sudo whole.
+    ok, out = sh("FEXBash -c 'sudo -E sh -c \"echo \\$(id -un) \\$(uname -m)\"; sudo -Eu root sh -c \"echo \\$(id -un) \\$(uname -m)\"'")
+    r.check(
+        "sudo -E and sudo -Eu root inside FEXBash run as root, x86",
+        ok and stdout(out).splitlines()[-2:] == ["root x86_64", "root x86_64"],
+        out[-300:],
+    )
 
     # An x86 service: a hardened systemd unit (a relay's options) running as nobody, whose home
     # doesn't exist. FEX falls back to a writable directory and reads its RootFS without FUSE or

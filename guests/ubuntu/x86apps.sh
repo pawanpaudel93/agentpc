@@ -89,14 +89,9 @@ if [ -n "$rootfs_url" ]; then
         echo "$rootfs_url:$rootfs_sha256" > "$rootfs_stamp"
     fi
 elif [ ! -f "$rootfs" ]; then
-    # No pin for this release: whatever FEXRootFSFetcher lists for it, unchecked.
-    tmp=$(mktemp -d)
-    HOME=$tmp XDG_DATA_HOME=$tmp/data XDG_CONFIG_HOME=$tmp/config FEXRootFSFetcher -y -a \
-        --distro-name=ubuntu --distro-version="$VERSION_ID" --distro-list-first \
-        --force-ui=tty >/dev/null
-    umount "$mnt" 2>/dev/null || true
-    mv "$tmp/data/fex-emu/RootFS/$name.sqsh" "$rootfs"
-    rm -rf "$tmp"
+    # Everything a guest downloads is checked against a pin; there is none for this release.
+    echo "no pinned x86 root filesystem for Ubuntu $VERSION_ID: x86apps images are 22.04 or 24.04" >&2
+    exit 1
 fi
 if ! mountpoint -q "$mnt"; then
     # Images built before the squashfs had it unpacked here.
@@ -133,33 +128,7 @@ chmod 755 /usr/local/sbin/agentpc-fex-tso
 # as the program runs, so it writes code and then executes it, and it sets the process
 # personality: MemoryDenyWriteExecute= and LockPersonality= forbid both, and the program then
 # dies at start without a message. fex-unit adds a drop-in that allows them (--undo removes it).
-cat > /usr/local/bin/fex-unit <<'EOF'
-#!/bin/sh
-# Let a systemd service run an x86 program through FEX: sudo fex-unit <unit> [--undo]
-set -eu
-usage="usage: fex-unit <unit> [--undo]"
-unit=${1:?$usage}
-case $unit in
-    -h|--help) echo "$usage"; exit 0 ;;
-    -*) echo "$usage" >&2; exit 2 ;;
-    *.*) ;;
-    *) unit=$unit.service ;;
-esac
-[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
-dir=/etc/systemd/system/$unit.d
-if [ "${2:-}" = --undo ]; then
-    rm -f "$dir/fex.conf"
-    rmdir "$dir" 2>/dev/null || true
-    echo "removed $dir/fex.conf"
-else
-    mkdir -p "$dir"
-    printf '%s\n' '# From fex-unit: FEX (x86 translation) writes and runs code, and sets the personality.' \
-        '[Service]' 'MemoryDenyWriteExecute=no' 'LockPersonality=no' > "$dir/fex.conf"
-    echo "wrote $dir/fex.conf; restart $unit to apply it"
-fi
-systemctl daemon-reload
-EOF
-chmod 755 /usr/local/bin/fex-unit
+install -m 755 /tmp/agentpc-helpers/fex-unit /usr/local/bin/fex-unit
 
 # dpkg runs an amd64 package's maintainer scripts (preinst, postinst, ...) with the native
 # arm64 shell, so `uname -m` in them says aarch64 and an arch check in a vendor .deb refuses to
@@ -167,30 +136,9 @@ chmod 755 /usr/local/bin/fex-unit
 # DPKG_MAINTSCRIPT_ARCH for those scripts; while it is amd64 or i386, these answer as that
 # machine. Anywhere else they are the real commands. They sit first on `sudo dpkg`'s PATH;
 # apt runs dpkg with its own DPkg::Path, so that gets /usr/local/bin too.
-for tool in uname arch; do
-cat > /usr/local/bin/$tool <<'EOF'
-#!/bin/sh
-# agentpc: inside an amd64/i386 package's maintainer script, answer as an x86 machine.
-case ${DPKG_MAINTSCRIPT_ARCH:-} in
-    amd64) m=x86_64 ;;
-    i386) m=i686 ;;
-    *) exec "/usr/bin/${0##*/}" "$@" ;;
-esac
-"/usr/bin/${0##*/}" "$@" | sed "s/aarch64/$m/g"
-EOF
-chmod 755 /usr/local/bin/$tool
-done
-cat > /usr/local/bin/dpkg <<'EOF'
-#!/bin/sh
-# agentpc: inside an amd64/i386 package's maintainer script, `dpkg --print-architecture` is that
-# package's architecture (its programs run through FEX); everything else is the real dpkg.
-case ${DPKG_MAINTSCRIPT_ARCH:-}:${1:-} in
-    amd64:--print-architecture | i386:--print-architecture)
-        [ $# -eq 1 ] && { echo "$DPKG_MAINTSCRIPT_ARCH"; exit 0; } ;;
-esac
-exec /usr/bin/dpkg "$@"
-EOF
-chmod 755 /usr/local/bin/dpkg
+install -m 755 /tmp/agentpc-helpers/maintscript-uname /usr/local/bin/uname
+install -m 755 /tmp/agentpc-helpers/maintscript-uname /usr/local/bin/arch
+install -m 755 /tmp/agentpc-helpers/maintscript-dpkg /usr/local/bin/dpkg
 cat > /etc/apt/apt.conf.d/99agentpc-dpkg-path <<'EOF'
 // agentpc: the PATH `sudo dpkg -i` has, so maintainer scripts run by apt find the x86 answers
 // in /usr/local/bin (uname, arch, dpkg) for amd64/i386 packages.
@@ -202,89 +150,14 @@ EOF
 # would see aarch64 again). It keeps sudo's options and VAR=value assignments but has sudo start
 # the command through FEXBash, so the command stays x86.
 mkdir -p /usr/libexec/agentpc/fexbash
-cat > /usr/libexec/agentpc/fexbash/sudo <<'EOF'
-#!/bin/sh
-# sudo inside FEXBash: sudo [options] [VAR=value...] command -> the real sudo, same options,
-# running `FEXBash -c 'exec "$@"' command`, so the command runs as an x86 program.
-n=0 arg=0
-for a do
-    if [ "$arg" = 1 ]; then arg=0; n=$((n + 1)); continue; fi
-    case $a in
-        --) n=$((n + 1)); break ;;
-        -[ugpCDrRtTU] | --user | --group | --prompt | --close-from | --chdir | --role | --type | \
-            --command-timeout | --other-user | --chroot | --host) arg=1 ;;
-        # Modes that run no command.
-        -l | -v | -k | -K | -V | -e | -h | --list | --validate | --reset-timestamp | \
-            --remove-timestamp | --version | --edit | --help) exec /usr/bin/sudo "$@" ;;
-        -* | *=*) ;;
-        *) break ;;
-    esac
-    n=$((n + 1))
-done
-total=$# i=0
-for a do
-    i=$((i + 1))
-    if [ "$i" -eq $((n + 1)) ]; then set -- "$@" /usr/bin/FEXBash -c 'exec "$@"' fexbash; fi
-    set -- "$@" "$a"
-done
-# No command (sudo -s, sudo -i): an interactive x86 bash.
-if [ "$n" -eq "$total" ]; then set -- "$@" /usr/bin/FEXBash; fi
-shift "$total"
-exec /usr/bin/sudo "$@"
-EOF
-chmod 755 /usr/libexec/agentpc/fexbash/sudo
+install -m 755 /tmp/agentpc-helpers/fexbash-sudo /usr/libexec/agentpc/fexbash/sudo
 
 # A systemd generator does what fex-unit does for every service whose ExecStart is an x86
 # program, so hardened x86 services work as installed. It runs at boot and on every
 # `systemctl daemon-reload`; arm64 services keep their settings. fex-unit stays for units
 # that start an x86 program some other way (a script, a wrapper).
 mkdir -p /etc/systemd/system-generators
-cat > /etc/systemd/system-generators/agentpc-fex <<'EOF'
-#!/bin/sh
-# agentpc: let services whose ExecStart is an x86 program run through FEX. FEX writes and runs
-# translated code and sets the process personality; MemoryDenyWriteExecute= and LockPersonality=
-# forbid both, and the service would die at start with a SIGSEGV inside FEX. For each such
-# unit, write a drop-in that allows them. $1 is the generator output directory.
-out=${1:-/run/systemd/generator}
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
-dirs='/etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system'
-is_x86() {
-    [ -f "$1" ] || return 1
-    [ "$(od -An -c -N 4 "$1" 2>/dev/null | tr -d ' ')" = 177ELF ] || return 1
-    case $(od -An -t u2 -j 18 -N 2 "$1" 2>/dev/null | tr -d ' ') in 62|3) return 0 ;; esac
-    return 1
-}
-# Only units that set either directive need a look: one grep per directory finds them.
-units=$(for dir in $dirs; do
-    [ -d "$dir" ] || continue
-    grep -lsE '^[[:space:]]*(MemoryDenyWriteExecute|LockPersonality)[[:space:]]*=[[:space:]]*(yes|true|on|1)' \
-        "$dir"/*.service "$dir"/*.service.d/*.conf
-done | sed -E 's|\.d/[^/]*$||; s|.*/||' | sort -u)
-for unit in $units; do
-    file=
-    for dir in $dirs; do
-        if [ -f "$dir/$unit" ]; then file=$dir/$unit; break; fi
-    done
-    [ -n "$file" ] || continue
-    # The last ExecStart= wins, a drop-in in /etc over the unit file.
-    exe=$(cat "$file" /etc/systemd/system/"$unit".d/*.conf 2>/dev/null |
-        sed -n 's/^[[:space:]]*ExecStart[[:space:]]*=[[:space:]]*[-@:+!]*//p' | grep -v '^$' | tail -n 1)
-    # The first word is the program (no glob expansion while splitting).
-    set -f
-    # shellcheck disable=SC2086
-    set -- $exe
-    set +f
-    exe=${1:-}
-    [ -n "$exe" ] || continue
-    case $exe in /*) ;; *) exe=$(command -v "$exe") || continue ;; esac
-    is_x86 "$exe" || continue
-    mkdir -p "$out/$unit.d"
-    printf '%s\n' "# agentpc-fex generator: $exe is an x86 program, which FEX runs." \
-        '[Service]' 'MemoryDenyWriteExecute=no' 'LockPersonality=no' > "$out/$unit.d/agentpc-fex.conf"
-done
-exit 0
-EOF
-chmod 755 /etc/systemd/system-generators/agentpc-fex
+install -m 755 /tmp/agentpc-helpers/agentpc-fex /etc/systemd/system-generators/agentpc-fex
 systemctl daemon-reload
 
 # x86 libraries a program needs beyond the RootFS: `sudo apt install libfoo:amd64` (or an

@@ -149,6 +149,10 @@ Rules:
   does the same with the same patch and an unpacked x86 Arch Linux root filesystem (no multiarch;
   `fex-pacman` installs x86 packages into it in a chroot). QEMU for those VMs loads `src/hvf_tso.c` (built by
   `build.rs`) to turn on the CPU's TSO mode; after each boot `ops` tells FEX which mode it got.
+  Shell helpers the Linux guest scripts install (the FEX systemd generator, FEXBash's `sudo`,
+  `fex-unit`, the dpkg maintainer-script wrappers, the `.deb` opener) are files in
+  `guests/helpers/`, uploaded to `/tmp/agentpc-helpers` before the scripts run and tested
+  without a VM by `scripts/test-guest-helpers.sh` (CI runs it with dash and bash).
   Changes take effect on the next `agentpc image build`, which refuses while VMs of that image exist.
   What guests download is pinned: FEX by tag and commit, the x86 root filesystems and
   cua-driver's installers and binaries by sha256. Bumping cua-driver means `CUA_DRIVER_VERSION`

@@ -3,7 +3,8 @@
 # 2. Fix an madvise overshoot that corrupts memory in a static-pie build.
 # 3. Run as a systemd service's system user: keep config, data and code cache in a writable
 #    directory when the home isn't one (the unit's StateDirectory= and friends, else a private
-#    /tmp dir), and FEXServer's socket in the unit's directories when /tmp is read-only.
+#    /tmp dir), and FEXServer's socket in the unit's directories when /tmp is read-only. A home
+#    that isn't the user's own (root's $HOME after `sudo -E`) isn't used.
 # 4. Open files inside the RootFS when a seccomp filter refuses openat2 (systemd's
 #    RestrictSUIDSGID=), instead of falling through to the host's files.
 # 5. FEXBash runs scripts and -c with the RootFS's /bin/bash, not /bin/sh (dash on Ubuntu).
@@ -26,7 +27,7 @@ index b136ec5..2ae8a21 100644
        ::madvise(MemoryAsBytes + ManagedSize, TrackingRegionSize, MADV_DONTNEED);
  
 diff --git a/Source/Common/Config.cpp b/Source/Common/Config.cpp
-index 676b2f5..1ae08b9 100644
+index 676b2f5..846126a 100644
 --- a/Source/Common/Config.cpp
 +++ b/Source/Common/Config.cpp
 @@ -19,6 +19,8 @@
@@ -38,15 +39,19 @@ index 676b2f5..1ae08b9 100644
  #endif
  #include <optional>
  #include <utility>
-@@ -578,6 +580,35 @@ static fextl::string FindUserHomeThroughUID() {
+@@ -578,6 +580,39 @@ static fextl::string FindUserHomeThroughUID() {
  }
  
  fextl::string GetHomeDirectory() {
 +  // agentpc: FEX keeps its config, data and code cache under the home, so it needs one it can
 +  // write. A system user (a service) often has none, or one hidden by ProtectHome=: use the
-+  // service's own directories, else a private per-user directory in /tmp.
++  // service's own directories, else a private per-user directory in /tmp. And only a home that
++  // is this user's: `sudo -E` hands root the caller's $HOME, where root would share the
++  // caller's FEXServer lock (and fail to start its own) and leave root-owned files behind.
 +  const auto Usable = [](const char* Path) {
-+    return Path && *Path && FHU::Filesystem::Exists(Path) && access(Path, W_OK) == 0;
++    struct stat St {};
++    return Path && *Path && stat(Path, &St) == 0 && S_ISDIR(St.st_mode) && St.st_uid == getuid() &&
++           access(Path, W_OK) == 0;
 +  };
 +  if (const char* Home = getenv("HOME"); Usable(Home)) {
 +    return Home;

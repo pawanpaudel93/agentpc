@@ -1,0 +1,56 @@
+#!/bin/sh
+# agentpc: a systemd generator (/etc/systemd/system-generators/agentpc-fex) that lets services
+# whose ExecStart is an x86 program run through FEX. FEX writes and runs translated code and
+# sets the process personality; MemoryDenyWriteExecute= and LockPersonality= forbid both, and
+# the service would die at start with a SIGSEGV inside FEX. For each such unit, write a drop-in
+# that allows them. It runs at boot and on every `systemctl daemon-reload`; arm64 services keep
+# their settings. $1 is the generator output directory.
+# AGENTPC_UNIT_DIRS overrides where units are looked for (tests); systemd sets no such thing.
+out=${1:-/run/systemd/generator}
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Highest precedence first, as systemd reads them.
+dirs=${AGENTPC_UNIT_DIRS:-/etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system}
+is_x86() {
+    [ -f "$1" ] || return 1
+    [ "$(od -An -c -N 4 "$1" 2>/dev/null | tr -d ' ')" = 177ELF ] || return 1
+    case $(od -An -t u2 -j 18 -N 2 "$1" 2>/dev/null | tr -d ' ') in 62|3) return 0 ;; esac
+    return 1
+}
+# Only units that set either directive need a look: one grep per directory finds them.
+# shellcheck disable=SC2086
+units=$(for dir in $dirs; do
+    [ -d "$dir" ] || continue
+    grep -lsE '^[[:space:]]*(MemoryDenyWriteExecute|LockPersonality)[[:space:]]*=[[:space:]]*(yes|true|on|1)' \
+        "$dir"/*.service "$dir"/*.service.d/*.conf
+done | sed -E 's|\.d/[^/]*$||; s|.*/||' | sort -u)
+for unit in $units; do
+    file=
+    # shellcheck disable=SC2086
+    for dir in $dirs; do
+        if [ -f "$dir/$unit" ]; then file=$dir/$unit; break; fi
+    done
+    [ -n "$file" ] || continue
+    # Its drop-ins from every directory, in name order; a name in a higher directory hides the
+    # same name lower down. Applied after the unit file, so the last ExecStart= wins.
+    # shellcheck disable=SC2086
+    dropins=$(for dir in $dirs; do
+        for f in "$dir/$unit.d"/*.conf; do [ -f "$f" ] && printf '%s\n' "$f"; done
+    done | awk -F/ '!seen[$NF]++ { print $NF "\t" $0 }' | sort | cut -f2-)
+    # Each ExecStart= value, prefixes (-@:+!) dropped; an empty one resets the list.
+    exe=$( { cat "$file"; for f in $dropins; do cat "$f"; done; } 2>/dev/null |
+        sed -n 's/^[[:space:]]*ExecStart[[:space:]]*=[[:space:]]*//p' |
+        awk '{ sub(/^[-@:+!]+/, "") } $0 == "" { v = ""; next } { v = $0 } END { print v }')
+    # The program: the first word, or a quoted path.
+    case $exe in
+        \"*) exe=${exe#\"}; exe=${exe%%\"*} ;;
+        \'*) exe=${exe#\'}; exe=${exe%%\'*} ;;
+        *) exe=${exe%%[[:space:]]*} ;;
+    esac
+    [ -n "$exe" ] || continue
+    case $exe in /*) ;; *) exe=$(command -v "$exe") || continue ;; esac
+    is_x86 "$exe" || continue
+    mkdir -p "$out/$unit.d"
+    printf '%s\n' "# agentpc-fex generator: $exe is an x86 program, which FEX runs." \
+        '[Service]' 'MemoryDenyWriteExecute=no' 'LockPersonality=no' > "$out/$unit.d/agentpc-fex.conf"
+done
+exit 0

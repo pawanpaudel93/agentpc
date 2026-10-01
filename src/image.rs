@@ -66,6 +66,28 @@ const UBUNTU_X86_APPS: &str = include_str!("../guests/ubuntu/x86apps.sh");
 const ARCH_X86_APPS: &str = include_str!("../guests/arch/x86apps.sh");
 const FEX_PATCH: &str = include_str!("../guests/ubuntu/fex.patch");
 const WIN_PREPARE: &str = include_str!("../guests/windows/prepare.ps1");
+/// Helpers the Linux guest scripts install (`guests/helpers/`), uploaded to
+/// /tmp/agentpc-helpers before they run. Kept as files so CI can test them without a VM.
+const LINUX_HELPERS: &[(&str, &str)] = &[
+    ("agentpc-fex", include_str!("../guests/helpers/agentpc-fex")),
+    (
+        "fexbash-sudo",
+        include_str!("../guests/helpers/fexbash-sudo"),
+    ),
+    ("fex-unit", include_str!("../guests/helpers/fex-unit")),
+    (
+        "maintscript-uname",
+        include_str!("../guests/helpers/maintscript-uname"),
+    ),
+    (
+        "maintscript-dpkg",
+        include_str!("../guests/helpers/maintscript-dpkg"),
+    ),
+    (
+        "agentpc-install-deb",
+        include_str!("../guests/helpers/agentpc-install-deb"),
+    ),
+];
 const WIN_AUTOUNATTEND: &str = include_str!("../guests/windows/Autounattend.xml");
 const WIN_SETUP_COMPLETE: &[u8] = include_bytes!("../guests/windows/SetupComplete.cmd");
 const WIN_OEM: [(&str, &[u8]); 2] = [
@@ -580,6 +602,23 @@ fn run_arch_build(inst: &Instance) -> Result<Option<String>> {
 /// `guests/<os>/x86apps.sh` on an x86apps image (prepare.sh's cleanup then shrinks both).
 /// It runs at every snapshot, so existing and pulled images get it too.
 fn prepare_guest(inst: &Instance) -> Result<()> {
+    if inst.os.is_linux() {
+        let dir = inst.dir.join("helpers");
+        std::fs::create_dir_all(&dir)?;
+        for (name, body) in LINUX_HELPERS {
+            std::fs::write(dir.join(name), body)?;
+        }
+        ssh(inst, "rm -rf /tmp/agentpc-helpers")?;
+        crate::ops::upload(inst, &dir, "/tmp/agentpc-helpers")?;
+    }
+    let res = prepare_scripts(inst);
+    if inst.os.is_linux() {
+        let _ = ssh(inst, "rm -rf /tmp/agentpc-helpers");
+    }
+    res
+}
+
+fn prepare_scripts(inst: &Instance) -> Result<()> {
     if inst.image.x86_apps() {
         log!("installing FEX for x86 programs");
         // Both OSes build the same FEX, with the same patch.
@@ -677,6 +716,12 @@ pub fn guest_scripts_id(image: &Image) -> String {
             _ => UBUNTU_X86_APPS,
         });
         h.update(FEX_PATCH);
+    }
+    if image.os.is_linux() {
+        for (name, body) in LINUX_HELPERS {
+            h.update(name);
+            h.update(body);
+        }
     }
     h.update(match image.os {
         Os::Ubuntu => UBUNTU_PREPARE,

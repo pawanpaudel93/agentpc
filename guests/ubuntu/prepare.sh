@@ -73,19 +73,7 @@ EOF
 # terminal that shows the progress: it closes on success and stays open on a failure. Stock
 # Ubuntu would open the App Center snap, which isn't installed; the agent user has
 # passwordless sudo, so there is no password prompt.
-cat > /usr/local/bin/agentpc-install-deb <<'EOF'
-#!/bin/sh
-# agentpc: install the .deb given (a double-click), with apt, in a terminal window.
-case $1 in /*) deb=$1 ;; *) deb=$PWD/$1 ;; esac
-exec xfce4-terminal --title "Installing ${deb##*/}" -x sh -c '
-    echo "Installing $1"; echo
-    if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$1"; then
-        echo; echo "Installed."; sleep 3
-    else
-        echo; echo "Install failed. Press Enter to close."; read -r _
-    fi' sh "$deb"
-EOF
-chmod 755 /usr/local/bin/agentpc-install-deb
+install -m 755 /tmp/agentpc-helpers/agentpc-install-deb /usr/local/bin/agentpc-install-deb
 cat > /usr/share/applications/agentpc-install-deb.desktop <<'EOF'
 [Desktop Entry]
 Type=Application
