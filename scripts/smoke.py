@@ -423,7 +423,8 @@ def x86apps(m, vm, r, guest="ubuntu"):
 
     # An x86 service: a hardened systemd unit (a relay's options) running as nobody, whose home
     # doesn't exist. FEX falls back to a writable directory and reads its RootFS without FUSE or
-    # openat2; MemoryDenyWriteExecute= and LockPersonality= still stop any JIT, so fex-unit relaxes them.
+    # openat2; the agentpc-fex generator relaxes MemoryDenyWriteExecute=/LockPersonality= (which
+    # stop any JIT) on its own, at the daemon-reload, with no fex-unit.
     unit = "\n".join([
         "[Service]", "Type=oneshot", "User=nobody",
         "ExecStart=/usr/local/lib/smoke-node/bin/node -p process.arch",
@@ -434,11 +435,13 @@ def x86apps(m, vm, r, guest="ubuntu"):
     ok, out = sh(
         "sudo rm -rf /usr/local/lib/smoke-node && sudo cp -r /tmp/node-v22.20.0-linux-x64 /usr/local/lib/smoke-node"
         f" && printf '%s\\n' '{unit}' | sudo tee /etc/systemd/system/smoke-x86.service >/dev/null"
-        " && sudo fex-unit smoke-x86 >/dev/null && sudo systemctl start smoke-x86"
+        " && sudo systemctl daemon-reload && sudo systemctl start smoke-x86"
         " && sudo journalctl -u smoke-x86 -n 5 --no-pager -o cat"
     )
-    r.check("a hardened systemd unit runs an x86 program (with fex-unit)", ok and "x64" in stdout(out).split(), out[-300:])
-    sh("sudo fex-unit smoke-x86 --undo >/dev/null; sudo rm -rf /etc/systemd/system/smoke-x86.service /usr/local/lib/smoke-node; sudo systemctl daemon-reload")
+    r.check("a hardened systemd unit runs an x86 program (generator, no fex-unit)", ok and "x64" in stdout(out).split(), out[-300:])
+    ok, out = sh("fex-unit --help")
+    r.check("fex-unit --help prints its usage", ok and "usage: fex-unit" in out, out[-200:])
+    sh("sudo rm -rf /etc/systemd/system/smoke-x86.service /usr/local/lib/smoke-node; sudo systemctl daemon-reload")
 
     # x86 libraries the RootFS lacks: on Ubuntu from apt (multiarch), on Arch (no multiarch)
     # installed into the x86 root filesystem with fex-pacman. Either way FEX finds them.

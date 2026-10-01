@@ -518,7 +518,7 @@ pub fn info(inst: &Instance) -> String {
         format!(
             "\n  x86 programs: FEX, {tso}\
              \n  x86-only installer (uname -m): sudo FEXBash ./install.sh; \
-             x86 service in a hardened unit: sudo fex-unit <unit>"
+             x86 service started by a script: sudo fex-unit <unit>"
         )
     } else {
         String::new()

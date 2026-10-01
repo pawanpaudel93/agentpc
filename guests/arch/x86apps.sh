@@ -181,4 +181,57 @@ systemctl daemon-reload
 EOF
 chmod 755 /usr/local/bin/fex-unit
 
+# A systemd generator does what fex-unit does for every service whose ExecStart is an x86
+# program, so hardened x86 services work as installed. It runs at boot and on every
+# `systemctl daemon-reload`; arm64 services keep their settings. fex-unit stays for units
+# that start an x86 program some other way (a script, a wrapper).
+mkdir -p /etc/systemd/system-generators
+cat > /etc/systemd/system-generators/agentpc-fex <<'EOF'
+#!/bin/sh
+# agentpc: let services whose ExecStart is an x86 program run through FEX. FEX writes and runs
+# translated code and sets the process personality; MemoryDenyWriteExecute= and LockPersonality=
+# forbid both, and the service would die at start with a SIGSEGV inside FEX. For each such
+# unit, write a drop-in that allows them. $1 is the generator output directory.
+out=${1:-/run/systemd/generator}
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+dirs='/etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system'
+is_x86() {
+    [ -f "$1" ] || return 1
+    [ "$(od -An -c -N 4 "$1" 2>/dev/null | tr -d ' ')" = 177ELF ] || return 1
+    case $(od -An -t u2 -j 18 -N 2 "$1" 2>/dev/null | tr -d ' ') in 62|3) return 0 ;; esac
+    return 1
+}
+# Only units that set either directive need a look: one grep per directory finds them.
+units=$(for dir in $dirs; do
+    [ -d "$dir" ] || continue
+    grep -lsE '^[[:space:]]*(MemoryDenyWriteExecute|LockPersonality)[[:space:]]*=[[:space:]]*(yes|true|on|1)' \
+        "$dir"/*.service "$dir"/*.service.d/*.conf
+done | sed -E 's|\.d/[^/]*$||; s|.*/||' | sort -u)
+for unit in $units; do
+    file=
+    for dir in $dirs; do
+        if [ -f "$dir/$unit" ]; then file=$dir/$unit; break; fi
+    done
+    [ -n "$file" ] || continue
+    # The last ExecStart= wins, a drop-in in /etc over the unit file.
+    exe=$(cat "$file" /etc/systemd/system/"$unit".d/*.conf 2>/dev/null |
+        sed -n 's/^[[:space:]]*ExecStart[[:space:]]*=[[:space:]]*[-@:+!]*//p' | grep -v '^$' | tail -n 1)
+    # The first word is the program (no glob expansion while splitting).
+    set -f
+    # shellcheck disable=SC2086
+    set -- $exe
+    set +f
+    exe=${1:-}
+    [ -n "$exe" ] || continue
+    case $exe in /*) ;; *) exe=$(command -v "$exe") || continue ;; esac
+    is_x86 "$exe" || continue
+    mkdir -p "$out/$unit.d"
+    printf '%s\n' "# agentpc-fex generator: $exe is an x86 program, which FEX runs." \
+        '[Service]' 'MemoryDenyWriteExecute=no' 'LockPersonality=no' > "$out/$unit.d/agentpc-fex.conf"
+done
+exit 0
+EOF
+chmod 755 /etc/systemd/system-generators/agentpc-fex
+systemctl daemon-reload
+
 FEXBash -c true

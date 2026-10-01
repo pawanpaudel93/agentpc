@@ -319,10 +319,11 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
               <code translate="no">sudo apt install libfoo:amd64</code> (or an amd64 <code translate="no">.deb</code>:
               <code translate="no">sudo apt install ./app_amd64.deb</code>); on Arch (no multiarch) x86 programs
               use the image's x86 Arch Linux tree, and <code translate="no">sudo fex-pacman -Sy --noconfirm --needed &lt;pkg&gt;</code>
-              installs more x86 packages into it. x86 systemd services run too; if the unit sets
-              <code translate="no">MemoryDenyWriteExecute=</code> or <code translate="no">LockPersonality=</code> (which stop FEX, as
-              they stop any JIT: the service dies at start with a SIGSEGV inside FEX and an AArch64 core dump),
-              <code translate="no">sudo fex-unit &lt;unit&gt;</code> relaxes just those two. An installer that refuses non-x86_64
+              installs more x86 packages into it. x86 systemd services run too, hardened ones included: for a unit
+              whose <code translate="no">ExecStart</code> is an x86 program, a generator relaxes
+              <code translate="no">MemoryDenyWriteExecute=</code> and <code translate="no">LockPersonality=</code> (they stop FEX, as
+              any JIT); a unit that runs its x86 program through a script needs
+              <code translate="no">sudo fex-unit &lt;unit&gt;</code> (else it dies with a SIGSEGV inside FEX). An installer that refuses non-x86_64
               (<code translate="no">uname -m</code>) runs unmodified under the x86 bash:
               <code translate="no">sudo FEXBash ./install.sh</code>. x86 containers work too:
               <code translate="no">docker run --platform linux/amd64 &lt;image&gt;</code> (install Docker first:
