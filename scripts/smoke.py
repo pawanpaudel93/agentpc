@@ -421,6 +421,18 @@ def x86apps(m, vm, r, guest="ubuntu"):
     ok, out = sh("sudo /tmp/node-v22.20.0-linux-x64/bin/node -p process.arch")
     r.check("x86 programs run as root too", ok and out.strip().endswith("x64"), out[-300:])
 
+    # An x86-only installer: a bash script (pipefail, arrays, [[ ]]) that refuses non-x86_64 runs
+    # unmodified under FEXBash, which must use bash (an Ubuntu RootFS's /bin/sh is dash).
+    script = (
+        "#!/usr/bin/env bash\nset -euo pipefail\narch=($(uname -m))\n"
+        "[[ ${arch[0]} == x86_64 ]] || { echo refused; exit 10; }\necho \"installer-ok $BASH_VERSION\"\n"
+    )
+    ok, out = sh(
+        f"printf '{script}' > ~/smoke-install.sh && chmod +x ~/smoke-install.sh"
+        " && sudo FEXBash ~/smoke-install.sh; rm -f ~/smoke-install.sh"
+    )
+    r.check("an x86-only bash installer runs unmodified under FEXBash", ok and "installer-ok" in stdout(out), out[-300:])
+
     # An x86 service: a hardened systemd unit (a relay's options) running as nobody, whose home
     # doesn't exist. FEX falls back to a writable directory and reads its RootFS without FUSE or
     # openat2; the agentpc-fex generator relaxes MemoryDenyWriteExecute=/LockPersonality= (which

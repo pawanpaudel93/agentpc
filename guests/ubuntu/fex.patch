@@ -6,6 +6,7 @@
 #    /tmp dir), and FEXServer's socket in the unit's directories when /tmp is read-only.
 # 4. Open files inside the RootFS when a seccomp filter refuses openat2 (systemd's
 #    RestrictSUIDSGID=), instead of falling through to the host's files.
+# 5. FEXBash runs scripts and -c with the RootFS's /bin/bash, not /bin/sh (dash on Ubuntu).
 
 diff --git a/Source/Tools/FEXInterpreter/FEXInterpreter.cpp b/Source/Tools/FEXInterpreter/FEXInterpreter.cpp
 index c2eb2fb..9986222 100644
@@ -177,3 +178,20 @@ index 7172460..7ac79e1 100644
          // This means a magic symlink (/proc/foo) was involved. In this case we
          // just punt and do the access without RESOLVE_IN_ROOT.
          fd = ::syscall(SYSCALL_DEF(openat), Path.FD, Path.Path, flags, mode);
+
+diff --git a/Source/Tools/FEXBash/FEXBash.cpp b/Source/Tools/FEXBash/FEXBash.cpp
+index ea18986..a99d7c9 100644
+--- a/Source/Tools/FEXBash/FEXBash.cpp
++++ b/Source/Tools/FEXBash/FEXBash.cpp
+@@ -46,8 +46,9 @@ int main(int argc, char** argv, char** const envp) {
+   const bool EmptyArgs = argc == 1;
+ 
+   // FEX will handle finding bash in the rootfs
+-  // Use /bin/bash for interactive mode and /bin/sh when running a script or when using -c
+-  const char* BashPath = EmptyArgs ? "/bin/bash" : "/bin/sh";
++  // agentpc: always /bin/bash. Upstream runs scripts and -c with /bin/sh, which is dash on an
++  // Ubuntu RootFS, so `FEXBash ./install.sh` broke on bash scripts (set -o pipefail, arrays).
++  const char* BashPath = "/bin/bash";
+ 
+   auto FEXPath = std::filesystem::path(argv[0]).replace_filename("FEX");
+ 
