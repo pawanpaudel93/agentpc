@@ -112,6 +112,9 @@ Rules:
 - The login for every guest is `agent` / `agent`. Everything binds to 127.0.0.1.
 - VMs you create, start, reset or restore over MCP are stopped (never deleted) when the
   session ends, unless `AGENTPC_KEEP_RUNNING=1`.
+- If a tool's options look older than what agentpc does (an OS or image `list_vms` shows that
+  `create_vm` doesn't list), your tool definitions predate an agentpc update: reconnect the
+  agentpc MCP server or start a new session. `list_vms` says when the binary was replaced.
 
 ## Working on this repo
 

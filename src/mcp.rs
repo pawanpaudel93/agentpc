@@ -31,7 +31,8 @@ use crate::{ops, qemu};
 
 const INSTRUCTIONS: &str = "\
 Controls instant, resettable Windows, Ubuntu and Arch Linux ARM desktop VMs on this Mac. Treat
-VMs as throwaway sandboxes.
+VMs as throwaway sandboxes. If list_vms shows an OS or image that create_vm's options don't
+list, your tool definitions predate an agentpc update: reconnect the agentpc MCP server.
 
 Flow: list_vms -> create_vm (or start_vm on one you created) -> take_screenshot -> list_desktop_tools ->
 use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance to a clean

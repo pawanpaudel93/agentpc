@@ -195,3 +195,6 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   the VMs are reachable from anything on the Mac.
 - VMs you create, start, reset or restore are stopped (never deleted) when the session ends,
   unless `AGENTPC_KEEP_RUNNING=1`.
+- If a tool's options look older than what agentpc does (an OS or image `list_vms` shows that
+  `create_vm` doesn't list), your tool definitions predate an agentpc update: reconnect the
+  agentpc MCP server or start a new session. `list_vms` says when the binary was replaced.
