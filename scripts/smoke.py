@@ -617,17 +617,97 @@ def x86apps(m, vm, r, guest="ubuntu"):
     r.check("the x86_64 Firefox shows the page", poll(page_window, 120, 5) is not None)
 
 
+# A pinned x64 build (a versioned file, so it can't change under the check).
+BUSYBOX_URL = "https://frippery.org/files/busybox/busybox-w64-FRP-6075-g169694ebd.exe"
+BUSYBOX_SHA256 = "07BB1E5B095B00D68A695481F9240879F33C5724B40AA2308F999D54ED78F075"
+
+
+def windows_lifecycle(m, vm, r):
+    """Jobs (a scheduled task, not Linux's setsid), forwards, checkpoints and reset on
+    Windows, whose paths through ops differ from the Linux ones."""
+    def ps(command, **kw):
+        return m.tool("run_command", name=vm, command=command, **kw)
+
+    ok, out = ps("Start-Sleep 2; 'smoke-job-done'", background=True)
+    job = re.search(r"\(id (\d+)", out)
+    if r.check("windows: background run_command returns a job id", ok and job, out[:300]):
+        def job_done():
+            _, st = m.tool("get_job_status", name=vm, id=int(job.group(1)), tail_lines=5)
+            return st if "STATE: exited 0" in st and "smoke-job-done" in st else None
+        r.check("windows: get_job_status reports the exit code and log tail", poll(job_done, 60))
+
+    ok, out = ps("Start-Sleep 60; 'late'", timeout=3)
+    r.check("windows: a foreground run stops at its timeout", not ok and "timed out after 3s" in out and "late" not in out, out[:300])
+
+    # TCP: the guest's own OpenSSH server, through an SSH tunnel.
+    ok, out = m.tool("forward_port", name=vm, guest_port=22)
+    fwd = re.search(r"127\.0\.0\.1:(\d+)", out) if ok else None
+    if r.check("windows: forward_port", fwd, out[:200]):
+        port = int(fwd.group(1))
+
+        def banner():
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as c:
+                    return c.recv(64).startswith(b"SSH-")
+            except OSError:
+                return False
+        r.check("windows: the forward reaches the guest's sshd", poll(banner, 20))
+        m.tool("delete_forward", name=vm, host_port=port)
+
+    # UDP: a QEMU host forward to a server on 0.0.0.0, which Windows' firewall must allow.
+    ps("New-NetFirewallRule -DisplayName smoke-udp -Direction Inbound -Protocol UDP -LocalPort 8766 -Action Allow | Out-Null")
+    ps(
+        "$u = New-Object System.Net.Sockets.UdpClient 8766; while ($true) { "
+        "$ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0); $d = $u.Receive([ref]$ep); "
+        "$b = [Text.Encoding]::ASCII.GetBytes('echo:' + [Text.Encoding]::ASCII.GetString($d)); "
+        "[void]$u.Send($b, $b.Length, $ep) }",
+        background=True,
+    )
+    ok, out = m.tool("forward_port", name=vm, guest_port=8766, protocol="udp")
+    fwd = re.search(r"udp 127\.0\.0\.1:(\d+)", out) if ok else None
+    if r.check("windows: forward_port with protocol udp", fwd, out[:200]):
+        port = int(fwd.group(1))
+
+        def echo():
+            u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            u.settimeout(3)
+            try:
+                u.sendto(b"smoke-udp", ("127.0.0.1", port))
+                return u.recvfrom(64)[0] == b"echo:smoke-udp"
+            except OSError:
+                return False
+            finally:
+                u.close()
+        r.check("windows: the UDP forward reaches the guest and back", poll(echo, 30))
+        m.tool("delete_forward", name=vm, host_port=port, protocol="udp")
+
+    ps("Set-Content $HOME\\smoke-marker before")
+    ok, out = m.tool("checkpoint_vm", name=vm, label="smoke")
+    if r.check("windows: checkpoint_vm", ok, out[:200]):
+        ps("Set-Content $HOME\\smoke-marker after")
+        ok, out = m.tool("restore_vm", name=vm, label="smoke")
+        _, marker = ps("Get-Content $HOME\\smoke-marker")
+        r.check("windows: restore_vm returns to the checkpoint", ok and "before" in marker and "after" not in marker, f"{out[:150]} | {marker[:100]}")
+        m.tool("delete_checkpoint", name=vm, label="smoke")
+
+    ok, out = m.tool("reset_vm", name=vm)
+    _, left = ps("Test-Path $HOME\\smoke-marker")
+    r.check("windows: reset_vm returns to a clean install", ok and "False" in left, f"{out[:150]} | {left[:100]}")
+
+
 def windows(m, vm, r):
     ok, out = m.tool("run_command", name=vm, command="$PSVersionTable.PSEdition")
     r.check("run_command runs PowerShell", ok and "Desktop" in out, out[:200])
     gateway_checks(m, vm, r)
+    windows_lifecycle(m, vm, r)
 
     # The guest is ARM64; x64 programs run through Prism, and see an AMD64 environment.
     ok, out = m.tool(
         "run_command", name=vm, timeout=180,
         command=(
             "$ProgressPreference = 'SilentlyContinue'; $f = \"$env:TEMP\\busybox.exe\"; "
-            "Invoke-WebRequest https://frippery.org/files/busybox/busybox64.exe -OutFile $f; "
+            f"Invoke-WebRequest {BUSYBOX_URL} -OutFile $f; "
+            f"if ((Get-FileHash $f).Hash -ne '{BUSYBOX_SHA256}') {{ 'busybox checksum mismatch'; exit 1 }}; "
             "\"host=$env:PROCESSOR_ARCHITECTURE\"; & $f sh -c 'echo x64=$PROCESSOR_ARCHITECTURE'"
         ),
     )
@@ -674,12 +754,30 @@ def windows(m, vm, r):
     r.check("the text landed in Notepad", poll(titled, 15))
 
 
+def reap_stale_vms(binary):
+    """Delete smoke VMs a killed earlier run left behind (its MCP server is gone, so their
+    owner isn't running); a concurrent run's VMs are left alone."""
+    m = Mcp(binary)
+    try:
+        ok, out = m.tool("list_vms")
+        if not ok:
+            return
+        listing = json.loads(out[out.index("{"):])
+        for vm in listing.get("instances", []):
+            if vm["name"].startswith("smoke-") and vm.get("owner_running") is False:
+                print(f"deleting {vm['name']}, left by an earlier run")
+                m.tool("delete_vm", name=vm["name"])
+    finally:
+        m.close()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--bin", default="agentpc", help="agentpc binary to test")
     ap.add_argument("--os", default="ubuntu,windows", help="comma-separated: ubuntu,windows,x86apps,arch,arch-x86apps")
     a = ap.parse_args()
 
+    reap_stale_vms(a.bin)
     failed = 0
     for os_name in [o.strip() for o in a.os.split(",") if o.strip()]:
         vm = f"smoke-{os_name}-{os.getpid()}"

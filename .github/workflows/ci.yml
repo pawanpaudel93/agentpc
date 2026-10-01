@@ -20,31 +20,14 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (v2.9.2)
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo build --locked --release
-      - run: cargo test --locked
-      - run: sh -n install.sh
-      - name: Syntax-check guest scripts
-        run: |
-          bash -n guests/arch/build.sh
-          for f in guests/arch/prepare.sh guests/arch/x86apps.sh guests/ubuntu/*.sh guests/helpers/*; do
-            sh -n "$f"
-          done
-      - name: shellcheck
+      # The runner image ships Node and npm; the plugin validation needs the claude CLI.
+      - name: Tools
         run: |
           command -v shellcheck >/dev/null || brew install shellcheck
-          shellcheck -S warning install.sh guests/arch/*.sh guests/ubuntu/*.sh guests/helpers/* \
-            scripts/test-guest-helpers.sh
-      - run: python3 -m py_compile scripts/smoke.py
-      - name: Plugin manifests parse
-        run: |
-          find plugin .claude-plugin -name '*.json' -print0 | xargs -0 -n1 python3 -m json.tool >/dev/null
-      # The runner image ships Node and npm.
-      - name: Validate the plugin
-        run: |
           npm install -g @anthropic-ai/claude-code@2.1.285
-          claude plugin validate plugin --strict
+      # The same checks release.sh runs before it builds.
+      - run: scripts/check.sh
+      - run: cargo build --locked --release
 
   # The helpers Linux guests install, tested against stubs with the guests' shells: dash
   # (Ubuntu's /bin/sh) and bash (Arch's).

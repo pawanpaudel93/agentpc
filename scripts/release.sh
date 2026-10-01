@@ -77,6 +77,17 @@ say "Fetching origin"
 git fetch --quiet origin main
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] ||
   die "main is not in sync with origin/main; pull or push first."
+# CI also runs what this Mac can't (the dash job); publish only a commit it passed.
+if [ "$DRY_RUN" = 0 ]; then
+  ci=$(gh run list --repo "$REPO" --workflow ci.yml --commit "$(git rev-parse HEAD)" \
+    --json status,conclusion --jq '.[0] | "\(.status) \(.conclusion)"' 2>/dev/null || true)
+  case "$ci" in
+    "completed success") ;;
+    "") die "CI hasn't run on $(git rev-parse --short HEAD) yet; push main and wait for it." ;;
+    completed*) die "CI failed on $(git rev-parse --short HEAD) ($ci); fix it first." ;;
+    *) die "CI is still running on $(git rev-parse --short HEAD); wait for it to pass." ;;
+  esac
+fi
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   die "tag $TAG already exists locally."
 fi
@@ -131,13 +142,8 @@ case "$(jq -r '.packages[0].identifier' server.json)" in
   *) die "server.json identifier not updated." ;;
 esac
 
-# --- checks (same as CI) ---------------------------------------------------
-say "cargo fmt --check"
-cargo fmt --check
-say "cargo clippy"
-cargo clippy --all-targets -- -D warnings
-say "cargo test"
-cargo test
+# --- checks (the same script CI runs) ----------------------------------------
+scripts/check.sh
 
 # --- build -----------------------------------------------------------------
 say "Building $TARGET"
