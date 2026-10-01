@@ -541,6 +541,9 @@ to arm64 as it runs; the kernel and desktop stay native. Run the program directl
   unit with `MemoryDenyWriteExecute=` or `LockPersonality=` stops FEX, as it stops any JIT:
   `sudo fex-unit <unit>` adds a drop-in that relaxes those two (`--undo` removes it). With
   `ProtectSystem=strict`, give the unit a writable directory (`StateDirectory=` or `PrivateTmp=`).
+- **x86-only installers** that check `uname -m` run unmodified under the x86 bash:
+  `sudo FEXBash ./install.sh`. Its `uname`, `useradd`, `systemctl` and other tools then run as
+  x86 programs, so the script sees an x86_64 machine.
 - **Not covered:** x86 kernel modules and drivers. It's translation, not an x86 machine.
 
 ### Hardware limits

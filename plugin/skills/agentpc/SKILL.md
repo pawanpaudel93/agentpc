@@ -179,7 +179,9 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs more x86 packages into it.
   x86 systemd services run too; if the unit sets `MemoryDenyWriteExecute=` or
   `LockPersonality=` (which stop FEX, as they stop any JIT), `sudo fex-unit <unit>` adds a
-  drop-in that relaxes just those two.
+  drop-in that relaxes just those two. An installer that refuses non-x86_64 (`uname -m`) runs
+  unmodified under the x86 bash: `sudo FEXBash ./install.sh` (its `uname` and tools then run as
+  x86 programs).
   `list_vms` shows `x86_tso`: `hardware` (fast; needs macOS 15+) or `emulated`. The first
   create downloads the image, or builds it locally (~8 min Ubuntu, ~10 min Arch) if the
   download fails.

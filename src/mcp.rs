@@ -51,7 +51,8 @@ create ubuntu or arch with version \"x86apps\": they run through FEX translation
 x86 libraries install with sudo apt install libfoo:amd64; on Arch (no multiarch), sudo fex-pacman
 -Sy --noconfirm --needed <pkg> installs x86 packages into the x86 Arch tree FEX runs them in.
 x86 systemd services run too; if the unit sets MemoryDenyWriteExecute= or LockPersonality=
-(they stop FEX, as they stop any JIT), sudo fex-unit <unit> relaxes just those two.
+(they stop FEX, as they stop any JIT), sudo fex-unit <unit> relaxes just those two. An installer
+that refuses non-x86_64 (uname -m) runs unmodified under the x86 bash: sudo FEXBash ./install.sh.
 list_vms shows x86_tso: hardware (fast; needs macOS 15+) or emulated.
 An Arch Linux ARM guest (os \"arch\") works like Ubuntu (XFCE, bash, the same desktop tools), but
 packages come from pacman (sudo pacman -Syu --noconfirm <pkg>: Arch doesn't support partial
