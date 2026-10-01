@@ -453,8 +453,10 @@ impl Gateway {
         title = "List VMs",
         description = "List VM instances (name, image, state, size, checkpoints, owner, viewer URL and, for\n\
                           running x86apps VMs, x86_tso: hardware|emulated) and which images exist.\n\
-                          Each VM shows its owner (owner_running: false once that session is gone); only\n\
-                          reset/delete/restore a VM you created, unless the user asks otherwise.",
+                          An image with `outdated` lacks this agentpc's newer guest fixes: tell the user\n\
+                          the command it gives. Each VM shows its owner (owner_running: false once that\n\
+                          session is gone); only reset/delete/restore a VM you created, unless the user\n\
+                          asks otherwise.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_vms(&self) -> CallToolResult {

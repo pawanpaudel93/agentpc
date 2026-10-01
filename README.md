@@ -259,7 +259,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 | `agentpc mcp` | Run the MCP server on stdio (what agents launch) |
 | `agentpc mcp-install [clients…]` | Register the MCP server with agents (skips Claude Code when the plugin is installed; raises Codex's MCP timeouts so slow builds and boots don't trip it) |
 | `agentpc mcp-uninstall [clients…]` | Remove it from agents again |
-| `agentpc update [--check]` | Update to the latest release (checksum-verified; images and VMs are kept). Alias: `upgrade`. If the binary's directory isn't writable, it suggests `sudo agentpc update` or reinstalling with `AGENTPC_INSTALL_DIR` |
+| `agentpc update [--check]` | Update to the latest release (checksum-verified; images and VMs are kept; `agentpc list` then marks images whose guest setup is older, and `agentpc image snapshot <image>` refreshes one). Alias: `upgrade`. If the binary's directory isn't writable, it suggests `sudo agentpc update` or reinstalling with `AGENTPC_INSTALL_DIR` |
 | `agentpc doctor` | Check prerequisites, with the macOS and QEMU versions (warns below macOS 15, where x86apps VMs get emulated TSO, and below QEMU 9.0) |
 | `agentpc clean [-n]` | Free disk space: downloads fetched again when needed (ISOs, cloud images, the ~830 MB Arch Linux ARM tarball), leftovers of interrupted builds, pulls or checkpoints, and other versions' TSO libraries. Never touches images or VMs, and keeps what a running build, pull or push uses ("kept …"); lists images no VM uses |
 | `agentpc uninstall [--keep-data] [-y]` | Remove agentpc (see [Uninstalling](#uninstalling)) |

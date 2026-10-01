@@ -606,14 +606,17 @@ pub fn create(
         let _ = std::fs::remove_dir_all(&inst.dir);
         return Err(e);
     }
-    boot(&inst).map_err(|e| {
-        anyhow::anyhow!(
-            "{e:#}\nThe VM '{name}' was created but didn't become ready (read_vm_log, or \
+    let note = crate::image::outdated(image).map(|h| format!("\n  note: the {image} image: {h}"));
+    boot(&inst)
+        .map(|s| s + &note.unwrap_or_default())
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{e:#}\nThe VM '{name}' was created but didn't become ready (read_vm_log, or \
              {}, shows why). Starting it again retries, as does create_vm with the same name \
              from the same session; deleting it starts over.",
-            inst.dir.join("qemu.log").display()
-        )
-    })
+                inst.dir.join("qemu.log").display()
+            )
+        })
 }
 
 /// `clone_disk` under the image lock, so a build, pull or snapshot can't replace the files
@@ -1057,6 +1060,8 @@ pub fn list_json() -> Result<String> {
                 "base": info.as_ref().map(|i| i.base.clone()),
                 "desktop_server": info.as_ref().map(|i| i.desktop_server.clone()),
                 "fast_start": image.has_snapshot(),
+                // Set when the image's guest setup predates this agentpc: how to refresh it.
+                "outdated": crate::image::outdated(&image),
             })
         })
         .collect();

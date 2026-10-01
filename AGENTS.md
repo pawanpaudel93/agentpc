@@ -121,6 +121,9 @@ Rules:
 - If a tool's options look older than what agentpc does (an OS or image `list_vms` shows that
   `create_vm` doesn't list), your tool definitions predate an agentpc update: reconnect the
   agentpc MCP server or start a new session. `list_vms` says when the binary was replaced.
+- An image in `list_vms` with `outdated` set was captured by an older agentpc, so it lacks newer
+  guest fixes; tell the user the command it gives (don't run it yourself; it needs that image's
+  VMs deleted).
 
 ## Working on this repo
 

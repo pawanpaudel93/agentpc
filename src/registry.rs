@@ -341,8 +341,11 @@ async fn download(image: &Image) -> Result<()> {
 
     // The old snapshot goes with the old disk: it would resume that one's RAM.
     image.remove_snapshot();
-    replace_readonly(&disk_tmp, &image.disk())?;
+    // The image exists once its disk does: take the old disk away, put the vars in, then the
+    // new disk, so an interruption never leaves a disk beside the wrong or no vars.
+    let _ = std::fs::remove_file(image.disk());
     replace_readonly(&work.join("vars.fd"), &image.vars())?;
+    replace_readonly(&disk_tmp, &image.disk())?;
     image::write_info(image, &info)?;
     std::fs::remove_dir_all(&work)?;
     log!("{image} downloaded");

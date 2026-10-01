@@ -271,6 +271,7 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
     info.arch = fresh.arch;
     info.agentpc = fresh.agentpc;
     info.desktop_server = fresh.desktop_server;
+    info.guest_scripts = guest_scripts_id(image);
     write_info(image, &info)?;
     std::thread::sleep(Duration::from_secs(settle));
 
@@ -659,6 +660,47 @@ pub struct ImageInfo {
     /// Registry reference, when the image was pulled rather than built here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pulled_from: Option<String>,
+    /// `guest_scripts_id` of the agentpc that last captured the snapshot.
+    #[serde(default)]
+    pub guest_scripts: String,
+}
+
+/// A fingerprint of the scripts a snapshot runs in an image's guest (`prepare.*`, and
+/// `x86apps.sh` with its FEX patch on x86apps images), as embedded in this binary. Each
+/// snapshot records it, so an image whose guest fixes predate this agentpc can say so.
+pub fn guest_scripts_id(image: &Image) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    if image.x86_apps() {
+        h.update(match image.os {
+            Os::Arch => ARCH_X86_APPS,
+            _ => UBUNTU_X86_APPS,
+        });
+        h.update(FEX_PATCH);
+    }
+    h.update(match image.os {
+        Os::Ubuntu => UBUNTU_PREPARE,
+        Os::Arch => ARCH_PREPARE,
+        Os::Windows => WIN_PREPARE,
+    });
+    h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// When an image's snapshot was captured by an agentpc with other guest scripts (an older
+/// one, usually: `agentpc update` doesn't touch images), what brings it up to date.
+pub fn outdated(image: &Image) -> Option<String> {
+    let info = read_info(image)?;
+    if info.guest_scripts == guest_scripts_id(image) {
+        return None;
+    }
+    Some(format!(
+        "its guest setup predates this agentpc; `{} image snapshot {image}` applies the \
+         current one (a few minutes; delete its VMs first)",
+        crate::setup::cmd_name()
+    ))
 }
 
 pub fn read_info(image: &Image) -> Option<ImageInfo> {
@@ -791,6 +833,7 @@ $cua = "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin\cua-driver.exe"
         desktop_server,
         iso_sha256: None,
         pulled_from: None,
+        guest_scripts: guest_scripts_id(&inst.image),
     })
 }
 
@@ -904,6 +947,9 @@ pub fn list() -> Result<String> {
         };
         let version = read_info(&image).map_or("version unknown".into(), |i| i.version);
         s += &format!("{image:<22} {version:<42} {size:>5.1} GB  {snap}\n");
+        if let Some(hint) = outdated(&image) {
+            s += &format!("  {image}: {hint}\n");
+        }
     }
     if s.is_empty() {
         let cmd = crate::setup::cmd_name();
@@ -1507,8 +1553,12 @@ fn promote_image(inst: &Instance) -> Result<()> {
             &tmp.to_string_lossy(),
         ],
     )?;
+    // The vars go in first, whole (a temp file renamed), then the disk: the image exists
+    // once its disk does, so an interruption can't leave one with missing or cut-off vars.
+    let vars_tmp = vars.with_extension("fd.tmp");
+    std::fs::copy(inst.vars(), &vars_tmp)?;
+    std::fs::rename(&vars_tmp, &vars)?;
     std::fs::rename(&tmp, &disk)?;
-    std::fs::copy(inst.vars(), &vars)?;
     for p in [&disk, &vars] {
         let mut perm = std::fs::metadata(p)?.permissions();
         perm.set_readonly(true);

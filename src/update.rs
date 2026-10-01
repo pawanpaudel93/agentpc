@@ -138,15 +138,17 @@ fn sha256_hex(data: &[u8]) -> String {
         .collect()
 }
 
-/// Whether `latest` is a higher X.Y.Z than `current` (pre-release suffixes ignored).
+/// Whether `latest` is a higher X.Y.Z than `current`. Missing parts count as 0 ("1.0" is
+/// "1.0.0"), and a pre-release ("0.2.0-rc1") comes before its release.
 fn is_newer(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> {
-        v.split(['-', '+'])
-            .next()
-            .unwrap_or_default()
-            .split('.')
-            .map(|p| p.parse().unwrap_or(0))
-            .collect()
+    let parse = |v: &str| -> ([u64; 3], bool) {
+        let v = v.split('+').next().unwrap_or_default();
+        let (num, pre) = v.split_once('-').map_or((v, false), |(n, _)| (n, true));
+        let mut x = [0u64; 3];
+        for (slot, p) in x.iter_mut().zip(num.split('.')) {
+            *slot = p.parse().unwrap_or(0);
+        }
+        (x, !pre)
     };
     parse(latest) > parse(current)
 }
@@ -175,5 +177,9 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.1.0"));
         assert!(!is_newer("0.1.0", "0.1.1"));
         assert!(!is_newer("0.1.0-rc1", "0.1.0"));
+        assert!(is_newer("0.2.0", "0.2.0-rc1"));
+        assert!(!is_newer("1.0", "1.0.0"));
+        assert!(!is_newer("1.0.0", "1.0"));
+        assert!(is_newer("1.0.1", "1.0"));
     }
 }

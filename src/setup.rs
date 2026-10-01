@@ -337,6 +337,11 @@ pub fn doctor() -> Result<bool> {
     for os in Os::ALL {
         if images.iter().any(|i| i.os == os) {
             println!("  ok   {os}");
+            for image in images.iter().filter(|i| i.os == os) {
+                if let Some(hint) = crate::image::outdated(image) {
+                    println!("  info {image}: {hint}");
+                }
+            }
         } else {
             let hint = match os {
                 Os::Windows => format!("{cmd} image build windows"),
@@ -511,13 +516,15 @@ fn scratch_image(name: &str) -> Option<Image> {
 }
 
 /// The image a half-written file in `images/` belongs to: `<image>.qcow2.tmp`,
-/// `<image>.snapshot.qcow2.tmp`, `<image>.snapshot.state.tmp` (and its `.machine` sidecar).
+/// `<image>.snapshot.qcow2.tmp`, `<image>.snapshot.state.tmp` (and its `.machine` sidecar),
+/// `<image>.vars.fd.tmp`.
 fn tmp_image(name: &str) -> Option<Image> {
     let s = name.strip_suffix(".machine").unwrap_or(name);
     let s = s.strip_suffix(".tmp")?;
     let s = s
         .strip_suffix(".qcow2")
-        .or_else(|| s.strip_suffix(".state"))?;
+        .or_else(|| s.strip_suffix(".state"))
+        .or_else(|| s.strip_suffix(".vars.fd"))?;
     s.strip_suffix(".snapshot").unwrap_or(s).parse().ok()
 }
 
@@ -865,6 +872,7 @@ mod tests {
             ("ubuntu-24.04.qcow2.tmp", "ubuntu-24.04"),
             ("ubuntu-24.04.snapshot.qcow2.tmp", "ubuntu-24.04"),
             ("arch-rolling.snapshot.state.tmp", "arch-rolling"),
+            ("ubuntu-24.04-x86apps.vars.fd.tmp", "ubuntu-24.04-x86apps"),
             (
                 "windows-11-25h2.snapshot.state.tmp.machine",
                 "windows-11-25h2",
