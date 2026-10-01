@@ -192,11 +192,14 @@ def deb_double_click(m, vm, r, arch, machine):
         " && xdg-mime query default application/vnd.debian.binary-package"
     )
     r.check("a .deb opens with agentpc's installer", ok and "agentpc-install-deb.desktop" in out, out[-300:])
-    status = poll(lambda: "ok installed" in stdout(sh(f"dpkg-query -W -f='${{Status}}' {pkg} 2>/dev/null; true")[1]), 120, 3)
+    # Done once the package is installed and the installer's apt has exited (dpkg marks it
+    # installed a moment before apt lets go of the lock).
+    status = poll(lambda: "ok installed" in stdout(sh(
+        f"pgrep -x apt-get >/dev/null || dpkg-query -W -f='${{Status}}' {pkg} 2>/dev/null; true")[1]), 120, 3)
     label = f"double-clicking an {arch} .deb whose preinst requires {machine} installs it" if machine \
         else "double-clicking a .deb installs it"
     r.check(label, status, "")
-    sh(f"sudo dpkg --purge {pkg} >/dev/null 2>&1; rm -rf ~/Downloads/{pkg}.deb /tmp/{pkg}")
+    sh(f"sudo apt-get -o DPkg::Lock::Timeout=60 purge -y -q {pkg} >/dev/null 2>&1; rm -rf ~/Downloads/{pkg}.deb /tmp/{pkg}")
 
 
 def arch(m, vm, r):
