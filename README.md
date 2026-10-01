@@ -226,7 +226,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 
 | Command | Description |
 | --- | --- |
-| `agentpc create <image> [name] [--memory GB] [--cpus N] [--offline]` | Create a VM from `ubuntu`, `windows`, `arch` or a version such as `ubuntu-22.04`; fetches Ubuntu and Arch images if missing. A name is up to 64 letters, digits, `.` `-` `_`. `--memory` is 2–64 GB, `--cpus` 1–16; a non-default size boots cold instead of resuming. `--offline`: no internet or access to this Mac |
+| `agentpc create <image> [name] [--memory GB] [--cpus N] [--offline]` | Create a VM from `ubuntu`, `windows`, `arch` or a version such as `ubuntu-22.04`; fetches Ubuntu and Arch images if missing. A name is up to 64 letters, digits, `.` `-` `_`. `--memory` is 2–64 GB, `--cpus` 1–16 (default 4); a non-default size boots cold instead of resuming. `--offline`: no internet or access to this Mac |
 | `agentpc list [--json]` (`ls`) | VMs and images; `--json` gives the same data as the MCP `list_vms` tool |
 | `agentpc info <name>` | Viewer URL (with the VNC password), SSH and VNC details, checkpoints, and on x86apps VMs how x86 programs run (`x86 programs: FEX, hardware\|emulated TSO`) |
 | `agentpc start <name>… \| --all` | Boot stopped VMs |
@@ -374,7 +374,7 @@ The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
   Silicon, with nothing else in between.
 - **Instant start.** After building or downloading an image, agentpc boots it once, waits
   until the desktop and its control server are running, and saves the VM's memory. New VMs
-  resume from that saved state instead of booting (~1 s / ~4 s instead of ~14 s / ~25 s). A
+  resume from that saved state instead of booting (~1 s / ~4 s instead of ~15 s / ~25 s). A
   `start` after `stop` is a normal boot; `reset` resumes a fresh copy again.
 - **Checkpoints.** A checkpoint pauses the VM for a few seconds, writes its memory to a file
   and clones its disk (an APFS copy-on-write clone, so it costs nothing until the VM writes

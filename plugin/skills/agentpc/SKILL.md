@@ -24,7 +24,7 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 | Tool | Use |
 | --- | --- |
 | `list_vms` | VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, `x86_tso`) and the available images with OS versions. Start here. |
-| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New VM (`ubuntu`, `windows` or `arch`, optionally a version such as `22.04`, `x86apps` or `22.04-x86apps`); returns when the desktop is ready. `name`: up to 64 letters, digits, `.` `-` `_`; retrying with the same `name` and image returns the VM already made (booting it if stopped). `offline: true` cuts it off from the internet and this Mac |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New VM (`ubuntu`, `windows` or `arch`, optionally a version such as `22.04`, `x86apps` or `22.04-x86apps`); returns when the desktop is ready. `name`: up to 64 letters, digits, `.` `-` `_`; retrying with the same `name` and image in the same session returns the VM already made (booting it if stopped). `offline: true` cuts it off from the internet and this Mac |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down |
 | `reset_vm(name)` | Discard all changes: back to a clean install |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save the VM's disk and memory; go back to that state in seconds; or drop one checkpoint |
@@ -131,7 +131,9 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   A hit a server in VM B, `forward_port(B, guest_port, host_port)`, then from A connect to
   `10.0.2.2:<host_port>`; for UDP pass `protocol: "udp"` and have B's server listen on `0.0.0.0`
   (a Windows guest also needs a firewall rule for it). An `offline: true` VM can't reach
-  `10.0.2.2`; its forwarded TCP ports still work (UDP forwards don't).
+  `10.0.2.2`; its forwarded TCP ports still work (UDP forwards don't). Every VM's own address
+  is `10.0.2.15`, so a service that advertises its address advertises the same one from each
+  VM; peers elsewhere reach it only through a forward.
 - **Reboots.** A reboot (Windows Update, some installers) drops SSH. Call `start_vm` on the same
   VM — it waits until the desktop is ready again — or just retry `run_command`.
 - **GUI installers** return immediately; run them silently and wait:
@@ -183,7 +185,10 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   x86 systemd services run too, hardened ones included: for a unit whose `ExecStart` is an
   x86 program, a generator relaxes `MemoryDenyWriteExecute=` and `LockPersonality=` (they stop
   FEX, as they stop any JIT). If a unit runs its x86 program another way (a script) and dies
-  at start with a SIGSEGV inside FEX, `sudo fex-unit <unit>` does the same. An installer that refuses non-x86_64 (`uname -m`) runs
+  at start with a SIGSEGV inside FEX, `sudo fex-unit <unit>` does the same. A big x86 program
+  takes longer to get going on its first start (FEX translates it; later starts reuse the
+  cache), so a health check right after `systemctl start` may need a retry. An installer that
+  refuses non-x86_64 (`uname -m`) runs
   unmodified under the x86 bash: `sudo FEXBash ./install.sh` (its `uname` and tools then run as
   x86 programs). For a paste block (`curl ... | sudo bash -s`), start `FEXBash` and paste it
   there: FEXBash's `sudo` keeps the command x86.

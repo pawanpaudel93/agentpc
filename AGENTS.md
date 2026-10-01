@@ -12,7 +12,7 @@ can run `agentpc mcp-install` (or install first: see README.md).
 | Tool | Use |
 | --- | --- |
 | `list_vms` | VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, `x86_tso`) and the images (with OS version) they come from. Start here. |
-| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New clone: ubuntu/arch ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready; `name` is up to 64 letters, digits, `.` `-` `_`. Retrying with the same `name` and image in the same session returns the VM it already made (booting it if stopped). `memory_gb` 2–64, `cpus` 1–16. `offline` cuts off the internet. |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New clone: ubuntu/arch ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready; `name` is up to 64 letters, digits, `.` `-` `_`. Retrying with the same `name` and image in the same session returns the VM it already made (booting it if stopped). `memory_gb` 2–64, `cpus` 1–16 (default 4). `offline` cuts off the internet. |
 | `start_vm` / `stop_vm` / `reset_vm` / `delete_vm` | Lifecycle. `reset_vm` = back to a clean install. |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save disk + memory before a risky step; restore in seconds; or drop one checkpoint. |
 | `take_screenshot(name, save_to?)` | Hypervisor screenshot; works even while booting or hung. `save_to` also writes the PNG to a Mac path. |
@@ -62,7 +62,9 @@ Guest tips:
   `forward_port(B, guest_port, host_port)` then connect from A to `10.0.2.2:<host_port>`; for
   UDP pass `protocol: "udp"` and have B's server listen on `0.0.0.0` (a Windows guest also needs
   a firewall rule for it). An offline VM can't reach `10.0.2.2` but forwarded TCP ports still
-  work (UDP forwards don't: its network drops the guest's UDP). A guest inherits no Mac
+  work (UDP forwards don't: its network drops the guest's UDP). Every VM's own address is
+  `10.0.2.15`, so a service that advertises its address advertises the same one from each VM;
+  peers elsewhere reach it only through a forward. A guest inherits no Mac
   proxy; set `HTTP(S)_PROXY` and import a corporate CA in the guest itself.
 - **Reboots** (Windows Update, some installers) drop SSH: call `start_vm` (it waits until the
   VM is ready again) or retry `run_command`.
@@ -86,7 +88,10 @@ Guest tips:
   x86 systemd services run too, hardened ones included: for a unit whose `ExecStart` is an
   x86 program, a generator relaxes `MemoryDenyWriteExecute=` and `LockPersonality=` (they stop
   FEX, as they stop any JIT). If a unit runs its x86 program another way (a script) and dies
-  at start with a SIGSEGV inside FEX, `sudo fex-unit <unit>` does the same. An installer that refuses non-x86_64 (`uname -m`) runs
+  at start with a SIGSEGV inside FEX, `sudo fex-unit <unit>` does the same. A big x86 program
+  takes longer to get going on its first start (FEX translates it; later starts reuse the
+  cache), so a health check right after `systemctl start` may need a retry. An installer that
+  refuses non-x86_64 (`uname -m`) runs
   unmodified under the x86 bash: `sudo FEXBash ./install.sh` (its `uname` and tools then run as
   x86 programs). For a paste block (`curl ... | sudo bash -s`), start `FEXBash` and paste it
   there: FEXBash's `sudo` keeps the command x86.

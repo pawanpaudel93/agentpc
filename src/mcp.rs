@@ -104,7 +104,9 @@ Rules:
   and returns a job id); poll it with get_job_status. Foreground run_command times out (default 120 s).
 - Reach a server in the VM from the Mac with forward_port (works even for servers bound to the
   guest's own 127.0.0.1); it returns a 127.0.0.1:<port> address and lasts until the VM stops.
-  For a UDP server pass protocol: \"udp\"; it must listen on 0.0.0.0. list_forwards /
+  For a UDP server pass protocol: \"udp\"; it must listen on 0.0.0.0 (on Windows, also allow
+  the port in its firewall: New-NetFirewallRule -Direction Inbound -Protocol UDP -LocalPort <port>
+  -Action Allow). list_forwards /
   delete_forward manage them. From inside the guest, 10.0.2.2 reaches this Mac.
 - Don't start a Windows image build yourself -- if no Windows image exists, ask the user to
   build one (~12 min).
@@ -787,7 +789,8 @@ impl Gateway {
         description = "Make a server running inside a VM reachable from this Mac: forwards a port on\n\
                           127.0.0.1 to the guest port until the VM stops. Returns the host address. TCP (default)\n\
                           reaches servers on the guest's own 127.0.0.1. protocol \"udp\" (game, DNS, QUIC, relay\n\
-                          servers) needs the guest server listening on 0.0.0.0 and doesn't work on offline VMs.\n\
+                          servers) needs the guest server listening on 0.0.0.0 (a Windows guest also needs an\n\
+                          inbound firewall rule for the port) and doesn't work on offline VMs.\n\
                           Other VMs reach a forward at 10.0.2.2:<host_port>.",
         annotations(
             read_only_hint = false,
