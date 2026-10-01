@@ -161,6 +161,42 @@ systemctl daemon-reload
 EOF
 chmod 755 /usr/local/bin/fex-unit
 
+# dpkg runs an amd64 package's maintainer scripts (preinst, postinst, ...) with the native
+# arm64 shell, so `uname -m` in them says aarch64 and an arch check in a vendor .deb refuses to
+# install, though the package's x86 programs run fine through FEX. dpkg sets
+# DPKG_MAINTSCRIPT_ARCH for those scripts; while it is amd64 or i386, these answer as that
+# machine. Anywhere else they are the real commands. They sit first on `sudo dpkg`'s PATH;
+# apt runs dpkg with its own DPkg::Path, so that gets /usr/local/bin too.
+for tool in uname arch; do
+cat > /usr/local/bin/$tool <<'EOF'
+#!/bin/sh
+# agentpc: inside an amd64/i386 package's maintainer script, answer as an x86 machine.
+case ${DPKG_MAINTSCRIPT_ARCH:-} in
+    amd64) m=x86_64 ;;
+    i386) m=i686 ;;
+    *) exec "/usr/bin/${0##*/}" "$@" ;;
+esac
+"/usr/bin/${0##*/}" "$@" | sed "s/aarch64/$m/g"
+EOF
+chmod 755 /usr/local/bin/$tool
+done
+cat > /usr/local/bin/dpkg <<'EOF'
+#!/bin/sh
+# agentpc: inside an amd64/i386 package's maintainer script, `dpkg --print-architecture` is that
+# package's architecture (its programs run through FEX); everything else is the real dpkg.
+case ${DPKG_MAINTSCRIPT_ARCH:-}:${1:-} in
+    amd64:--print-architecture | i386:--print-architecture)
+        [ $# -eq 1 ] && { echo "$DPKG_MAINTSCRIPT_ARCH"; exit 0; } ;;
+esac
+exec /usr/bin/dpkg "$@"
+EOF
+chmod 755 /usr/local/bin/dpkg
+cat > /etc/apt/apt.conf.d/99agentpc-dpkg-path <<'EOF'
+// agentpc: the PATH `sudo dpkg -i` has, so maintainer scripts run by apt find the x86 answers
+// in /usr/local/bin (uname, arch, dpkg) for amd64/i386 packages.
+DPkg::Path "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+EOF
+
 # FEXBash puts /usr/libexec/agentpc/fexbash first on PATH, for this sudo: the real sudo is
 # setuid, so it runs natively, and so would everything it starts (`curl ... | sudo bash -s`
 # would see aarch64 again). It keeps sudo's options and VAR=value assignments but has sudo start

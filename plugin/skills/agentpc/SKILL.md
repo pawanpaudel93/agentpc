@@ -175,7 +175,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   install docker.io` on Ubuntu; `sudo pacman -Syu --noconfirm docker && sudo systemctl start
   docker` on Arch), then `docker run --platform linux/amd64 ...`. x86 Electron/Chromium apps
   (VS Code, Slack, ...) need `--no-sandbox`. A missing x86 library on Ubuntu: `sudo apt install
-  libfoo:amd64`. Arch has no multiarch: x86 programs there use FEX's x86 Arch Linux tree, and
+  libfoo:amd64`; an x86 app's `.deb`: `sudo apt install ./app_amd64.deb` (its install scripts see
+  an x86_64 machine, so ones that check `uname -m` pass). Arch has no multiarch: x86 programs there use FEX's x86 Arch Linux tree, and
   `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs more x86 packages into it.
   x86 systemd services run too, hardened ones included: for a unit whose `ExecStart` is an
   x86 program, a generator relaxes `MemoryDenyWriteExecute=` and `LockPersonality=` (they stop

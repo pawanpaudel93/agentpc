@@ -522,7 +522,9 @@ to arm64 as it runs; the kernel and desktop stay native. Run the program directl
 - **Libraries.** x86 programs find the common libraries (libc, libstdc++, GTK, ...) in an x86
   tree the image ships (x86 Ubuntu or x86 Arch Linux). On Ubuntu, install anything else as the
   amd64 package: `sudo apt install libfoo:amd64` (the image has amd64 package sources set up),
-  or an amd64 `.deb` with `sudo apt install ./app_amd64.deb`. Installing an amd64 library can
+  or an amd64 `.deb` with `sudo apt install ./app_amd64.deb`; its install scripts (run by the
+  native dpkg) see an x86_64 machine in `uname -m`, `arch` and `dpkg --print-architecture`, so
+  vendor packages that check pass. Installing an amd64 library can
   upgrade its arm64 twin, since both must be the same version. Arch has no multiarch, so on
   `arch-x86apps` x86 programs use FEX's x86 Arch Linux tree, and
   `sudo fex-pacman -Sy --noconfirm --needed <pkg>` installs more x86 packages into it (the x86

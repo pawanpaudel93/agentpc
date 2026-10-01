@@ -49,7 +49,8 @@ create ubuntu or arch with version \"x86apps\": they run through FEX translation
 (Node 6-7x). Go programs work; amd64 containers work with docker run --platform linux/amd64
 (install Docker first: sudo apt install docker.io on Ubuntu; sudo pacman -Syu --noconfirm docker
 && sudo systemctl start docker on Arch); x86 Electron/Chromium apps need --no-sandbox. On Ubuntu,
-x86 libraries install with sudo apt install libfoo:amd64; on Arch (no multiarch), sudo fex-pacman
+x86 libraries install with sudo apt install libfoo:amd64 and x86 .debs with
+sudo apt install ./app_amd64.deb (their install scripts see x86_64); on Arch (no multiarch), sudo fex-pacman
 -Sy --noconfirm --needed <pkg> installs x86 packages into the x86 Arch tree FEX runs them in.
 x86 systemd services run too, hardened ones included: a generator relaxes
 MemoryDenyWriteExecute=/LockPersonality= (which stop FEX, as any JIT) for units whose ExecStart is

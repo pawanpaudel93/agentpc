@@ -317,7 +317,7 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
               <code translate="no">GODEBUG=asyncpreemptoff=1</code> for them). x86 Electron and Chromium apps need
               <code translate="no">--no-sandbox</code>. On Ubuntu a missing x86 library installs with
               <code translate="no">sudo apt install libfoo:amd64</code> (or an amd64 <code translate="no">.deb</code>:
-              <code translate="no">sudo apt install ./app_amd64.deb</code>); on Arch (no multiarch) x86 programs
+              <code translate="no">sudo apt install ./app_amd64.deb</code>, whose install scripts see an x86_64 machine); on Arch (no multiarch) x86 programs
               use the image's x86 Arch Linux tree, and <code translate="no">sudo fex-pacman -Sy --noconfirm --needed &lt;pkg&gt;</code>
               installs more x86 packages into it. x86 systemd services run too, hardened ones included: for a unit
               whose <code translate="no">ExecStart</code> is an x86 program, a generator relaxes

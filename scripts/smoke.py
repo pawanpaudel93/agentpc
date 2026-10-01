@@ -472,6 +472,30 @@ def x86apps(m, vm, r, guest="ubuntu"):
     if guest == "ubuntu":
         ok, out = sh(install("libzmq5:amd64") + load)
         r.check("apt install <lib>:amd64 gives x86 programs the library", ok and "loaded" in out.split(), out[-300:])
+        # An amd64 .deb whose maintainer scripts refuse anything but x86_64: dpkg runs them
+        # natively, so uname/arch/dpkg answer as x86 while DPKG_MAINTSCRIPT_ARCH is amd64. An
+        # arm64 package's scripts still see the real machine.
+        check = (
+            "#!/bin/sh\\n[ \\\"\\$(uname -m)/\\$(arch)/\\$(dpkg --print-architecture)\\\" = \\\"%s\\\" ]"
+            " || { echo \\\"refused \\$(uname -m)\\\" >&2; exit 1; }\\n"
+        )
+        ok, out = sh(
+            "cd /tmp && rm -rf smoke-deb && for a in amd64:x86_64/x86_64/amd64 arm64:aarch64/aarch64/arm64; do"
+            " d=smoke-deb/${a%%:*}; mkdir -p $d/DEBIAN"
+            " && printf 'Package: smoke-%s\\nVersion: 1\\nArchitecture: %s\\nMaintainer: s <s@s>\\nDescription: s\\n'"
+            " ${a%%:*} ${a%%:*} > $d/DEBIAN/control"
+            f" && printf \"{check}\" ${{a#*:}} > $d/DEBIAN/preinst && cp $d/DEBIAN/preinst $d/DEBIAN/postinst"
+            " && chmod 755 $d/DEBIAN/preinst $d/DEBIAN/postinst && dpkg-deb --build $d smoke-deb/${a%%:*}.deb >/dev/null"
+            " || exit 1; done"
+            " && sudo apt-get install -y -q ./smoke-deb/amd64.deb ./smoke-deb/arm64.deb >/dev/null"
+            " && dpkg-query -W -f='${Package}:${Architecture}=${db:Status-Abbrev}\\n' smoke-amd64 smoke-arm64"
+            "; sudo dpkg --purge smoke-amd64 smoke-arm64 >/dev/null 2>&1; rm -rf smoke-deb"
+        )
+        r.check(
+            "an amd64 .deb's maintainer scripts see x86_64; arm64 ones see aarch64",
+            ok and "smoke-amd64:amd64=ii" in out and "smoke-arm64:arm64=ii" in out,
+            out[-300:],
+        )
     else:
         ok, out = sh("sudo fex-pacman -Sy --noconfirm --needed zeromq >/dev/null 2>&1" + load)
         r.check("fex-pacman gives x86 programs the library", ok and "loaded" in out.split(), out[-300:])
