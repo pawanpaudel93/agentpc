@@ -764,7 +764,12 @@ def reap_stale_vms(binary):
             return
         listing = json.loads(out[out.index("{"):])
         for vm in listing.get("instances", []):
-            if vm["name"].startswith("smoke-") and vm.get("owner_running") is False:
+            # Ours: a smoke- name, made through this suite's MCP client, whose server is gone.
+            if (
+                vm["name"].startswith("smoke-")
+                and (vm.get("owner") or "").startswith("agentpc-smoke [")
+                and vm.get("owner_running") is False
+            ):
                 print(f"deleting {vm['name']}, left by an earlier run")
                 m.tool("delete_vm", name=vm["name"])
     finally:

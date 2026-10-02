@@ -1,0 +1,14 @@
+#!/bin/sh
+# agentpc (ubuntu-x86apps): /usr/local/bin/uname and /usr/local/bin/arch. dpkg runs an amd64
+# package's maintainer scripts (preinst, postinst, ...) with the native arm64 shell, so
+# `uname -m` in them says aarch64 and an arch check in a vendor .deb refuses to install, though
+# the package's x86 programs run fine through FEX. dpkg sets DPKG_MAINTSCRIPT_ARCH for those
+# scripts; while it is amd64 or i386, answer as that machine. Anywhere else, the real command.
+# AGENTPC_REAL (default /usr/bin) is where the real one is; tests point it at stubs.
+real=${AGENTPC_REAL:-/usr/bin}/${0##*/}
+case ${DPKG_MAINTSCRIPT_ARCH:-} in
+    amd64) m=x86_64 ;;
+    i386) m=i686 ;;
+    *) exec "$real" "$@" ;;
+esac
+"$real" "$@" | sed "s/aarch64/$m/g"

@@ -25,10 +25,10 @@ shellcheck -S warning install.sh guests/arch/*.sh guests/ubuntu/*.sh guests/help
   scripts/check.sh scripts/release.sh scripts/test-guest-helpers.sh
 
 say "guest helpers (bash)"
-bash scripts/test-guest-helpers.sh >/dev/null
+HELPER_SH=bash bash scripts/test-guest-helpers.sh >/dev/null
 if command -v dash >/dev/null 2>&1; then
   say "guest helpers (dash)"
-  dash scripts/test-guest-helpers.sh >/dev/null
+  HELPER_SH=dash dash scripts/test-guest-helpers.sh >/dev/null
 else
   echo "    (no dash here; CI's guest-helpers job runs them with it)"
 fi

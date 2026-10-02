@@ -36,21 +36,31 @@ for unit in $units; do
     dropins=$(for dir in $dirs; do
         for f in "$dir/$unit.d"/*.conf; do [ -f "$f" ] && printf '%s\n' "$f"; done
     done | awk -F/ '!seen[$NF]++ { print $NF "\t" $0 }' | sort | cut -f2-)
-    # Each ExecStart= value, prefixes (-@:+!) dropped; an empty one resets the list.
-    exe=$( { cat "$file"; for f in $dropins; do cat "$f"; done; } 2>/dev/null |
+    # Every ExecStart= that stays (a oneshot unit may have several), prefixes (-@:+!)
+    # dropped; an empty one clears those before it.
+    cmds=$( { cat "$file"; for f in $dropins; do cat "$f"; done; } 2>/dev/null |
         sed -n 's/^[[:space:]]*ExecStart[[:space:]]*=[[:space:]]*//p' |
-        awk '{ sub(/^[-@:+!]+/, "") } $0 == "" { v = ""; next } { v = $0 } END { print v }')
-    # The program: the first word, or a quoted path.
-    case $exe in
-        \"*) exe=${exe#\"}; exe=${exe%%\"*} ;;
-        \'*) exe=${exe#\'}; exe=${exe%%\'*} ;;
-        *) exe=${exe%%[[:space:]]*} ;;
-    esac
-    [ -n "$exe" ] || continue
-    case $exe in /*) ;; *) exe=$(command -v "$exe") || continue ;; esac
-    is_x86 "$exe" || continue
+        awk '{ sub(/^[-@:+!]+/, "") } $0 == "" { n = 0; next } { c[++n] = $0 }
+             END { for (i = 1; i <= n; i++) print c[i] }')
+    x86=
+    while IFS= read -r exe; do
+        # The program: the first word, or a quoted path.
+        case $exe in
+            \"*) exe=${exe#\"}; exe=${exe%%\"*} ;;
+            \'*) exe=${exe#\'}; exe=${exe%%\'*} ;;
+            *) exe=${exe%%[[:space:]]*} ;;
+        esac
+        [ -n "$exe" ] || continue
+        case $exe in /*) ;; *) exe=$(command -v "$exe") || continue ;; esac
+        if is_x86 "$exe"; then x86=$exe; break; fi
+    done <<EOF_CMDS
+$cmds
+EOF_CMDS
+    [ -n "$x86" ] || continue
     mkdir -p "$out/$unit.d"
-    printf '%s\n' "# agentpc-fex generator: $exe is an x86 program, which FEX runs." \
-        '[Service]' 'MemoryDenyWriteExecute=no' 'LockPersonality=no' > "$out/$unit.d/agentpc-fex.conf"
+    # Drop-ins apply in name order whatever their directory, so a unit's own hardening.conf
+    # would set the options back after this one; zz- sorts last.
+    printf '%s\n' "# agentpc-fex generator: $x86 is an x86 program, which FEX runs." \
+        '[Service]' 'MemoryDenyWriteExecute=no' 'LockPersonality=no' > "$out/$unit.d/zz-agentpc-fex.conf"
 done
 exit 0

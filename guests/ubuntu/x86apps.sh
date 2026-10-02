@@ -83,7 +83,11 @@ if [ -n "$rootfs_url" ]; then
         if ! { [ -f "$rootfs" ] && echo "$rootfs_sha256  $rootfs" | sha256sum -c --quiet >/dev/null 2>&1; }; then
             curl -fsSL -o "$rootfs.tmp" "$rootfs_url"
             echo "$rootfs_sha256  $rootfs.tmp" | sha256sum -c --quiet
-            umount "$mnt" 2>/dev/null || true
+            # The old one must come off first: left mounted (busy), it would stay in use
+            # under a stamp that names the new one.
+            if mountpoint -q "$mnt"; then
+                umount "$mnt" || { echo "x86 root filesystem at $mnt is busy; stop what uses it" >&2; exit 1; }
+            fi
             mv "$rootfs.tmp" "$rootfs"
         fi
         echo "$rootfs_url:$rootfs_sha256" > "$rootfs_stamp"

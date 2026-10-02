@@ -16,14 +16,17 @@ case $unit in
 esac
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 dir=/etc/systemd/system/$unit.d
+# Drop-ins apply in name order, so zz- comes after the unit's own (a hardening.conf, say).
+conf=$dir/zz-fex.conf
 if [ "${2:-}" = --undo ]; then
-    rm -f "$dir/fex.conf"
+    rm -f "$conf" "$dir/fex.conf"
     rmdir "$dir" 2>/dev/null || true
-    echo "removed $dir/fex.conf"
+    echo "removed $conf"
 else
     mkdir -p "$dir"
+    rm -f "$dir/fex.conf"
     printf '%s\n' '# From fex-unit: FEX (x86 translation) writes and runs code, and sets the personality.' \
-        '[Service]' 'MemoryDenyWriteExecute=no' 'LockPersonality=no' > "$dir/fex.conf"
-    echo "wrote $dir/fex.conf; restart $unit to apply it"
+        '[Service]' 'MemoryDenyWriteExecute=no' 'LockPersonality=no' > "$conf"
+    echo "wrote $conf; restart $unit to apply it"
 fi
 systemctl daemon-reload

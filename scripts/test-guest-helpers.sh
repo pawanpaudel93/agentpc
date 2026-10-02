@@ -1,8 +1,10 @@
 #!/bin/sh
 # Tests for guests/helpers/, the shell helpers agentpc installs in Linux guests, run without a
 # VM: stubs stand in for sudo, FEXBash, uname and dpkg (AGENTPC_REAL), and fake ELF headers
-# for programs. CI runs it with dash and bash: sh scripts/test-guest-helpers.sh
+# for programs. HELPER_SH is the shell the helpers run under (default sh); CI runs it with
+# dash (Ubuntu's /bin/sh) and bash (Arch's): HELPER_SH=dash dash scripts/test-guest-helpers.sh
 set -u
+sh_=${HELPER_SH:-sh}
 cd "$(dirname "$0")/../guests/helpers" || exit 1
 helpers=$PWD
 t=$(mktemp -d)
@@ -32,7 +34,7 @@ chmod 755 "$t/real"/*
 export AGENTPC_REAL="$t/real"
 
 # --- fexbash-sudo ---
-sudo_() { sh "$helpers/fexbash-sudo" "$@"; }
+sudo_() { "$sh_" "$helpers/fexbash-sudo" "$@"; }
 x='FEXBash|-c|exec "$@"|fexbash'
 check "sudo cmd" "sudo|/x/$x|id|" "$(sudo_ id | sed "s|$t/real|/x|g")"
 check "sudo VAR=v cmd args" "sudo|V=1|/x/$x|bash|-s|--|a|" "$(sudo_ V=1 bash -s -- a | sed "s|$t/real|/x|g")"
@@ -55,16 +57,19 @@ cp "$helpers/maintscript-uname" "$t/bin/uname"
 cp "$helpers/maintscript-uname" "$t/bin/arch"
 cp "$helpers/maintscript-dpkg" "$t/bin/dpkg"
 chmod 755 "$t/bin"/*
-check "uname -m outside a maintainer script" aarch64 "$("$t/bin/uname" -m)"
-check "uname -m in an amd64 maintainer script" x86_64 "$(DPKG_MAINTSCRIPT_ARCH=amd64 "$t/bin/uname" -m)"
+u() { "$sh_" "$t/bin/uname" "$@"; }
+a() { "$sh_" "$t/bin/arch" "$@"; }
+d() { "$sh_" "$t/bin/dpkg" "$@"; }
+check "uname -m outside a maintainer script" aarch64 "$(u -m)"
+check "uname -m in an amd64 maintainer script" x86_64 "$(DPKG_MAINTSCRIPT_ARCH=amd64 u -m)"
 check "uname -a in an amd64 maintainer script" "Linux vm 6.8.0 x86_64 GNU/Linux" \
-    "$(DPKG_MAINTSCRIPT_ARCH=amd64 "$t/bin/uname" -a)"
-check "uname -m in an i386 maintainer script" i686 "$(DPKG_MAINTSCRIPT_ARCH=i386 "$t/bin/uname" -m)"
-check "uname -m in an arm64 maintainer script" aarch64 "$(DPKG_MAINTSCRIPT_ARCH=arm64 "$t/bin/uname" -m)"
-check "arch in an amd64 maintainer script" x86_64 "$(DPKG_MAINTSCRIPT_ARCH=amd64 "$t/bin/arch" -m)"
-check "dpkg --print-architecture outside" "real-dpkg --print-architecture" "$("$t/bin/dpkg" --print-architecture)"
-check "dpkg --print-architecture in amd64" amd64 "$(DPKG_MAINTSCRIPT_ARCH=amd64 "$t/bin/dpkg" --print-architecture)"
-check "dpkg -l in amd64 is the real dpkg" "real-dpkg -l" "$(DPKG_MAINTSCRIPT_ARCH=amd64 "$t/bin/dpkg" -l)"
+    "$(DPKG_MAINTSCRIPT_ARCH=amd64 u -a)"
+check "uname -m in an i386 maintainer script" i686 "$(DPKG_MAINTSCRIPT_ARCH=i386 u -m)"
+check "uname -m in an arm64 maintainer script" aarch64 "$(DPKG_MAINTSCRIPT_ARCH=arm64 u -m)"
+check "arch in an amd64 maintainer script" x86_64 "$(DPKG_MAINTSCRIPT_ARCH=amd64 a -m)"
+check "dpkg --print-architecture outside" "real-dpkg --print-architecture" "$(d --print-architecture)"
+check "dpkg --print-architecture in amd64" amd64 "$(DPKG_MAINTSCRIPT_ARCH=amd64 d --print-architecture)"
+check "dpkg -l in amd64 is the real dpkg" "real-dpkg -l" "$(DPKG_MAINTSCRIPT_ARCH=amd64 d -l)"
 
 # --- agentpc-fex (the systemd generator) ---
 elf() { # path e_machine: a file with an ELF header for that machine (62 x86_64, 3 i386, 183 arm64)
@@ -109,12 +114,19 @@ unit "$t/lib" over.service "ExecStart=$t/armprog
 $hard"
 unit "$t/etc" over.service "ExecStart=$t/x86prog
 $hard"
-sh "$helpers/agentpc-fex" "$t/out"
+# A oneshot unit with two ExecStart=: an x86 one, then a native one; systemd runs both.
+unit "$t/lib" multi.service "Type=oneshot
+ExecStart=$t/x86prog
+ExecStart=$t/armprog
+$hard"
+"$sh_" "$helpers/agentpc-fex" "$t/out"
 got=$(cd "$t/out" 2>/dev/null && ls -d -- *.d | sort | tr '\n' ' ')
 check "generator relaxes exactly the hardened x86 units" \
-    "dropin.service.d i386.service.d over.service.d quoted.service.d x86.service.d " "$got"
+    "dropin.service.d i386.service.d multi.service.d over.service.d quoted.service.d x86.service.d " "$got"
 check "generator drop-in content" "[Service] MemoryDenyWriteExecute=no LockPersonality=no" \
-    "$(grep -v '^#' "$t/out/x86.service.d/agentpc-fex.conf" | tr '\n' ' ' | sed 's/ $//')"
+    "$(grep -v '^#' "$t/out/x86.service.d/zz-agentpc-fex.conf" | tr '\n' ' ' | sed 's/ $//')"
+check "the drop-in sorts after the unit's own (hardening.conf, 50-x.conf)" zz-agentpc-fex.conf \
+    "$(printf '%s\n' hardening.conf 50-x.conf zz-agentpc-fex.conf | sort | tail -1)"
 
 echo
 if [ "$fails" -gt 0 ]; then
