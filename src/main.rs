@@ -276,6 +276,7 @@ or use any other name (windows-custom).")]
 
 fn main() {
     ensure_path();
+    instance::secure_home();
     if let Err(e) = instance::migrate_legacy_images() {
         log!("upgrading the image layout failed: {e:#}");
     }

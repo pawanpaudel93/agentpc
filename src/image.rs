@@ -183,6 +183,7 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
     for d in [home(), cache_dir(), images_dir(), instances_dir()] {
         std::fs::create_dir_all(&d).with_context(|| format!("create {}", d.display()))?;
     }
+    crate::instance::secure_home();
     ensure_ssh_key()?;
     // Peak use: the build disk plus its flattened copy, then the image plus its snapshot.
     let need_gb = match os {
@@ -488,10 +489,6 @@ fn build_arch(image: &Image, name: &str) -> Result<()> {
     qemu::stop(inst)?;
     log!("writing the {image} image");
     let (disk, vars) = (image.disk(), image.vars());
-    let _ = std::fs::remove_file(&disk);
-    let _ = std::fs::remove_file(&vars);
-    // An old snapshot would resume the previous build if the new one fails.
-    image.remove_snapshot();
     let tmp = disk.with_extension("qcow2.tmp");
     wait_for_space(
         allocated(&target) + (1 << 30),
@@ -507,6 +504,9 @@ fn build_arch(image: &Image, name: &str) -> Result<()> {
             &tmp.to_string_lossy(),
         ],
     )?;
+    // Only now, with the new disk written whole, does the old image go: an old snapshot
+    // would resume the previous build.
+    image.remove_snapshot();
     // Blank vars: edk2 initializes them at first boot and finds systemd-boot on the disk.
     // In place whole before the disk, which is what makes the image exist.
     let vars_tmp = vars.with_extension("fd.tmp");
@@ -1643,15 +1643,12 @@ fn promote_image(inst: &Instance) -> Result<()> {
     qemu::stop(inst)?;
     log!("writing the {image} image");
     let (disk, vars) = (image.disk(), image.vars());
-    let _ = std::fs::remove_file(&disk);
-    let _ = std::fs::remove_file(&vars);
-    // An old snapshot would resume the previous build if the new one fails.
-    image.remove_snapshot();
     let tmp = disk.with_extension("qcow2.tmp");
     wait_for_space(
         allocated(&inst.disk()) + (1 << 30),
         &format!("write the {image} image"),
     )?;
+    // The old image stays usable until the new one is written whole.
     run(
         "qemu-img",
         &[
@@ -1662,6 +1659,8 @@ fn promote_image(inst: &Instance) -> Result<()> {
             &tmp.to_string_lossy(),
         ],
     )?;
+    // An old snapshot would resume the previous build.
+    image.remove_snapshot();
     // The vars go in first, whole (a temp file renamed), then the disk: the image exists
     // once its disk does, so an interruption can't leave one with missing or cut-off vars.
     let vars_tmp = vars.with_extension("fd.tmp");

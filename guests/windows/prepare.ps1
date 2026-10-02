@@ -101,6 +101,19 @@ Windows Registry Editor Version 5.00
     }
 }
 
+# SSH takes agentpc's key only: every VM's SSH port is reachable from the other VMs (at
+# 10.0.2.2) and from other users of this Mac, and the shared agent/agent login would open it
+# to them. sshd keeps the first value it reads, so these go first. Not restarted here (that
+# could drop this session); it applies from the next boot, which every snapshot is.
+Invoke-Critical 'SSH key logins only' {
+    $conf = "$env:ProgramData\ssh\sshd_config"
+    $lines = Get-Content $conf -ErrorAction Stop | Where-Object { $_ -notmatch '^\s*(PasswordAuthentication|KbdInteractiveAuthentication)\s' }
+    $new = @('# agentpc: key logins only', 'PasswordAuthentication no', 'KbdInteractiveAuthentication no') + ($lines | Where-Object { $_ -ne '# agentpc: key logins only' })
+    Set-Content -Path $conf -Value $new -Encoding ascii -ErrorAction Stop
+    & "$env:windir\System32\OpenSSH\sshd.exe" -t
+    Assert-Exit 'sshd -t'
+}
+
 if ($failed.Count -gt 0) {
     [Console]::Error.WriteLine("prepare: failed: $($failed -join ', ')")
     exit 1

@@ -261,6 +261,7 @@ async fn download(image: &Image) -> Result<()> {
     // partial writes) goes.
     let work = pull_dir(image);
     std::fs::create_dir_all(&work)?;
+    crate::instance::secure_home();
     for e in std::fs::read_dir(&work)?.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if !blobs.iter().any(|b| b.title == name) {
@@ -338,6 +339,11 @@ async fn download(image: &Image) -> Result<()> {
     }
     out.flush().await?;
     drop(out);
+    // Checked before QEMU or qemu-img ever opens it, and before the old image goes.
+    if let Err(e) = check_downloaded(&disk_tmp, &work.join("vars.fd")) {
+        let _ = std::fs::remove_file(&disk_tmp);
+        return Err(e);
+    }
 
     // The old snapshot goes with the old disk: it would resume that one's RAM.
     image.remove_snapshot();
@@ -466,8 +472,20 @@ async fn fetch_blob(
     let part = dest.with_file_name(format!("{}.part", blob.title));
     let mut file = tokio::fs::File::create(&part).await?;
     let mut hasher = Sha256::new();
+    let mut got_bytes: u64 = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        // Never more than the manifest declared: a server streaming without end would
+        // otherwise fill the disk before the checksum could catch it.
+        got_bytes += chunk.len() as u64;
+        if got_bytes > blob.size {
+            drop(file);
+            let _ = tokio::fs::remove_file(&part).await;
+            bail!(
+                "{} is larger than its manifest says; not downloading it",
+                blob.title
+            );
+        }
         hasher.update(&chunk);
         file.write_all(&chunk).await?;
         let before = done.fetch_add(chunk.len() as u64, Ordering::Relaxed);
@@ -492,6 +510,41 @@ async fn fetch_blob(
     Ok(())
 }
 
+/// A downloaded image must stand alone. A qcow2 can name a backing file or an external data
+/// file, and QEMU opens whatever it names on this Mac: an image that does could read host
+/// files into the guest. Only the header is read, so nothing it names gets opened.
+fn check_downloaded(disk: &Path, vars: &Path) -> Result<()> {
+    use std::io::Read;
+    let mut header = [0u8; 104];
+    let n = std::fs::File::open(disk)?.take(104).read(&mut header)?;
+    check_qcow2_header(&header[..n])?;
+    let vars_len = std::fs::metadata(vars)?.len();
+    if vars_len == 0 || vars_len > 256 << 20 {
+        bail!("the image's vars.fd is {vars_len} bytes; not using it");
+    }
+    Ok(())
+}
+
+fn check_qcow2_header(h: &[u8]) -> Result<()> {
+    let be32 = |o: usize| u32::from_be_bytes(h[o..o + 4].try_into().unwrap());
+    let be64 = |o: usize| u64::from_be_bytes(h[o..o + 8].try_into().unwrap());
+    if h.len() < 72 || h[..4] != *b"QFI\xfb" {
+        bail!("the downloaded disk is not a qcow2 image");
+    }
+    let version = be32(4);
+    if !(2..=3).contains(&version) {
+        bail!("the downloaded disk is qcow2 version {version}; expected 2 or 3");
+    }
+    if be64(8) != 0 || be32(16) != 0 {
+        bail!("the downloaded disk names a backing file; refusing it");
+    }
+    // Incompatible feature bit 2: an external data file.
+    if version >= 3 && (h.len() < 80 || be64(72) & 0b100 != 0) {
+        bail!("the downloaded disk uses an external data file; refusing it");
+    }
+    Ok(())
+}
+
 fn replace_readonly(from: &Path, to: &Path) -> Result<()> {
     let _ = std::fs::remove_file(to);
     std::fs::rename(from, to)?;
@@ -504,6 +557,34 @@ fn replace_readonly(from: &Path, to: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn qcow2(version: u32, backing: u64, incompat: u64) -> Vec<u8> {
+        let mut h = vec![0u8; 104];
+        h[..4].copy_from_slice(b"QFI\xfb");
+        h[4..8].copy_from_slice(&version.to_be_bytes());
+        h[8..16].copy_from_slice(&backing.to_be_bytes());
+        h[72..80].copy_from_slice(&incompat.to_be_bytes());
+        h
+    }
+
+    #[test]
+    fn downloaded_disks_must_stand_alone() {
+        assert!(check_qcow2_header(&qcow2(3, 0, 0)).is_ok());
+        assert!(check_qcow2_header(&qcow2(2, 0, 0)).is_ok());
+        // A backing file, an external data file, another format or version, a short file.
+        assert!(check_qcow2_header(&qcow2(3, 0x200, 0)).is_err());
+        assert!(check_qcow2_header(&qcow2(3, 0, 0b100)).is_err());
+        assert!(check_qcow2_header(&qcow2(4, 0, 0)).is_err());
+        assert!(
+            check_qcow2_header(
+                b"\x7fELF and more bytes than the header needs, padding padding padding padding"
+            )
+            .is_err()
+        );
+        assert!(check_qcow2_header(&qcow2(3, 0, 0)[..40]).is_err());
+        // Other incompatible bits (dirty, corrupt, compression type) are qemu's to judge.
+        assert!(check_qcow2_header(&qcow2(3, 0, 0b1)).is_ok());
+    }
 
     #[test]
     fn reads_manifest_layers() {

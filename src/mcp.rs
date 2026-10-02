@@ -430,8 +430,8 @@ struct DesktopArgs {
 #[derive(Deserialize, JsonSchema)]
 struct ScreenshotArgs {
     name: String,
-    /// Also write the PNG to this path on this Mac (absolute, or relative to the server's
-    /// working directory).
+    /// Also write the PNG to this new file on this Mac (absolute, or relative to the server's
+    /// working directory); an existing file is not overwritten.
     save_to: Option<String>,
 }
 
@@ -718,8 +718,17 @@ impl Gateway {
             blocking(move || {
                 let png = qemu::screenshot(&inst, &inst.dir.join("screen.png"))?;
                 if let Some(dst) = save_to {
-                    std::fs::write(&dst, &png)
-                        .with_context(|| format!("write {}", dst.display()))?;
+                    // A new file only (create_new also refuses a symlink there): this tool is
+                    // read-only, and save_to must not be a way to overwrite files on this Mac.
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&dst)
+                        .and_then(|mut f| f.write_all(&png))
+                        .with_context(|| {
+                            format!("write {} (save_to must be a new file)", dst.display())
+                        })?;
                 }
                 Ok(png)
             })

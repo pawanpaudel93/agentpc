@@ -15,6 +15,20 @@ pub fn home() -> PathBuf {
         })
 }
 
+/// Keep the state dir private (0700): it holds guest disks, RAM checkpoints, logs and the SSH
+/// key, and a default umask leaves a new directory readable by every local user. Inside a
+/// private directory each file's own mode no longer matters to other users.
+pub fn secure_home() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = home();
+    if let Ok(m) = std::fs::metadata(&h)
+        && m.is_dir()
+        && m.permissions().mode() & 0o077 != 0
+    {
+        let _ = std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
 pub fn cache_dir() -> PathBuf {
     home().join("cache")
 }
@@ -364,8 +378,12 @@ pub struct Instance {
 
 impl Instance {
     pub fn load(name: &str) -> Result<Self> {
+        // A name, never a path: `agentpc rm /some/dir` must not reach outside the state dir.
+        if name.is_empty() || name.starts_with('.') || name.contains('/') {
+            bail!("no instance '{name}' (see: agentpc list)");
+        }
         let dir = instances_dir().join(name);
-        if name.is_empty() || !dir.is_dir() {
+        if !dir.is_dir() {
             bail!("no instance '{name}' (see: agentpc list)");
         }
         // VMs from before versioned images only recorded their OS.
@@ -547,8 +565,9 @@ impl Instance {
             return false;
         };
         let cmd = String::from_utf8_lossy(&out.stdout);
+        // The directory with its trailing slash: VM `a`'s path is a prefix of VM `ab`'s.
         cmd.contains("qemu-system")
-            && (cmd.contains(&*self.dir.to_string_lossy())
+            && (cmd.contains(&format!("{}/", self.dir.display()))
                 || cmd.contains(&*self.qmp_socket().to_string_lossy()))
     }
 
@@ -850,7 +869,7 @@ fn runtime_dir() -> PathBuf {
 }
 
 /// Write `contents` to `path` with 0600 permissions (owner-only), for the VNC password.
-fn write_private(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()

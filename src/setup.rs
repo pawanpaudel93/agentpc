@@ -62,10 +62,14 @@ fn register_cmd(cmd: &str, args: &[&str], quiet_fail: bool) -> Result<()> {
 
 /// Merge `{"mcpServers": {"agentpc": ...}}` into a JSON config, keeping every other key.
 fn json_register(path: &Path, bin: &str) -> Result<()> {
+    // Only a missing or empty file starts from nothing: one that can't be read (not UTF-8,
+    // no permission) would otherwise be overwritten with just this entry.
     let mut cfg: Value = match std::fs::read_to_string(path) {
         Ok(s) if !s.trim().is_empty() => serde_json::from_str(&s)
             .with_context(|| format!("{} is not valid JSON; not touching it", path.display()))?,
-        _ => json!({}),
+        Ok(_) => json!({}),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => bail!("can't read {}: {e}; not touching it", path.display()),
     };
     let root = cfg
         .as_object_mut()
@@ -78,8 +82,33 @@ fn json_register(path: &Path, bin: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, serde_json::to_string_pretty(&cfg)? + "\n")?;
+    write_atomic(path, &(serde_json::to_string_pretty(&cfg)? + "\n"))?;
     Ok(())
+}
+
+/// Replace a config file whole: write a temp file beside it (keeping the old file's mode)
+/// and rename it over, so an interruption or a full disk never leaves half a config.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = path.with_file_name(format!(
+        ".{}.agentpc-{}.tmp",
+        path.file_name()
+            .map_or("config".into(), |n| n.to_string_lossy()),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, contents)
+        .and_then(|()| match std::fs::metadata(path) {
+            Ok(m) => std::fs::set_permissions(
+                &tmp,
+                std::fs::Permissions::from_mode(m.permissions().mode()),
+            ),
+            Err(_) => Ok(()),
+        })
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+        .with_context(|| format!("write {}", path.display()))
 }
 
 /// True when the agentpc Claude Code plugin is installed. The plugin already ships an MCP
@@ -97,6 +126,72 @@ fn claude_plugin_installed() -> bool {
     cfg.get("plugins")
         .and_then(Value::as_object)
         .is_some_and(|m| m.keys().any(|k| k.split('@').next() == Some(SERVER)))
+}
+
+/// Point an existing `[mcp_servers.agentpc]` in ~/.codex/config.toml at `bin`, rewriting only
+/// its `command` and `args` lines. False when there is no such section to update.
+fn codex_update_command(bin: &str) -> Result<bool> {
+    let path = user_home().join(".codex/config.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => bail!("can't read {}: {e}; not touching it", path.display()),
+    };
+    let Some(out) = codex_with_command(&text, bin) else {
+        return Ok(false);
+    };
+    write_atomic(&path, &out)?;
+    log!("updated agentpc in {}", path.display());
+    Ok(true)
+}
+
+/// `text` with the `[mcp_servers.agentpc]` section's `command` and `args` set to run `bin`,
+/// every other line as it was; None without that section.
+fn codex_with_command(text: &str, bin: &str) -> Option<String> {
+    let header = format!("[mcp_servers.{SERVER}]");
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().position(|l| l.trim() == header)?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map_or(lines.len(), |i| start + 1 + i);
+    let key = |l: &str| {
+        l.split('=')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"')
+            .to_string()
+    };
+    let command = format!("command = {}", toml_string(bin));
+    let args = "args = [\"mcp\"]".to_string();
+    let missing = |k: &str| !lines[start + 1..end].iter().any(|l| key(l) == k);
+    let mut out: Vec<String> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        let inside = i > start && i < end;
+        if inside && key(l) == "command" {
+            out.push(command.clone());
+        } else if inside && key(l) == "args" {
+            out.push(args.clone());
+        } else {
+            out.push((*l).to_string());
+        }
+        if i == start {
+            // Keys the section lacks go right under its header.
+            if missing("command") {
+                out.push(command.clone());
+            }
+            if missing("args") {
+                out.push(args.clone());
+            }
+        }
+    }
+    Some(out.join("\n") + "\n")
+}
+
+/// A TOML basic string.
+fn toml_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// codex has no CLI flag for MCP timeouts, so add them to the `[mcp_servers.agentpc]` block
@@ -143,7 +238,7 @@ fn codex_set_timeouts() -> Result<()> {
             }
         }
     }
-    std::fs::write(&path, out)?;
+    write_atomic(&path, &out)?;
     log!("set codex MCP timeouts in {}", path.display());
     Ok(())
 }
@@ -196,8 +291,11 @@ pub fn mcp_install(clients: &[String]) -> Result<()> {
                     log!("skip codex (not installed)");
                     continue;
                 }
-                register_cmd("codex", &["mcp", "remove", SERVER], true)?;
-                register_cmd("codex", &["mcp", "add", SERVER, "--", &bin, "mcp"], false)?;
+                // An existing entry keeps its other settings (env such as AGENTPC_HOME,
+                // approvals, timeouts); only the command is brought up to date.
+                if !codex_update_command(&bin)? {
+                    register_cmd("codex", &["mcp", "add", SERVER, "--", &bin, "mcp"], false)?;
+                }
                 codex_set_timeouts()?;
                 // Approving every tool is the user's call (download_file writes to this Mac),
                 // so say how rather than set it.
@@ -424,7 +522,7 @@ fn json_unregister(path: &Path, key: &str) -> Result<bool> {
         .and_then(Value::as_object_mut)
         .is_some_and(|servers| servers.remove(SERVER).is_some());
     if removed {
-        std::fs::write(path, serde_json::to_string_pretty(&cfg)? + "\n")?;
+        write_atomic(path, &(serde_json::to_string_pretty(&cfg)? + "\n"))?;
     }
     Ok(removed)
 }
@@ -537,21 +635,60 @@ fn stale_tso_lib(name: &str, current: &str) -> bool {
 }
 
 /// Whether a build, pull or snapshot of `image` holds its lock right now.
-fn image_busy(image: &Image) -> bool {
-    crate::instance::try_image_lock(image).is_none()
+/// The locks `clean` takes as it decides, held until its deletions are done: a build, pull or
+/// checkpoint must not start using a file between the check and its removal.
+#[derive(Default)]
+struct Held {
+    images: std::collections::HashMap<String, std::fs::File>,
+    other: Vec<std::fs::File>,
 }
 
-/// Whether any image's lock is held: some build may be using the shared downloads.
-fn any_image_busy() -> bool {
-    std::fs::read_dir(crate::instance::images_dir())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            name.strip_prefix('.')?.strip_suffix(".lock")?.parse().ok()
-        })
-        .any(|i: Image| image_busy(&i))
+impl Held {
+    /// Whether someone else holds `image`'s lock (else it is now ours).
+    fn image_busy(&mut self, image: &Image) -> bool {
+        let key = image.to_string();
+        if self.images.contains_key(&key) {
+            return false;
+        }
+        match crate::instance::try_image_lock(image) {
+            Some(f) => {
+                self.images.insert(key, f);
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// Whether someone else holds the lock at `path` (else it is now ours).
+    fn busy(&mut self, path: &Path) -> bool {
+        match crate::instance::try_lock(path) {
+            Some(f) => {
+                self.other.push(f);
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// Whether any image's lock is held elsewhere: some build may be using the shared
+    /// downloads.
+    fn any_image_busy(&mut self) -> bool {
+        let images: Vec<Image> = std::fs::read_dir(crate::instance::images_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.strip_prefix('.')?.strip_suffix(".lock")?.parse().ok()
+            })
+            .collect();
+        // Every lock taken, not only up to the first busy one.
+        let mut busy = false;
+        for i in &images {
+            busy |= self.image_busy(i);
+        }
+        busy
+    }
 }
 
 /// Delete what can be downloaded or rebuilt again, and leftovers of interrupted work.
@@ -561,7 +698,8 @@ pub fn clean(dry_run: bool) -> Result<String> {
     use crate::instance::{Instance, cache_dir, images_dir, instances_dir};
     let mut targets: Vec<(PathBuf, &str)> = Vec::new();
     let mut in_use: Vec<PathBuf> = Vec::new();
-    let building = any_image_busy();
+    let mut held = Held::default();
+    let building = held.any_image_busy();
     for e in std::fs::read_dir(cache_dir())
         .into_iter()
         .flatten()
@@ -575,8 +713,8 @@ pub fn clean(dry_run: bool) -> Result<String> {
         let pull = name.strip_prefix("pull-").and_then(|i| i.parse().ok());
         let push = name.strip_prefix("push-").and_then(|i| i.parse().ok());
         let live = match (&pull, &push) {
-            (Some(i), _) => image_busy(i),
-            (_, Some(i)) => crate::instance::try_lock(&crate::registry::push_lock(i)).is_none(),
+            (Some(i), _) => held.image_busy(i),
+            (_, Some(i)) => held.busy(&crate::registry::push_lock(i)),
             // Cloud images, ISOs and drivers a running build may be reading.
             _ => building,
         };
@@ -609,8 +747,8 @@ pub fn clean(dry_run: bool) -> Result<String> {
         if name.starts_with('_') {
             // The image it makes, or the one it runs (an Arch build's helper drops that
             // one's lock once cloned, so the name is what counts there).
-            let live = scratch_image(&name).is_some_and(|i| image_busy(&i))
-                || inst.as_ref().is_some_and(|i| image_busy(&i.image));
+            let live = scratch_image(&name).is_some_and(|i| held.image_busy(&i))
+                || inst.as_ref().is_some_and(|i| held.image_busy(&i.image));
             if live {
                 in_use.push(e.path());
                 continue;
@@ -631,10 +769,7 @@ pub fn clean(dry_run: bool) -> Result<String> {
         }
         // A real VM: sweep only unfinished checkpoint temp dirs, never a real checkpoint, and
         // none while a lifecycle operation (a checkpoint being written, say) holds its lock.
-        if inst
-            .as_ref()
-            .is_some_and(|i| crate::instance::try_lock(&i.lock_path()).is_none())
-        {
+        if inst.as_ref().is_some_and(|i| held.busy(&i.lock_path())) {
             continue;
         }
         let valid = inst
@@ -663,7 +798,7 @@ pub fn clean(dry_run: bool) -> Result<String> {
         let name = e.file_name().to_string_lossy().into_owned();
         if name.ends_with(".tmp") || name.ends_with(".tmp.machine") {
             let live = match tmp_image(&name) {
-                Some(i) => image_busy(&i),
+                Some(i) => held.image_busy(&i),
                 None => building,
             };
             if live {
@@ -847,6 +982,65 @@ pub fn uninstall(keep_data: bool, yes: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn json_register_never_overwrites_an_unreadable_config() {
+        let dir = std::env::temp_dir().join(format!("agentpc-jr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("mcp.json");
+        // Not UTF-8: reading fails, and the file must stay as it was.
+        std::fs::write(&cfg, b"{\"mcpServers\": {\"x\": \"\xff\"}}").unwrap();
+        assert!(super::json_register(&cfg, "/bin/agentpc").is_err());
+        assert_eq!(
+            std::fs::read(&cfg).unwrap(),
+            b"{\"mcpServers\": {\"x\": \"\xff\"}}"
+        );
+        // A good config keeps its other servers, and no temp file is left behind.
+        std::fs::write(
+            &cfg,
+            r#"{"mcpServers": {"other": {"command": "x"}}, "theme": 1}"#,
+        )
+        .unwrap();
+        super::json_register(&cfg, "/bin/agentpc").unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["other"]["command"], "x");
+        assert_eq!(v["mcpServers"]["agentpc"]["command"], "/bin/agentpc");
+        assert_eq!(v["theme"], 1);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // A missing file is created.
+        let fresh = dir.join("new.json");
+        super::json_register(&fresh, "/bin/agentpc").unwrap();
+        assert!(fresh.is_file());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn codex_update_keeps_other_settings() {
+        let text = "[other]\nx = 1\n\n[mcp_servers.agentpc]\ncommand = \"/old/agentpc\"\nargs = [\"mcp\"]\n\
+                    tool_timeout_sec = 1200\nenv = { AGENTPC_HOME = \"/vms\" }\n\n[tail]\ny = 2\n";
+        let out = super::codex_with_command(text, "/new/agent \"pc\"").unwrap();
+        assert!(out.contains("command = \"/new/agent \\\"pc\\\"\""), "{out}");
+        assert!(!out.contains("/old/agentpc"));
+        for keep in [
+            "tool_timeout_sec = 1200",
+            "AGENTPC_HOME = \"/vms\"",
+            "[other]",
+            "x = 1",
+            "[tail]",
+            "y = 2",
+        ] {
+            assert!(out.contains(keep), "lost {keep}: {out}");
+        }
+        assert_eq!(out.matches("args = ").count(), 1);
+        // A section without command/args gets them; no section: nothing to update.
+        let out = super::codex_with_command("[mcp_servers.agentpc]\nenv = {}\n", "/b").unwrap();
+        assert!(
+            out.contains("command = \"/b\"") && out.contains("args = [\"mcp\"]"),
+            "{out}"
+        );
+        assert!(super::codex_with_command("[mcp_servers.other]\n", "/b").is_none());
+    }
+
     use super::*;
 
     #[test]

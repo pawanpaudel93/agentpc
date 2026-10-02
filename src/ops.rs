@@ -15,7 +15,7 @@ use crate::{log, qemu, viewer};
 pub const LINUX_SESSION_ENV: &str = "DISPLAY=:0 XAUTHORITY=/home/agent/.Xauthority \
      XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus";
 
-pub const SSH_OPTS: [&str; 16] = [
+pub const SSH_OPTS: [&str; 24] = [
     "-o",
     "StrictHostKeyChecking=no",
     "-o",
@@ -35,6 +35,16 @@ pub const SSH_OPTS: [&str; 16] = [
     // MaxAuthTries before ours is tried.
     "-o",
     "IdentitiesOnly=yes",
+    // The guest is untrusted: never hand it the user's ssh-agent or X display (a ~/.ssh/config
+    // `Host *` might), and never share a connection with the user's own sessions.
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPath=none",
 ];
 
 /// `ssh` argv (without the program) that runs `remote` in the instance.
@@ -460,11 +470,11 @@ pub fn clone_disk(inst: &Instance) -> Result<()> {
     Ok(())
 }
 
+/// Writable by its owner (set_readonly(false) would make it writable by everyone).
 pub fn set_writable(p: &Path) -> Result<()> {
-    let mut perm = std::fs::metadata(p)?.permissions();
-    #[allow(clippy::permissions_set_readonly_false)]
-    perm.set_readonly(false);
-    std::fs::set_permissions(p, perm)?;
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(p)?.permissions().mode();
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode | 0o200))?;
     Ok(())
 }
 

@@ -16,15 +16,53 @@ const NOVNC: &str = "v1.6.0";
 const NOVNC_SHA256: &str = "5066103959ef4e9b10f37e5a148627360dd8414e4cf8a7db92bdbd022e728aaa";
 
 pub fn url(inst: &Instance) -> String {
-    // The per-VM VNC password (if set) is handed to noVNC so the URL still auto-connects.
+    // A page served on this port reads the password, so only ever hand it to our own viewer.
+    if !ours() {
+        return format!(
+            "unavailable: 127.0.0.1:{PORT} is in use by another program (VNC on 127.0.0.1:{})",
+            inst.vnc_port()
+        );
+    }
+    // The per-VM VNC password (if set) is handed to noVNC so the URL still auto-connects. It
+    // goes in the fragment, which noVNC reads and a browser never sends in a request.
     let pass = inst
         .vnc_password()
         .map(|p| format!("&password={p}"))
         .unwrap_or_default();
     format!(
-        "http://127.0.0.1:{PORT}/vnc.html?autoconnect=1&resize=scale&host=127.0.0.1&port={}&path={pass}",
+        "http://127.0.0.1:{PORT}/vnc.html#autoconnect=1&resize=scale&host=127.0.0.1&port={}&path={pass}",
         inst.ws_port()
     )
+}
+
+/// What our viewer answers at `/.agentpc-viewer`: a random token in a private file, which
+/// another program on this port can't know.
+fn token_file() -> PathBuf {
+    home().join("viewer.token")
+}
+
+/// Whether the server on PORT is our viewer (it answers with the token).
+fn ours() -> bool {
+    use std::io::{Read, Write};
+    let Ok(token) = read_trimmed(&token_file()) else {
+        return false;
+    };
+    let Ok(mut s) =
+        TcpStream::connect_timeout(&([127, 0, 0, 1], PORT).into(), Duration::from_millis(300))
+    else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+    if s.write_all(b"GET /.agentpc-viewer HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut body = String::new();
+    let _ = s.take(4096).read_to_string(&mut body);
+    body.split("\r\n\r\n")
+        .nth(1)
+        .is_some_and(|b| b.trim() == token)
 }
 
 fn novnc_dir() -> PathBuf {
@@ -91,9 +129,32 @@ fn listening() -> bool {
 /// Start the detached viewer server if it isn't up.
 pub fn ensure_running() -> Result<()> {
     if listening() {
-        return Ok(());
+        if ours() {
+            return Ok(());
+        }
+        // An older agentpc's viewer (it has no token) gives way to this one; anything else
+        // keeps the port, and no VM's password goes near it.
+        match read_trimmed(&pid_file()).and_then(|p| Ok(p.parse::<i32>()?)) {
+            Ok(pid) if pid_is_our_viewer(pid) => {
+                kill(pid, 15);
+                for _ in 0..20 {
+                    if !listening() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            _ => bail!("127.0.0.1:{PORT} is in use by another program; the browser viewer is off"),
+        }
     }
     ensure_novnc()?;
+    // A fresh token for this viewer, private to this user.
+    let mut buf = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+        .context("read /dev/urandom")?;
+    let token: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    crate::instance::write_private(&token_file(), &token)?;
     use std::os::unix::process::CommandExt;
     let child = Command::new(std::env::current_exe()?)
         .arg("__viewer")
@@ -150,7 +211,10 @@ pub fn serve() -> Result<()> {
             path
         };
         let file = root.join(&path);
-        let resp = if !path.contains("..") && file.is_file() {
+        let resp = if path == ".agentpc-viewer" {
+            let token = read_trimmed(&token_file()).unwrap_or_default();
+            tiny_http::Response::from_string(token).boxed()
+        } else if !path.contains("..") && file.is_file() {
             let mime = match file.extension().and_then(|e| e.to_str()) {
                 Some("html") => "text/html",
                 Some("js") => "text/javascript",

@@ -45,6 +45,17 @@ cat > /etc/chromium/policies/managed/agentpc.json <<'EOF'
 }
 EOF
 
+# SSH takes agentpc's key only. Every VM's SSH port is reachable from the other VMs (at
+# 10.0.2.2) and from other users of this Mac, and the shared agent/agent login would open it
+# to them. sshd keeps the first value it reads, so 00- comes before any other drop-in.
+mkdir -p /etc/ssh/sshd_config.d
+printf '%s\n' '# agentpc: key logins only' 'PasswordAuthentication no' 'KbdInteractiveAuthentication no' \
+    > /etc/ssh/sshd_config.d/00-agentpc.conf
+grep -qs '^Include /etc/ssh/sshd_config.d/\*.conf' /etc/ssh/sshd_config ||
+    sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+sshd -t
+systemctl reload ssh 2>/dev/null || systemctl reload sshd
+
 # Smaller images: drop downloaded packages and old logs, then hand free blocks back to the
 # qcow2 (the disk is attached with discard). The sync databases stay so `pacman -S` works.
 # (-Scc's cache prompt defaults to No, so --noconfirm alone would keep the packages.)
