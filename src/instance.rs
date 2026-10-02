@@ -924,6 +924,22 @@ pub fn mac_timezone() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn instance_names_are_never_paths() {
+        for bad in [
+            "",
+            "/etc",
+            "/Users/x/Downloads/thing",
+            "../images",
+            "a/b",
+            ".hidden",
+            "..",
+        ] {
+            let err = super::Instance::load(bad).unwrap_err().to_string();
+            assert!(err.starts_with("no instance"), "{bad}: {err}");
+        }
+    }
+
     use super::{Image, Os, fnv1a, slot_host_ports};
 
     #[test]

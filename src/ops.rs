@@ -126,6 +126,9 @@ pub fn forward(
     if guest_port == 0 || host_port == Some(0) {
         bail!("ports are 1-65535 (leave host_port out for a free one)");
     }
+    // Under the VM's lock: two forwards can't both claim one host port, and a reset can't
+    // swap QEMU out from under a UDP hostfwd being added.
+    let _lock = inst.lock()?;
     if !inst.running() {
         bail!("{} is not running; start it first", inst.name);
     }
@@ -1137,6 +1140,26 @@ pub fn set_owner(inst: &Instance, owner: &str) -> Result<()> {
     Ok(())
 }
 
+/// Make `owner` the VM's owner, under its lock: an orphan stop or another session's exit,
+/// which check the owner under the same lock, then see this one.
+pub fn claim(inst: &Instance, owner: &str) -> Result<()> {
+    let _lock = inst.lock()?;
+    set_owner(inst, owner)
+}
+
+/// Stop the VM if its owner tag still ends with `tag` (this session's), checked under its
+/// lock: another session may have taken it over.
+pub fn stop_if_owned(inst: &Instance, tag: &str) -> Result<bool> {
+    let _lock = inst.lock()?;
+    if !inst.running() || !owner(inst).is_some_and(|o| o.ends_with(tag)) {
+        return Ok(false);
+    }
+    stop_forwards(inst);
+    qemu::stop(inst)?;
+    viewer::stop_if_idle();
+    Ok(true)
+}
+
 /// AGENTPC_KEEP_RUNNING=1: VMs an MCP server starts outlive it.
 pub fn keep_running() -> bool {
     std::env::var_os("AGENTPC_KEEP_RUNNING").is_some_and(|v| v == "1")
@@ -1301,6 +1324,7 @@ pub fn remove_forward(
     host_port: u16,
     protocol: Option<Protocol>,
 ) -> Result<String> {
+    let _lock = inst.lock()?;
     let dir = inst.dir.join("forwards");
     let mut removed = Vec::new();
     for p in [Protocol::Tcp, Protocol::Udp] {

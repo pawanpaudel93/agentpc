@@ -61,6 +61,9 @@ pub fn push(image: &Image) -> Result<()> {
         &push_lock(image),
         Some(&format!("waiting for another push of {image} to finish")),
     )?;
+    // The image lock while its disk, vars and info are copied out, so a snapshot, build or
+    // pull can't swap one of them mid-way (the upload after works on the copies).
+    let image_lock = crate::instance::image_lock(image)?;
     let mut info = image::read_info(image).with_context(|| {
         format!("{image} has no version info; run: {cmd} image snapshot {image}")
     })?;
@@ -97,6 +100,7 @@ pub fn push(image: &Image) -> Result<()> {
         image::write_info(image, &info)?;
     }
     std::fs::write(work.join("config.json"), serde_json::to_vec(&info)?)?;
+    drop(image_lock);
 
     let mut parts: Vec<String> = std::fs::read_dir(&work)?
         .flatten()

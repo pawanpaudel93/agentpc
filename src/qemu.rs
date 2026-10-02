@@ -210,8 +210,14 @@ fn pause_and_save(inst: &Instance, q: &mut Qmp, out: &Path) -> Result<()> {
         let st = q.execute("query-migrate", None)?;
         match st["status"].as_str().unwrap_or("") {
             "completed" => {
-                // Record the machine type so this state resumes on the same machine.
-                let _ = std::fs::write(machine_sidecar(out), machine_type());
+                // Record the machine type so this state resumes on the same machine: the one
+                // this VM runs on, not the current default.
+                let machine = std::fs::read_to_string(inst.dir.join("machine"))
+                    .ok()
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(machine_type);
+                std::fs::write(machine_sidecar(out), machine)?;
                 return Ok(());
             }
             "failed" | "cancelled" => bail!(
@@ -241,6 +247,9 @@ fn launch(
         Some(state) => resume_machine(state),
         None => machine_type(),
     };
+    // What this run is on: a checkpoint of it must resume on the same machine, which after a
+    // QEMU upgrade isn't the default one.
+    std::fs::write(d.join("machine"), &machine)?;
     let fwd = format!("hostfwd=tcp:127.0.0.1:{}-:22", inst.ssh_port());
     let (mem, cpus) = inst.size();
     let mut args: Vec<String> = vec![
@@ -435,6 +444,19 @@ pub fn quit(inst: &Instance) {
     }
     if inst.running() {
         kill(pid, 9);
+        wait_gone(inst);
+    }
+}
+
+/// After a SIGKILL: wait until QEMU is really gone (its disk and sockets released) before a
+/// caller replaces or deletes them.
+fn wait_gone(inst: &Instance) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while inst.running() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if inst.running() {
+        log!("{}: QEMU still hasn't exited after SIGKILL", inst.name);
     }
 }
 
@@ -454,6 +476,10 @@ pub fn stop(inst: &Instance) -> Result<()> {
     std::thread::sleep(Duration::from_secs(2));
     if inst.running() {
         kill(pid, 9);
+        wait_gone(inst);
+    }
+    if inst.running() {
+        bail!("{}: QEMU would not exit", inst.name);
     }
     Ok(())
 }

@@ -225,6 +225,7 @@ pub(crate) fn build_locked(image: &Image, iso: Option<PathBuf>) -> Result<()> {
         record_iso(&mut info, p)?;
     }
     info.built = crate::instance::local_date();
+    info.base_setup = base_setup_id(image);
     promote_image(&guard.inst)?;
     // The image disk is written and the build VM removed; snapshot_locked guards its own VM.
     guard.keep();
@@ -535,6 +536,7 @@ fn build_arch(image: &Image, name: &str) -> Result<()> {
         ),
         built,
         agentpc: env!("CARGO_PKG_VERSION").into(),
+        base_setup: base_setup_id(image),
         ..Default::default()
     };
     write_info(image, &info)?;
@@ -766,6 +768,9 @@ pub struct ImageInfo {
     /// `guest_scripts_id` of the agentpc that last captured the snapshot.
     #[serde(default)]
     pub guest_scripts: String,
+    /// `base_setup_id` of the agentpc that built the image (empty: built before it was kept).
+    #[serde(default)]
+    pub base_setup: String,
 }
 
 /// A fingerprint of the scripts a snapshot runs in an image's guest (`prepare.*`, and
@@ -798,10 +803,54 @@ pub fn guest_scripts_id(image: &Image) -> String {
         .collect()
 }
 
-/// When an image's snapshot was captured by an agentpc with other guest scripts (an older
-/// one, usually: `agentpc update` doesn't touch images), what brings it up to date.
+/// A fingerprint of what only a build installs: the first-boot setup (cloud-init, the Arch
+/// build script, Windows' unattended setup) and the desktop-control server's version. A
+/// snapshot can't apply changes to these; a rebuild (or a newer pull) can.
+pub fn base_setup_id(image: &Image) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(CUA_DRIVER_VERSION);
+    match image.os {
+        Os::Ubuntu => h.update(UBUNTU_USER_DATA),
+        Os::Arch => h.update(ARCH_BUILD),
+        Os::Windows => {
+            h.update(WIN_AUTOUNATTEND);
+            h.update(WIN_SETUP_COMPLETE);
+            for (name, body) in WIN_OEM {
+                h.update(name);
+                h.update(body);
+            }
+        }
+    }
+    h.finalize()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// When an image predates this agentpc (an older one built or captured it, usually:
+/// `agentpc update` doesn't touch images), what brings it up to date.
 pub fn outdated(image: &Image) -> Option<String> {
     let info = read_info(image)?;
+    // An image built before base_setup was kept is not known to be out of date.
+    if !info.base_setup.is_empty() && info.base_setup != base_setup_id(image) {
+        let how = if image.pinned() {
+            format!(
+                "a newer one: {} image pull {}",
+                crate::setup::cmd_name(),
+                image.os
+            )
+        } else {
+            format!(
+                "`{cmd} image build {image}` (or `{cmd} image pull {image}` when published)",
+                cmd = crate::setup::cmd_name()
+            )
+        };
+        return Some(format!(
+            "its first-boot setup (desktop driver, installed packages) predates this agentpc; \
+             {how} brings it up to date (delete its VMs first)"
+        ));
+    }
     if info.guest_scripts == guest_scripts_id(image) {
         return None;
     }
@@ -943,6 +992,7 @@ $cua = "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin\cua-driver.exe"
         iso_sha256: None,
         pulled_from: None,
         guest_scripts: guest_scripts_id(&inst.image),
+        base_setup: String::new(),
     })
 }
 
@@ -1200,6 +1250,19 @@ fn windows_iso(version: &str, iso: Option<PathBuf>) -> Result<PathBuf> {
                     p.display(),
                     found.replace('-', " ").to_ascii_uppercase()
                 );
+            }
+            // An ISO agentpc downloaded earlier is checked again before use (a cut-off or
+            // altered copy is fetched again); one the user passed is theirs to vouch for.
+            if let Some(w) = windows_iso_entry(version)
+                && p == downloaded_iso_path(w)
+            {
+                log!("verifying the cached Windows ISO");
+                let size = std::fs::metadata(&p)?.len();
+                if size != w.size || sha256_file(&p)? != w.sha256 {
+                    log!("the cached Windows ISO doesn't match its checksum; downloading it again");
+                    std::fs::remove_file(&p)?;
+                    return download_windows_iso(w);
+                }
             }
             Ok(p)
         }

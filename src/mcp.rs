@@ -256,7 +256,7 @@ impl Gateway {
     /// the auto-stop set agree.
     fn claim(&self, name: &str, ctx: &RequestContext<RoleServer>) {
         if let Ok(inst) = load(name) {
-            let _ = ops::set_owner(&inst, &self.owner_tag(ctx));
+            let _ = ops::claim(&inst, &self.owner_tag(ctx));
             self.owned.lock().unwrap().insert(name.to_string());
         }
     }
@@ -284,17 +284,19 @@ impl Gateway {
             running.len()
         );
         let stops = running.iter().cloned().map(|inst| {
-            blocking(move || {
-                // Tear down this VM's port forwards before it stops, so no stale tunnel or
-                // pid file is left behind.
-                ops::stop_forwards(&inst);
-                ops::stop(&inst)
-            })
+            let mine = mine.clone();
+            // Checked again under the VM's lock: it may have changed hands since.
+            blocking(move || ops::stop_if_owned(&inst, &mine))
         });
         let _ =
             tokio::time::timeout(Duration::from_secs(45), futures::future::join_all(stops)).await;
         for inst in &running {
-            if inst.running() {
+            // Force-quit only what is still ours (a lock held past the timeout is someone
+            // else's operation; their VM is theirs).
+            if inst.running()
+                && ops::owner(inst).is_some_and(|o| o.ends_with(&mine))
+                && crate::instance::try_lock(&inst.lock_path()).is_some()
+            {
                 qemu::quit(inst);
             }
         }
@@ -539,12 +541,40 @@ impl Gateway {
                 || ops::owner_alive(&inst) == Some(false))
             && Image::resolve(&image).is_ok_and(|i| i == inst.image)
         {
+            // Settings asked for again must match: an `offline: true` retry must never come
+            // back with an online VM.
+            let (mem, cpus) = inst.size();
+            let differs = [
+                (a.offline != inst.offline()).then(|| format!("offline is {}", inst.offline())),
+                a.memory_gb
+                    .filter(|&m| m != mem)
+                    .map(|_| format!("memory_gb is {mem}")),
+                a.cpus
+                    .filter(|&c| c != cpus)
+                    .map(|_| format!("cpus is {cpus}")),
+            ];
+            let differs: Vec<String> = differs.into_iter().flatten().collect();
+            if !differs.is_empty() {
+                return text(Err(anyhow!(
+                    "VM {name} already exists with other settings ({}); pick another name, or \
+                     delete_vm it first",
+                    differs.join(", ")
+                )));
+            }
             self.claim(name, &ctx);
             // Through boot even when QEMU runs: a VM that never became ready is waited for
             // again (and a paused one resumed), rather than reported ready.
             return text(with_progress(&ctx, move || ops::boot(&inst)).await);
         }
         let requested = a.name.clone();
+        // Tracked before it boots: a client that disconnects mid-create must still have it
+        // stopped (shutdown stops only VMs whose owner tag is this session's, which create
+        // writes before the first boot).
+        if let Some(n) = &requested
+            && load(n).is_err()
+        {
+            self.owned.lock().unwrap().insert(n.clone());
+        }
         let tag = owner.clone();
         let res = with_progress(&ctx, move || {
             ops::create(
@@ -1137,6 +1167,18 @@ impl Gateway {
         self.sessions.lock().unwrap().remove(name);
     }
 
+    /// Forget `failed`, if it is still the VM's connection: a call that failed on an old one
+    /// must not throw away the replacement another call has made since.
+    async fn drop_client(&self, name: &str, failed: &Client) {
+        let slot = self.sessions.lock().unwrap().get(name).cloned();
+        if let Some(slot) = slot {
+            let mut slot = slot.lock().await;
+            if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, failed)) {
+                *slot = None;
+            }
+        }
+    }
+
     async fn session(&self, name: &str) -> Result<Client> {
         let slot = self
             .sessions
@@ -1178,6 +1220,7 @@ impl Gateway {
         };
         for attempt in 1..=2 {
             let client = self.session(name).await?;
+            let used = client.clone();
             // A hung desktop tool must not wedge the call forever; treat a stall like a
             // transport failure so we reconnect once, then give up.
             let call = tokio::time::timeout(DESKTOP_CALL_TIMEOUT, f(client)).await;
@@ -1187,7 +1230,7 @@ impl Gateway {
                     bail!("{what} failed in {name}: {}", e.message)
                 }
                 Ok(Err(e)) => {
-                    self.drop_session(name);
+                    self.drop_client(name, &used).await;
                     if !retry {
                         return Err(unknown(format!(
                             "the connection to the desktop driver dropped ({e})"
@@ -1198,7 +1241,7 @@ impl Gateway {
                     }
                 }
                 Err(_) => {
-                    self.drop_session(name);
+                    self.drop_client(name, &used).await;
                     if !retry {
                         return Err(unknown(format!(
                             "no reply within {}s",
@@ -1358,7 +1401,15 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
         bail!("VM {name} is not running; start_vm first");
     }
     let id = job_id();
-    let b64 = base64::engine::general_purpose::STANDARD.encode(command);
+    // On Windows, as in the foreground: a failed last command (a cmdlet error sets no exit
+    // code) ends the job with its native code, or 1, rather than a 0 that looks like success.
+    let script = match inst.os {
+        Os::Windows => format!(
+            "{command}\n$__agentpc_ok = $?\nif (-not $__agentpc_ok) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}"
+        ),
+        Os::Ubuntu | Os::Arch => command.to_string(),
+    };
+    let b64 = base64::engine::general_purpose::STANDARD.encode(script);
     let script = match inst.os {
         // Separate lines: `a && b &` would background the whole list, and that shell would
         // hold the SSH session open. The wrapper records the exit code in <id>.exit so
@@ -1367,6 +1418,7 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
             "d=~/agentpc-bg; mkdir -p $d && echo {b64} | base64 -d > $d/{id}.sh || exit 1\n\
              {env} setsid nohup bash -c 'bash \"$0\"; echo $? > \"$1\"' \
              $d/{id}.sh $d/{id}.exit > $d/{id}.log 2>&1 < /dev/null &\n\
+             echo $! > $d/{id}.pid\n\
              echo \"started in the background (id {id}, pid $!). \
              Poll it with get_job_status name={name} id={id}. \
              Output: $HOME/agentpc-bg/{id}.log. Stop it with: kill $!\"",
@@ -1404,13 +1456,23 @@ async fn job_status(name: &str, id: u64, tail_lines: usize) -> Result<String> {
             "d=~/agentpc-bg\n\
              if [ ! -f $d/{id}.log ]; then echo 'STATE: no such job'; exit 0; fi\n\
              if [ -f $d/{id}.exit ]; then echo \"STATE: exited $(cat $d/{id}.exit)\"; \
-             else echo 'STATE: running'; fi\n\
+             elif p=$(cat $d/{id}.pid 2>/dev/null) && grep -qs {id}.sh /proc/$p/cmdline; \
+             then echo 'STATE: running'; \
+             else echo 'STATE: ended without an exit code (killed, or the VM restarted)'; fi\n\
              echo '--- log tail ---'; tail -n {tail_lines} $d/{id}.log",
         ),
         Os::Windows => format!(
             r#"$d = "$env:USERPROFILE\agentpc-bg"; $log = "$d\{id}.log"; $exit = "$d\{id}.exit"
 if (-not (Test-Path $log)) {{ 'STATE: no such job'; exit 0 }}
-if (Test-Path $exit) {{ "STATE: exited $((Get-Content $exit -Raw).Trim())" }} else {{ 'STATE: running' }}
+if (Test-Path $exit) {{ "STATE: exited $((Get-Content $exit -Raw).Trim())" }}
+else {{
+  # Ended only once the task has run and is no longer running (just after Start-ScheduledTask
+  # it can still read Ready, not yet having run).
+  $t = Get-ScheduledTask -TaskName 'agentpc-bg-{id}' -ErrorAction SilentlyContinue
+  $ran = $t -and ($t | Get-ScheduledTaskInfo).LastRunTime.Year -gt 2000
+  if ($t -and ($t.State -in 'Running', 'Queued' -or -not $ran)) {{ 'STATE: running' }}
+  else {{ 'STATE: ended without an exit code (stopped, or the VM restarted)' }}
+}}
 '--- log tail ---'; if (Test-Path $log) {{ Get-Content $log -Tail {tail_lines} }}"#
         ),
     };
