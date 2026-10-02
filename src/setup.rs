@@ -626,6 +626,27 @@ fn tmp_image(name: &str) -> Option<Image> {
     s.strip_suffix(".snapshot").unwrap_or(s).parse().ok()
 }
 
+/// The image a file in `images/` belongs to: `.<image>.lock`, `<image>.json`, its disks,
+/// vars and snapshot files.
+fn image_of_file(name: &str) -> Option<Image> {
+    if let Some(n) = name.strip_prefix('.') {
+        return n.strip_suffix(".lock")?.parse().ok();
+    }
+    [
+        ".snapshot.state.machine",
+        ".snapshot.state",
+        ".snapshot.vars.fd",
+        ".snapshot.qcow2",
+        ".vars.fd",
+        ".qcow2",
+        ".json",
+    ]
+    .iter()
+    .find_map(|suffix| name.strip_suffix(suffix))?
+    .parse()
+    .ok()
+}
+
 /// A file in `~/.agentpc/lib` that `clean` may remove: another build's `hvf-tso-*.dylib`
 /// or a leftover `hvf-tso-*.tmp` from writing one, never this build's `current` library.
 fn stale_tso_lib(name: &str, current: &str) -> bool {
@@ -809,6 +830,35 @@ pub fn clean(dry_run: bool) -> Result<String> {
                 e.path(),
                 "half-written image file from an interrupted build",
             ));
+        } else if name.starts_with('.') && name.ends_with(".lock") && name != ".lock" {
+            // An image's lock file is `.<image>.lock` by its full name. Any other one (an
+            // alias or old name an earlier agentpc used, a deleted image's) is left over,
+            // unless someone holds it right now.
+            let image = image_of_file(&name).filter(|i| name == format!(".{i}.lock"));
+            if image.as_ref().is_some_and(Image::exists) {
+                continue;
+            }
+            // At an image's own lock path, `held` may already hold it (any_image_busy took
+            // every image lock): ask it, rather than lock the file a second time.
+            let busy = match &image {
+                Some(i) => held.image_busy(i),
+                None => held.busy(&e.path()),
+            };
+            if busy {
+                in_use.push(e.path());
+                continue;
+            }
+            targets.push((e.path(), "lock file of an image that no longer exists"));
+        } else if let Some(i) = image_of_file(&name)
+            && !i.exists()
+        {
+            // A deleted (or older agentpc's) image's lock, info or sidecar. Its lock held
+            // means it is being built or pulled right now.
+            if held.image_busy(&i) {
+                in_use.push(e.path());
+                continue;
+            }
+            targets.push((e.path(), "left over from an image that no longer exists"));
         }
     }
 
@@ -1082,6 +1132,19 @@ mod tests {
             assert_eq!(name(tmp_image(file)), Some(image.into()), "{file}");
         }
         assert_eq!(name(tmp_image("ubuntu-24.04.qcow2")), None);
+        for (file, image) in [
+            (".ubuntu-22.04.lock", "ubuntu-22.04"),
+            (".ubuntu-x86apps.lock", "ubuntu-24.04-x86apps"),
+            ("ubuntu-26.04.snapshot.state.machine", "ubuntu-26.04"),
+            ("arch-rolling.snapshot.vars.fd", "arch-rolling"),
+            ("windows-11-25h2.qcow2", "windows-11-25h2"),
+            ("ubuntu-24.04-x86apps.json", "ubuntu-24.04-x86apps"),
+        ] {
+            assert_eq!(name(image_of_file(file)), Some(image.into()), "{file}");
+        }
+        // Not an image's: the creation lock, other files.
+        assert_eq!(name(image_of_file(".lock")), None);
+        assert_eq!(name(image_of_file("notes.txt")), None);
         assert_eq!(name(tmp_image("junk.tmp")), None);
     }
 
