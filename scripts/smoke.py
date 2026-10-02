@@ -211,6 +211,9 @@ def arch(m, vm, r):
 def linux(m, vm, r, browser, label):
     ok, out = m.tool("run_command", name=vm, command="uname -sm")
     r.check("run_command runs bash", ok and "Linux" in out, out[:200])
+    # Every VM's SSH port is reachable from other VMs and local users: key logins only.
+    ok, out = m.tool("run_command", name=vm, command="sudo sshd -T | grep -iE '^(passwordauthentication|kbdinteractiveauthentication) '")
+    r.check("sshd takes keys only (no password logins)", ok and stdout(out).lower().split() == ["passwordauthentication", "no", "kbdinteractiveauthentication", "no"], out[-200:])
     gateway_checks(m, vm, r)
 
     # Reading a page: the browser must open straight to it (no first-run or Terms of
@@ -638,6 +641,9 @@ def windows_lifecycle(m, vm, r):
     Windows, whose paths through ops differ from the Linux ones."""
     def ps(command, **kw):
         return m.tool("run_command", name=vm, command=command, **kw)
+
+    ok, out = ps("& \"$env:windir\\System32\\OpenSSH\\sshd.exe\" -T | Select-String -Pattern '^(passwordauthentication|kbdinteractiveauthentication) '")
+    r.check("windows: sshd takes keys only (no password logins)", ok and "passwordauthentication no" in out and "kbdinteractiveauthentication no" in out, out[-200:])
 
     ok, out = ps("Start-Sleep 2; 'smoke-job-done'", background=True)
     job = re.search(r"\(id (\d+)", out)
