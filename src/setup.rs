@@ -629,7 +629,14 @@ pub fn clean(dry_run: bool) -> Result<String> {
             }
             continue;
         }
-        // A real VM: sweep only unfinished checkpoint temp dirs, never a real checkpoint.
+        // A real VM: sweep only unfinished checkpoint temp dirs, never a real checkpoint, and
+        // none while a lifecycle operation (a checkpoint being written, say) holds its lock.
+        if inst
+            .as_ref()
+            .is_some_and(|i| crate::instance::try_lock(&i.lock_path()).is_none())
+        {
+            continue;
+        }
         let valid = inst
             .as_ref()
             .map(crate::ops::checkpoints)

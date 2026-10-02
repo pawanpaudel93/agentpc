@@ -172,6 +172,9 @@ struct Gateway {
     reconnected: Arc<Mutex<HashSet<String>>>,
     /// The agentpc binary this server runs, as found at startup, to notice an update.
     exe: Option<(std::path::PathBuf, u64)>,
+    /// Per VM, the desktop tools its driver marks read-only: only those are re-sent after a
+    /// dropped connection.
+    read_only: Arc<Mutex<HashMap<String, HashSet<String>>>>,
 }
 
 impl Gateway {
@@ -187,6 +190,7 @@ impl Gateway {
             session_id: format!("{pid:x}{nanos:x}").into(),
             connected: Default::default(),
             reconnected: Default::default(),
+            read_only: Default::default(),
             exe: std::env::current_exe()
                 .ok()
                 .and_then(|p| exe_id(&p).map(|id| (p, id))),
@@ -224,13 +228,37 @@ impl Gateway {
         format!("{client} [{}]", self.session_id)
     }
 
+    /// Whether the VM's desktop driver marks `tool` read-only (asked once per VM). Unknown
+    /// counts as not: a repeated click or keystroke is worse than a reported failure.
+    async fn read_only_tool(&self, name: &str, tool: &str) -> bool {
+        if let Some(set) = self.read_only.lock().unwrap().get(name) {
+            return set.contains(tool);
+        }
+        let Ok(tools) = self
+            .with_session(name, "list_tools", true, |c: Client| async move {
+                c.list_all_tools().await
+            })
+            .await
+        else {
+            return false;
+        };
+        let set: HashSet<String> = tools
+            .iter()
+            .filter(|t| t.annotations.as_ref().and_then(|a| a.read_only_hint) == Some(true))
+            .map(|t| t.name.to_string())
+            .collect();
+        let found = set.contains(tool);
+        self.read_only.lock().unwrap().insert(name.to_string(), set);
+        found
+    }
+
     /// Make this session a VM's owner: its tag (with this process, for `owner_running`) and
     /// the auto-stop set agree.
     fn claim(&self, name: &str, ctx: &RequestContext<RoleServer>) {
         if let Ok(inst) = load(name) {
             let _ = ops::set_owner(&inst, &self.owner_tag(ctx));
+            self.owned.lock().unwrap().insert(name.to_string());
         }
-        self.owned.lock().unwrap().insert(name.to_string());
     }
 
     /// Best-effort, bounded shutdown: gracefully stop the VMs this session left running, unless
@@ -240,10 +268,13 @@ impl Gateway {
             return;
         }
         let names: Vec<String> = self.owned.lock().unwrap().iter().cloned().collect();
+        // Only VMs still ours: another session may have taken one over since (its owner tag
+        // then names that session).
+        let mine = format!("[{}]", self.session_id);
         let running: Vec<Instance> = names
             .into_iter()
             .filter_map(|n| load(&n).ok())
-            .filter(|i| i.running())
+            .filter(|i| i.running() && ops::owner(i).is_some_and(|o| o.ends_with(&mine)))
             .collect();
         if running.is_empty() {
             return;
@@ -509,9 +540,8 @@ impl Gateway {
             && Image::resolve(&image).is_ok_and(|i| i == inst.image)
         {
             self.claim(name, &ctx);
-            if inst.running() {
-                return text(Ok(ops::info(&inst)));
-            }
+            // Through boot even when QEMU runs: a VM that never became ready is waited for
+            // again (and a paused one resumed), rather than reported ready.
             return text(with_progress(&ctx, move || ops::boot(&inst)).await);
         }
         let requested = a.name.clone();
@@ -530,18 +560,23 @@ impl Gateway {
         // Track it for auto-stop (ops::create recorded the owner before booting), also when
         // it was made but didn't become ready. Without a requested name, `info` starts with
         // the generated one.
-        let made = match &res {
+        let made: Vec<String> = match &res {
             Ok(info) => requested
                 .as_deref()
                 .or_else(|| info.split_whitespace().next())
-                .map(str::to_string),
-            Err(_) => requested.filter(|n| {
-                load(n).is_ok_and(|i| ops::owner(&i).as_deref() == Some(owner.as_str()))
-            }),
+                .map(str::to_string)
+                .into_iter()
+                .collect(),
+            // Made but not ready: it carries this session's owner tag (its name may have been
+            // generated, so look for the tag).
+            Err(_) => Instance::list()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|i| ops::owner(i).as_deref() == Some(owner.as_str()))
+                .map(|i| i.name)
+                .collect(),
         };
-        if let Some(name) = made {
-            self.owned.lock().unwrap().insert(name);
-        }
+        self.owned.lock().unwrap().extend(made);
         let note = self.stale_note().unwrap_or_default();
         text(res.map(|s| note + &s))
     }
@@ -561,11 +596,9 @@ impl Gateway {
         Parameters(a): Parameters<NameArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let r = self.lifecycle(&a.name, ops::boot, &ctx).await;
-        if r.is_ok() {
-            self.claim(&a.name, &ctx);
-        }
-        text(r)
+        // Claimed before booting, so a VM whose boot fails is still this session's to stop.
+        self.claim(&a.name, &ctx);
+        text(self.lifecycle(&a.name, ops::boot, &ctx).await)
     }
 
     #[tool(
@@ -600,11 +633,8 @@ impl Gateway {
         Parameters(a): Parameters<NameArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let r = self.lifecycle(&a.name, ops::reset, &ctx).await;
-        if r.is_ok() {
-            self.claim(&a.name, &ctx);
-        }
-        text(r)
+        self.claim(&a.name, &ctx);
+        text(self.lifecycle(&a.name, ops::reset, &ctx).await)
     }
 
     #[tool(
@@ -666,15 +696,12 @@ impl Gateway {
         ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
         self.drop_session(&a.name);
-        let name = a.name.clone();
+        self.claim(&a.name, &ctx);
         let r = async {
             let inst = load(&a.name)?;
             with_progress(&ctx, move || ops::restore(&inst, &a.label)).await
         }
         .await;
-        if r.is_ok() {
-            self.claim(&name, &ctx);
-        }
         text(r)
     }
 
@@ -819,7 +846,7 @@ impl Gateway {
     async fn list_desktop_tools(&self, Parameters(a): Parameters<ToolsArgs>) -> CallToolResult {
         let r = async {
             let tools = self
-                .with_session(&a.name, "list_tools", |c: Client| async move {
+                .with_session(&a.name, "list_tools", true, |c: Client| async move {
                     c.list_all_tools().await
                 })
                 .await?;
@@ -887,8 +914,9 @@ impl Gateway {
     async fn use_desktop_tool(&self, Parameters(a): Parameters<DesktopArgs>) -> CallToolResult {
         let params = CallToolRequestParams::new(a.tool.clone())
             .with_arguments(a.arguments.unwrap_or_default());
+        let retry = self.read_only_tool(&a.name, &a.tool).await;
         let r = self
-            .with_session(&a.name, &a.tool, |c: Client| {
+            .with_session(&a.name, &a.tool, retry, |c: Client| {
                 let params = params.clone();
                 async move { c.call_tool(params).await }
             })
@@ -930,7 +958,7 @@ impl Gateway {
         // right names or the arguments, so the next call can be right without another lookup.
         // (cua-driver reports an unknown name as a permission error, so check names here.)
         let tools = self
-            .with_session(&a.name, "list_tools", |c: Client| async move {
+            .with_session(&a.name, "list_tools", true, |c: Client| async move {
                 c.list_all_tools().await
             })
             .await
@@ -1121,11 +1149,24 @@ impl Gateway {
     }
 
     /// Runs `f` on the instance's session. A transport failure usually means the guest
-    /// restarted underneath us, so reconnect once and retry.
-    async fn with_session<T, F>(&self, name: &str, what: &str, f: impl Fn(Client) -> F) -> Result<T>
+    /// restarted underneath us, so reconnect once and, with `retry`, try again. Without it (a
+    /// click, typing: the call may have taken effect before the reply was lost) say so instead.
+    async fn with_session<T, F>(
+        &self,
+        name: &str,
+        what: &str,
+        retry: bool,
+        f: impl Fn(Client) -> F,
+    ) -> Result<T>
     where
         F: Future<Output = Result<T, ServiceError>>,
     {
+        let unknown = |why: String| {
+            anyhow!(
+                "{what} in {name}: {why}, so whether it took effect is unknown. Look first (a new \
+                 screenshot or get_window_state) before repeating it."
+            )
+        };
         for attempt in 1..=2 {
             let client = self.session(name).await?;
             // A hung desktop tool must not wedge the call forever; treat a stall like a
@@ -1138,12 +1179,23 @@ impl Gateway {
                 }
                 Ok(Err(e)) => {
                     self.drop_session(name);
+                    if !retry {
+                        return Err(unknown(format!(
+                            "the connection to the desktop driver dropped ({e})"
+                        )));
+                    }
                     if attempt == 2 {
                         bail!("{what} failed in {name}: {e}");
                     }
                 }
                 Err(_) => {
                     self.drop_session(name);
+                    if !retry {
+                        return Err(unknown(format!(
+                            "no reply within {}s",
+                            DESKTOP_CALL_TIMEOUT.as_secs()
+                        )));
+                    }
                     if attempt == 2 {
                         bail!(
                             "{what} timed out after {}s in {name}",
@@ -1360,8 +1412,10 @@ if (Test-Path $exit) {{ "STATE: exited $((Get-Content $exit -Raw).Trim())" }} el
 }
 
 /// Keep the first and last `keep` characters of `s`, noting how much was cut.
-/// A background job's id: the time in milliseconds, but never the same twice in this
-/// process, since two jobs started in one millisecond would share their files.
+/// A background job's id, unique in the VM: two jobs sharing one would share their script,
+/// log and exit files. The time in milliseconds, times 1024, plus the low bits of this
+/// process's id (another MCP server may start one in the same millisecond); within this
+/// process each id is above the last.
 fn job_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST: AtomicU64 = AtomicU64::new(0);
@@ -1369,12 +1423,18 @@ fn job_id() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    let candidate = (now << 10) | u64::from(std::process::id() & 0x3ff);
+    let next = |last: u64| {
+        if candidate > last {
+            candidate
+        } else {
+            last + 1024
+        }
+    };
     let prev = LAST
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| {
-            Some(now.max(last + 1))
-        })
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some(next(last)))
         .unwrap_or(0);
-    now.max(prev + 1)
+    next(prev)
 }
 
 /// What a command printed on one stream: only its first and last bytes are kept while
@@ -1656,6 +1716,9 @@ mod tests {
     fn job_ids_never_repeat() {
         let ids: Vec<u64> = (0..1000).map(|_| super::job_id()).collect();
         assert!(ids.windows(2).all(|w| w[1] > w[0]));
+        // Each keeps this process's bits, which another server's ids don't share.
+        let me = u64::from(std::process::id() & 0x3ff);
+        assert!(ids.iter().all(|id| id & 0x3ff == me));
     }
 
     #[test]

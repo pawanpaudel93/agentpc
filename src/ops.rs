@@ -131,9 +131,25 @@ pub fn forward(
     let dir = inst.dir.join("forwards");
     std::fs::create_dir_all(&dir)?;
     let pid_file = dir.join(format!("{host_port}.pid"));
-    // A live tunnel already on this host port: reuse it rather than start a second one.
-    if read_forward(&pid_file).is_some_and(|(pid, _)| tunnel_alive(pid, host_port)) {
+    // A live tunnel already on this host port: reuse it rather than start a second one, if
+    // it goes where this one should.
+    if let Some((pid, to)) = read_forward(&pid_file)
+        && tunnel_alive(pid, host_port)
+    {
+        if to != guest_port {
+            bail!(
+                "127.0.0.1:{host_port} already forwards to {}:{to}; delete that forward first, \
+                 or pick another host port",
+                inst.name
+            );
+        }
         return Ok(forward_url(inst, host_port, guest_port));
+    }
+    // Something else on that port would answer the readiness check below in the tunnel's place.
+    if std::net::TcpListener::bind(("127.0.0.1", host_port)).is_err() {
+        bail!(
+            "127.0.0.1:{host_port} is in use on this Mac; pick another host port (or leave it out)"
+        );
     }
     let log_path = dir.join(format!("{host_port}.log"));
     let log = std::fs::File::create(&log_path)?;
@@ -335,14 +351,17 @@ else {{ 'missing' }}"#
                 },
             )
         }
-        Os::Ubuntu | Os::Arch => Ok(ssh(
+        // Bounded like the Windows probe: a guest whose probe hangs while SSH stays up must
+        // not hold boot (and the VM's lock) past its timeout.
+        Os::Ubuntu | Os::Arch => Ok(ssh_within(
             inst,
             &format!(
                 "test -f /var/lib/cloud/agent-ready && pgrep -x xfce4-session >/dev/null && \
                  {LINUX_SESSION_ENV} ~/.local/bin/cua-driver --version"
             ),
+            Duration::from_secs(20),
         )
-        .is_ok_and(|o| o.status.success())),
+        .is_some_and(|o| o.status.success())),
     }
 }
 
@@ -1148,13 +1167,22 @@ pub fn stop_orphans() -> Vec<String> {
         return vec![];
     };
     let mut stopped = vec![];
+    let orphan = |i: &Instance| i.running() && owner_alive(i) == Some(false) && !owner_keeps(i);
     for inst in all {
-        if inst.running() && owner_alive(&inst) == Some(false) && !owner_keeps(&inst) {
+        if !orphan(&inst) {
+            continue;
+        }
+        // Again under the VM's lock: a session may have adopted it in between.
+        let Ok(_lock) = inst.lock() else { continue };
+        if orphan(&inst) {
             stop_forwards(&inst);
-            if stop(&inst).is_ok() {
+            if qemu::stop(&inst).is_ok() {
                 stopped.push(inst.name.clone());
             }
         }
+    }
+    if !stopped.is_empty() {
+        viewer::stop_if_idle();
     }
     stopped
 }

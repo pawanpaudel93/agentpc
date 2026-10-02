@@ -559,10 +559,21 @@ impl Instance {
     /// Held for the length of a lifecycle op (start/stop/reset/…) so two of them can't
     /// race on this instance's disk. Same helper as `creation_lock`; released on drop.
     pub fn lock(&self) -> Result<std::fs::File> {
-        lock(
-            &self.dir.join(".lock"),
+        let f = lock(
+            &self.lock_path(),
             Some("waiting for another operation on this VM to finish"),
-        )
+        )?;
+        // The operation it waited for may have deleted the VM.
+        if !self.dir.is_dir() {
+            bail!("VM {} was deleted", self.name);
+        }
+        Ok(f)
+    }
+
+    /// Outside the VM's directory, so deleting the VM doesn't delete the lock a waiting
+    /// operation holds open (a VM made again under the name would get a second lock).
+    pub fn lock_path(&self) -> PathBuf {
+        home().join("locks").join(format!("{}.lock", self.name))
     }
 
     /// This VM's VNC password file (0600), created with a fresh password if absent.

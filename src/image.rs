@@ -247,6 +247,60 @@ pub fn snapshot(image: &Image) -> Result<()> {
     snapshot_locked(image)
 }
 
+/// Apply this agentpc's guest setup (`prepare_guest`) to the image's base disk: boot a clone,
+/// run it, shut down cleanly and make that disk the base. VMs of a non-default size boot from
+/// the base rather than the snapshot, so it must have what the snapshot has (and an Arch
+/// build's base never ran the guest setup at all). Runs before every snapshot.
+fn bake_base(image: &Image) -> Result<()> {
+    let name = format!("_build-{image}");
+    if instances_dir().join(&name).is_dir() {
+        if let Ok(old) = Instance::load(&name) {
+            qemu::quit(&old);
+        }
+        std::fs::remove_dir_all(instances_dir().join(&name))?;
+    }
+    let guard = BuildGuard::new(Instance::create_scratch(&name, image)?);
+    let inst = &guard.inst;
+    clone_image(inst, image)?;
+    log!("booting {image} to apply this agentpc's guest setup to its disk");
+    qemu::start(inst, &[])?;
+    wait_ready(inst, Duration::from_secs(image.os.boot_timeout()))?;
+    prepare_guest(inst)?;
+    qemu::stop(inst)?;
+    let (disk, vars) = (image.disk(), image.vars());
+    wait_for_space(
+        allocated(&disk) + allocated(&inst.disk()) + (1 << 30),
+        &format!("write the {image} image"),
+    )?;
+    let (disk_tmp, vars_tmp) = (
+        disk.with_extension("qcow2.tmp"),
+        vars.with_extension("fd.tmp"),
+    );
+    run(
+        "qemu-img",
+        &[
+            "convert",
+            "-O",
+            "qcow2",
+            &inst.disk().to_string_lossy(),
+            &disk_tmp.to_string_lossy(),
+        ],
+    )?;
+    std::fs::copy(inst.vars(), &vars_tmp)?;
+    // The old snapshot was captured from the old base; it is recaptured next.
+    image.remove_snapshot();
+    std::fs::rename(&vars_tmp, &vars)?;
+    std::fs::rename(&disk_tmp, &disk)?;
+    for p in [&disk, &vars] {
+        let mut perm = std::fs::metadata(p)?.permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(p, perm)?;
+    }
+    std::fs::remove_dir_all(&inst.dir)?;
+    guard.keep();
+    Ok(())
+}
+
 /// `snapshot`, for a caller already holding the image lock.
 pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
     let os = image.os;
@@ -256,9 +310,16 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
             crate::setup::cmd_name()
         );
     }
-    if image.instances()?.iter().any(|i| i.on_snapshot_base()) {
-        bail!("VMs of {image} depend on its snapshot; rm them first");
+    // Both disks are rewritten: the base (custom-size VMs boot from it) and the snapshot.
+    let vms = image.instances()?;
+    if !vms.is_empty() {
+        let names: Vec<_> = vms.iter().map(|i| i.name.as_str()).collect();
+        bail!(
+            "VMs of {image} use its disks; rm them first: {}",
+            names.join(", ")
+        );
     }
+    bake_base(image)?;
     let name = format!("_snap-{image}");
     if instances_dir().join(&name).is_dir() {
         if let Ok(old) = Instance::load(&name) {
@@ -446,9 +507,12 @@ fn build_arch(image: &Image, name: &str) -> Result<()> {
             &tmp.to_string_lossy(),
         ],
     )?;
-    std::fs::rename(&tmp, &disk)?;
     // Blank vars: edk2 initializes them at first boot and finds systemd-boot on the disk.
-    std::fs::File::create(&vars)?.set_len(64 << 20)?;
+    // In place whole before the disk, which is what makes the image exist.
+    let vars_tmp = vars.with_extension("fd.tmp");
+    std::fs::File::create(&vars_tmp)?.set_len(64 << 20)?;
+    std::fs::rename(&vars_tmp, &vars)?;
+    std::fs::rename(&tmp, &disk)?;
     for p in [&disk, &vars] {
         let mut perm = std::fs::metadata(p)?.permissions();
         perm.set_readonly(true);
