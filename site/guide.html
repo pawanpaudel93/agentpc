@@ -3,40 +3,65 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>agentpc Guide</title>
+    <title>VM Installation, Networking and Troubleshooting | agentpc</title>
     <meta
       name="description"
-      content="agentpc guide: requirements, images and versions, how instant VMs work, networking, configuration, guest tips, troubleshooting and security."
+      content="Install agentpc on Apple Silicon and learn about VM images, Windows setup, Linux x86 apps, networking, security and troubleshooting."
     />
-    <meta property="og:title" content="agentpc Guide" />
+    <meta property="og:title" content="VM Installation, Networking and Troubleshooting | agentpc" />
     <meta
       property="og:description"
-      content="Images, networking, configuration, guest tips, troubleshooting and security for agentpc."
+      content="Install agentpc on Apple Silicon and learn about VM images, Windows setup, Linux x86 apps, networking, security and troubleshooting."
     />
     <meta property="og:type" content="website" />
     <meta property="og:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta property="og:url" content="https://agentpc.pawanpaudel.com.np/guide.html" />
+    <meta property="og:url" content="https://agentpc.pawanpaudel.com.np/guide" />
+    <link rel="canonical" href="https://agentpc.pawanpaudel.com.np/guide" />
+    <meta name="twitter:title" content="VM Installation, Networking and Troubleshooting | agentpc" />
+    <meta name="twitter:description" content="Install agentpc on Apple Silicon and learn about VM images, Windows setup, Linux x86 apps, networking, security and troubleshooting." />
+    <meta name="twitter:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
+    <meta property="og:image:alt" content="agentpc — desktop VMs for AI agents" />
     <meta name="theme-color" content="#1b1f4b" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="apple-touch-icon.png" />
     <link rel="stylesheet" href="styles.css" />
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Home",
+          "item": "https://agentpc.pawanpaudel.com.np/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "VM installation and troubleshooting guide",
+          "item": "https://agentpc.pawanpaudel.com.np/guide"
+        }
+      ]
+    }
+    </script>
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
     <header class="shell">
       <nav class="nav" aria-label="Main navigation">
-        <a class="brand" href="index.html">
+        <a class="brand" href="/">
           <img src="favicon.svg" width="36" height="36" alt="" decoding="async" />
           <span>agentpc</span>
           <span class="version" translate="no">v0.1.11</span>
         </a>
         <div class="nav-links">
-          <a href="index.html#install">Install</a>
-          <a href="index.html#features">Features</a>
-          <a href="mcp.html">MCP</a>
-          <a href="cli.html">CLI</a>
-          <a href="guide.html" aria-current="page">Guide</a>
+          <a href="/#install">Install</a>
+          <a href="/#features">Features</a>
+          <a href="/mcp">MCP</a>
+          <a href="/cli">CLI</a>
+          <a href="/guide" aria-current="page">Guide</a>
           <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
         </div>
       </nav>
@@ -45,8 +70,8 @@
     <main id="main">
       <section class="shell hero compact">
         <div class="hero-inner">
-          <p class="eyebrow">Documentation</p>
-          <h1>Guide</h1>
+          <p class="eyebrow"><a href="/">Home</a> / Documentation</p>
+          <h1>VM installation and troubleshooting guide</h1>
           <p class="hero-copy">
             What you need, where images come from, how VMs start in a second, and how to get
             files, ports and networks to do what you want.
@@ -388,11 +413,11 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
       <div class="shell">
         <span>agentpc by <a href="https://github.com/pawanpaudel93">Pawan Paudel</a> · MIT license</span>
         <span>
-          <a href="index.html">Home</a>
+          <a href="/">Home</a>
           ·
-          <a href="mcp.html">MCP</a>
+          <a href="/mcp">MCP</a>
           ·
-          <a href="cli.html">CLI</a>
+          <a href="/cli">CLI</a>
           ·
           <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
         </span>

@@ -7,9 +7,9 @@ The VMs are ARM64. x64 Windows apps run through Prism; x86_64 and i386 Linux pro
 ## Links
 
 - [Website](https://agentpc.pawanpaudel.com.np/)
-- [MCP docs](https://agentpc.pawanpaudel.com.np/mcp.html)
-- [CLI docs](https://agentpc.pawanpaudel.com.np/cli.html)
-- [Guide](https://agentpc.pawanpaudel.com.np/guide.html)
+- [MCP docs](https://agentpc.pawanpaudel.com.np/mcp)
+- [CLI docs](https://agentpc.pawanpaudel.com.np/cli)
+- [Guide](https://agentpc.pawanpaudel.com.np/guide)
 - [Agent instructions](https://github.com/pawanpaudel93/agentpc/blob/main/AGENTS.md)
 - [Source](https://github.com/pawanpaudel93/agentpc)
 - [Releases](https://github.com/pawanpaudel93/agentpc/releases)

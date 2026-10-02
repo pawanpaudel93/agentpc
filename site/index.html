@@ -3,30 +3,53 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>agentpc: instant desktops for AI agents on your Mac</title>
+    <title>agentpc — Desktop VMs for AI Agents on Apple Silicon</title>
     <meta
       name="description"
-      content="agentpc gives AI agents instant, resettable Windows, Ubuntu and Arch Linux ARM desktop VMs on an Apple Silicon Mac, over one MCP server."
+      content="Run resettable Windows, Ubuntu and Arch Linux ARM desktop VMs on your Apple Silicon Mac. Connect Claude Code, Codex and other AI agents through MCP."
     />
-    <meta property="og:title" content="agentpc" />
+    <meta property="og:title" content="agentpc — Desktop VMs for AI Agents on Apple Silicon" />
     <meta
       property="og:description"
-      content="Instant, resettable Windows, Ubuntu and Arch Linux ARM desktops for AI agents, on your Mac. One MCP server for Claude, Codex, Cursor, Gemini and VS Code."
+      content="Run resettable Windows, Ubuntu and Arch Linux ARM desktop VMs on your Apple Silicon Mac. Connect Claude Code, Codex and other AI agents through MCP."
     />
     <meta property="og:type" content="website" />
     <meta property="og:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
     <meta name="twitter:card" content="summary_large_image" />
     <meta property="og:url" content="https://agentpc.pawanpaudel.com.np/" />
+    <link rel="canonical" href="https://agentpc.pawanpaudel.com.np/" />
+    <meta name="twitter:title" content="agentpc — Desktop VMs for AI Agents on Apple Silicon" />
+    <meta name="twitter:description" content="Run resettable Windows, Ubuntu and Arch Linux ARM desktop VMs on your Apple Silicon Mac. Connect Claude Code, Codex and other AI agents through MCP." />
+    <meta name="twitter:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
+    <meta property="og:image:alt" content="agentpc — desktop VMs for AI agents" />
     <meta name="theme-color" content="#1b1f4b" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="apple-touch-icon.png" />
     <link rel="stylesheet" href="styles.css" />
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareSourceCode",
+      "name": "agentpc",
+      "description": "Run resettable Windows, Ubuntu and Arch Linux ARM desktop VMs on your Apple Silicon Mac. Connect Claude Code, Codex and other AI agents through MCP.",
+      "url": "https://agentpc.pawanpaudel.com.np/",
+      "codeRepository": "https://github.com/pawanpaudel93/agentpc",
+      "license": "https://opensource.org/license/mit",
+      "programmingLanguage": "Rust",
+      "runtimePlatform": "macOS on Apple Silicon",
+      "author": {
+        "@type": "Person",
+        "name": "Pawan Paudel",
+        "url": "https://github.com/pawanpaudel93"
+      }
+    }
+    </script>
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
     <header class="shell">
       <nav class="nav" aria-label="Main navigation">
-        <a class="brand" href="index.html">
+        <a class="brand" href="/">
           <img src="favicon.svg" width="36" height="36" alt="" decoding="async" />
           <span>agentpc</span>
           <span class="version" translate="no">v0.1.11</span>
@@ -34,9 +57,9 @@
         <div class="nav-links">
           <a href="#install">Install</a>
           <a href="#features">Features</a>
-          <a href="mcp.html">MCP</a>
-          <a href="cli.html">CLI</a>
-          <a href="guide.html">Guide</a>
+          <a href="/mcp">MCP</a>
+          <a href="/cli">CLI</a>
+          <a href="/guide">Guide</a>
           <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
         </div>
       </nav>
@@ -46,7 +69,7 @@
       <section class="shell hero hero-split" id="install">
         <div class="hero-inner">
           <p class="eyebrow">MCP server · Apple Silicon</p>
-          <h1>A real computer for your agent, ready in a second</h1>
+          <h1>Windows and Linux desktop VMs for AI agents</h1>
           <p class="hero-copy">
             agentpc runs Windows, Ubuntu and Arch Linux ARM desktop VMs on your Mac and hands them to AI agents
             over MCP. The agent clicks, types, runs commands and takes screenshots, then resets
@@ -239,14 +262,14 @@
   }
 }</code></pre>
             </div>
-            <p class="tab-note">One stdio server handles every VM. See the <a class="inline-link" href="mcp.html">MCP docs</a> for the tools.</p>
+            <p class="tab-note">One stdio server handles every VM. See the <a class="inline-link" href="/mcp">MCP docs</a> for the tools.</p>
           </div>
         </div>
       </section>
 
       <section class="shell section" id="guests" aria-labelledby="guests-title">
         <div class="section-head">
-          <h2 id="guests-title">Windows and Linux desktops, any version</h2>
+          <h2 id="guests-title">Windows, Ubuntu and Arch Linux ARM desktops</h2>
           <p>Every VM is a copy-on-write clone of a read-only image, so it starts from a clean install and costs only a few MB.</p>
         </div>
         <div class="grid two">
@@ -284,17 +307,17 @@
           <div class="card">
             <h3>MCP</h3>
             <p>All 20 tools agents use to create, drive and reset VMs, plus how to set up each client.</p>
-            <p class="card-action"><a href="mcp.html">Read the MCP docs</a></p>
+            <p class="card-action"><a href="/mcp">Read the MCP docs</a></p>
           </div>
           <div class="card">
             <h3>CLI</h3>
             <p>Manage VMs and images yourself: create, checkpoint, ssh, copy files and forward ports.</p>
-            <p class="card-action"><a href="cli.html">Read the CLI reference</a></p>
+            <p class="card-action"><a href="/cli">Read the CLI reference</a></p>
           </div>
           <div class="card">
             <h3>Guide</h3>
             <p>Images, networking, configuration, guest tips, troubleshooting and security.</p>
-            <p class="card-action"><a href="guide.html">Read the guide</a></p>
+            <p class="card-action"><a href="/guide">Read the guide</a></p>
           </div>
         </div>
       </section>
@@ -304,11 +327,11 @@
       <div class="shell">
         <span>agentpc by <a href="https://github.com/pawanpaudel93">Pawan Paudel</a> · MIT license</span>
         <span>
-          <a href="mcp.html">MCP</a>
+          <a href="/mcp">MCP</a>
           ·
-          <a href="cli.html">CLI</a>
+          <a href="/cli">CLI</a>
           ·
-          <a href="guide.html">Guide</a>
+          <a href="/guide">Guide</a>
           ·
           <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
         </span>

@@ -33,6 +33,9 @@ else
   echo "    (no dash here; CI's guest-helpers job runs them with it)"
 fi
 
+say "static site SEO and links"
+python3 scripts/test-site.py
+
 say "smoke.py compiles"
 python3 -m py_compile scripts/smoke.py
 

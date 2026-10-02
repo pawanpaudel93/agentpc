@@ -3,40 +3,65 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>agentpc MCP</title>
+    <title>Desktop MCP Server Setup and Tools | agentpc</title>
     <meta
       name="description"
-      content="agentpc MCP server documentation: connect AI agents and give them tools to create, drive, screenshot and reset desktop VMs."
+      content="Connect Claude Code, Codex, Cursor and other MCP clients to agentpc. Create, control, screenshot and reset Windows and Linux desktop VMs on Apple Silicon."
     />
-    <meta property="og:title" content="agentpc MCP" />
+    <meta property="og:title" content="Desktop MCP Server Setup and Tools | agentpc" />
     <meta
       property="og:description"
-      content="One MCP server that lets agents create, drive, screenshot and reset Windows, Ubuntu and Arch Linux ARM VMs on a Mac."
+      content="Connect Claude Code, Codex, Cursor and other MCP clients to agentpc. Create, control, screenshot and reset Windows and Linux desktop VMs on Apple Silicon."
     />
     <meta property="og:type" content="website" />
     <meta property="og:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta property="og:url" content="https://agentpc.pawanpaudel.com.np/mcp.html" />
+    <meta property="og:url" content="https://agentpc.pawanpaudel.com.np/mcp" />
+    <link rel="canonical" href="https://agentpc.pawanpaudel.com.np/mcp" />
+    <meta name="twitter:title" content="Desktop MCP Server Setup and Tools | agentpc" />
+    <meta name="twitter:description" content="Connect Claude Code, Codex, Cursor and other MCP clients to agentpc. Create, control, screenshot and reset Windows and Linux desktop VMs on Apple Silicon." />
+    <meta name="twitter:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
+    <meta property="og:image:alt" content="agentpc — desktop VMs for AI agents" />
     <meta name="theme-color" content="#1b1f4b" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="apple-touch-icon.png" />
     <link rel="stylesheet" href="styles.css" />
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Home",
+          "item": "https://agentpc.pawanpaudel.com.np/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Desktop MCP server setup and tools",
+          "item": "https://agentpc.pawanpaudel.com.np/mcp"
+        }
+      ]
+    }
+    </script>
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
     <header class="shell">
       <nav class="nav" aria-label="Main navigation">
-        <a class="brand" href="index.html">
+        <a class="brand" href="/">
           <img src="favicon.svg" width="36" height="36" alt="" decoding="async" />
           <span>agentpc</span>
           <span class="version" translate="no">v0.1.11</span>
         </a>
         <div class="nav-links">
-          <a href="index.html#install">Install</a>
-          <a href="index.html#features">Features</a>
-          <a href="mcp.html" aria-current="page">MCP</a>
-          <a href="cli.html">CLI</a>
-          <a href="guide.html">Guide</a>
+          <a href="/#install">Install</a>
+          <a href="/#features">Features</a>
+          <a href="/mcp" aria-current="page">MCP</a>
+          <a href="/cli">CLI</a>
+          <a href="/guide">Guide</a>
           <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
         </div>
       </nav>
@@ -45,8 +70,8 @@
     <main id="main">
       <section class="shell hero compact">
         <div class="hero-inner">
-          <p class="eyebrow">Documentation</p>
-          <h1>MCP</h1>
+          <p class="eyebrow"><a href="/">Home</a> / Documentation</p>
+          <h1>Desktop MCP server setup and tools</h1>
           <p class="hero-copy">
             <code translate="no">agentpc mcp</code> is one stdio MCP server for every VM. Agents use it
             to create desktops, drive them, take screenshots and reset them, with no human in the loop.
@@ -456,11 +481,11 @@ forward_port    { "name": "ubuntu-1", "guest_port": 3000 }  <span class="comment
       <div class="shell">
         <span>agentpc by <a href="https://github.com/pawanpaudel93">Pawan Paudel</a> · MIT license</span>
         <span>
-          <a href="index.html">Home</a>
+          <a href="/">Home</a>
           ·
-          <a href="cli.html">CLI</a>
+          <a href="/cli">CLI</a>
           ·
-          <a href="guide.html">Guide</a>
+          <a href="/guide">Guide</a>
           ·
           <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
         </span>

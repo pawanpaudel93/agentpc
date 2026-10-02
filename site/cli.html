@@ -3,40 +3,65 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>agentpc CLI</title>
+    <title>Windows and Linux VM CLI Reference | agentpc</title>
     <meta
       name="description"
-      content="agentpc CLI reference: create, checkpoint, reset and control Windows, Ubuntu and Arch Linux ARM desktop VMs from your Mac's terminal."
+      content="Manage Windows, Ubuntu and Arch Linux ARM VMs from your Mac terminal: create, reset, checkpoint, SSH, transfer files and forward ports with agentpc."
     />
-    <meta property="og:title" content="agentpc CLI" />
+    <meta property="og:title" content="Windows and Linux VM CLI Reference | agentpc" />
     <meta
       property="og:description"
-      content="Create, checkpoint, reset and control Windows, Ubuntu and Arch Linux ARM VMs from your terminal."
+      content="Manage Windows, Ubuntu and Arch Linux ARM VMs from your Mac terminal: create, reset, checkpoint, SSH, transfer files and forward ports with agentpc."
     />
     <meta property="og:type" content="website" />
     <meta property="og:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta property="og:url" content="https://agentpc.pawanpaudel.com.np/cli.html" />
+    <meta property="og:url" content="https://agentpc.pawanpaudel.com.np/cli" />
+    <link rel="canonical" href="https://agentpc.pawanpaudel.com.np/cli" />
+    <meta name="twitter:title" content="Windows and Linux VM CLI Reference | agentpc" />
+    <meta name="twitter:description" content="Manage Windows, Ubuntu and Arch Linux ARM VMs from your Mac terminal: create, reset, checkpoint, SSH, transfer files and forward ports with agentpc." />
+    <meta name="twitter:image" content="https://agentpc.pawanpaudel.com.np/og.png" />
+    <meta property="og:image:alt" content="agentpc — desktop VMs for AI agents" />
     <meta name="theme-color" content="#1b1f4b" />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="apple-touch-icon.png" />
     <link rel="stylesheet" href="styles.css" />
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "Home",
+          "item": "https://agentpc.pawanpaudel.com.np/"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Windows and Linux VM CLI reference",
+          "item": "https://agentpc.pawanpaudel.com.np/cli"
+        }
+      ]
+    }
+    </script>
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
     <header class="shell">
       <nav class="nav" aria-label="Main navigation">
-        <a class="brand" href="index.html">
+        <a class="brand" href="/">
           <img src="favicon.svg" width="36" height="36" alt="" decoding="async" />
           <span>agentpc</span>
           <span class="version" translate="no">v0.1.11</span>
         </a>
         <div class="nav-links">
-          <a href="index.html#install">Install</a>
-          <a href="index.html#features">Features</a>
-          <a href="mcp.html">MCP</a>
-          <a href="cli.html" aria-current="page">CLI</a>
-          <a href="guide.html">Guide</a>
+          <a href="/#install">Install</a>
+          <a href="/#features">Features</a>
+          <a href="/mcp">MCP</a>
+          <a href="/cli" aria-current="page">CLI</a>
+          <a href="/guide">Guide</a>
           <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
         </div>
       </nav>
@@ -45,8 +70,8 @@
     <main id="main">
       <section class="shell hero compact">
         <div class="hero-inner">
-          <p class="eyebrow">Documentation</p>
-          <h1>CLI</h1>
+          <p class="eyebrow"><a href="/">Home</a> / Documentation</p>
+          <h1>Windows and Linux VM CLI reference</h1>
           <p class="hero-copy">
             Everything agents do over MCP, you can do from Terminal with
             <code translate="no">agentpc</code>, plus image builds, setup and updates.
@@ -205,7 +230,7 @@
             <p>
               An image is a read-only disk with the OS, desktop and agent tools installed. Images are
               named <code translate="no">&lt;os&gt;-&lt;version&gt;</code> and can be installed side by side.
-              See the <a href="guide.html#images">guide</a> for the versions available.
+              See the <a href="/guide#images">guide</a> for the versions available.
             </p>
             <table class="data-table">
               <thead>
@@ -291,11 +316,11 @@
       <div class="shell">
         <span>agentpc by <a href="https://github.com/pawanpaudel93">Pawan Paudel</a> · MIT license</span>
         <span>
-          <a href="index.html">Home</a>
+          <a href="/">Home</a>
           ·
-          <a href="mcp.html">MCP</a>
+          <a href="/mcp">MCP</a>
           ·
-          <a href="guide.html">Guide</a>
+          <a href="/guide">Guide</a>
           ·
           <a class="nav-github" href="https://github.com/pawanpaudel93/agentpc">GitHub</a>
         </span>
