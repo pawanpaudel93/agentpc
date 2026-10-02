@@ -221,7 +221,7 @@ enum ImageCmd {
     #[command(after_help = "\
 Images are <os>-<version>; a bare os means the default version.
   ubuntu-<release>            any release at cloud-images.ubuntu.com/releases (default 24.04)
-  ubuntu-<release>-x86apps    also runs x86_64/i386 Linux programs, through FEX (ubuntu-x86apps)
+  ubuntu-<release>-x86apps    also runs x86_64/i386 Linux programs, through FEX (22.04, 24.04)
   windows-11-25h2             Windows 11 25H2 Home/Pro (default: windows, windows-11)
   windows-11-24h2             Windows 11 24H2 Home/Pro (archive mirror)
   windows-11-23h2             Windows 11 23H2 Home/Pro (archive mirror)

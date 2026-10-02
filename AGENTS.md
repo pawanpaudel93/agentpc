@@ -106,8 +106,8 @@ Rules:
 - Don't create instances you won't use, and `delete_vm` your instances when done.
   Each running VM takes 4 GB (ubuntu, arch) or 8 GB (windows) of RAM.
 - `create_vm ubuntu` downloads the Ubuntu image on first use (~1.2 GB); pass `version`
-  (e.g. "22.04") for another release, or `version: "x86apps"` (`ubuntu-<release>-x86apps`) for
-  Ubuntu that also runs x86 Linux programs (downloaded on first use, or built locally, ~8 min,
+  (e.g. "22.04") for another release, or `version: "x86apps"` (`ubuntu-24.04-x86apps`; also
+  "22.04-x86apps": x86apps is for 22.04 and 24.04 only) for Ubuntu that also runs x86 Linux programs (downloaded on first use, or built locally, ~8 min,
   if the download fails). `create_vm arch` (`arch-rolling`; `version` may be `x86apps`, or pin
   a published build, `rolling-YYYYMMDD` / `rolling-x86apps-YYYYMMDD`) downloads the Arch image
   on first use, or builds it locally (~6 min; ~10 min for x86apps) if the download fails.
@@ -148,7 +148,7 @@ Rules:
   `guests/<os>/prepare.*` runs in the guest every time a snapshot is captured (agent defaults:
   no pop-ups or updates, Chrome on Ubuntu, Chromium flags on Arch), so it also upgrades
   existing and pulled images.
-  On `ubuntu-<release>-x86apps` images, `guests/ubuntu/x86apps.sh` runs first: FEX (tag and
+  On `ubuntu-<release>-x86apps` images (22.04 and 24.04, which have a pinned x86 root filesystem), `guests/ubuntu/x86apps.sh` runs first: FEX (tag and
   commit pinned there) built static-pie from source with `guests/ubuntu/fex.patch` (so x86
   containers work; bumping the pin may need the patch rebased), its x86 root filesystem,
   amd64 apt sources, and `agentpc-fex-tso`. On `arch-rolling-x86apps`, `guests/arch/x86apps.sh`
@@ -169,8 +169,9 @@ Rules:
 - `plugin/` is the Claude plugin (MCP server + `skills/agentpc/SKILL.md`), listed by
   `.claude-plugin/marketplace.json`. Keep the skill's tool guidance in sync with the
   "Using the VMs" section above; check with `claude plugin validate plugin --strict`.
-- Verify with `cargo clippy -- -D warnings` plus a real instance (`agentpc create ubuntu`, then
-  the MCP tools). Unit tests can't cover the VM paths. After changing `guests/`, the desktop
+- Verify with `scripts/check.sh` (every CI check: fmt, clippy, tests, shellcheck, the guest
+  helper tests, plugin validation; `release.sh` runs it too) plus a real instance (`agentpc create
+  ubuntu`, then the MCP tools). Unit tests can't cover the VM paths. After changing `guests/`, the desktop
   driver or the MCP gateway, rebuild the affected images and run `scripts/smoke.py --bin
   target/release/agentpc`: it drives fresh VMs through the MCP server like an agent does.
 - Never commit `target/`.

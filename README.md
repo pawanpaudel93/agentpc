@@ -281,7 +281,7 @@ full name when the release matters, e.g. in test harnesses.
 | `ubuntu` = `ubuntu-24.04` | Official Ubuntu 24.04 cloud image | `image pull` (automatic on first `create`) or `image build` |
 | `ubuntu-<release>` | Any release in [cloud-images.ubuntu.com/releases](https://cloud-images.ubuntu.com/releases/), e.g. `22.04`, `26.04` | `image build ubuntu-22.04`, or `image pull` if published |
 | `ubuntu-x86apps` = `ubuntu-24.04-x86apps` | Ubuntu 24.04 that also runs x86_64 and i386 Linux programs (see [x86_64 Linux programs](#x86_64-linux-programs)) | `image pull` (automatic on first `create`; built locally, ~8 min, if the download fails) or `image build ubuntu-x86apps` |
-| `ubuntu-<release>-x86apps` | Another release with x86 programs, e.g. `ubuntu-22.04-x86apps` | `image build ubuntu-22.04-x86apps`, or `image pull` if published |
+| `ubuntu-22.04-x86apps` | 22.04 with x86 programs (x86apps is for 22.04 and 24.04 only) | `image build ubuntu-22.04-x86apps`, or `image pull` if published |
 | `arch` = `arch-rolling` | [Arch Linux ARM](https://archlinuxarm.org) (a community port of Arch), installed from its aarch64 tarball in an Ubuntu helper VM | `image pull` (automatic on first `create`; built locally, ~6 min, if the download fails) or `image build arch` (needs the Ubuntu image, fetched if missing) |
 | `arch-x86apps` = `arch-rolling-x86apps` | Arch Linux ARM that also runs x86_64 and i386 Linux programs (see [x86_64 Linux programs](#x86_64-linux-programs)) | `image pull` (automatic on first `create`; built locally, ~10 min, if the download fails) or `image build arch-x86apps` |
 | `windows-11-25h2` (`windows`) | Windows 11 25H2 (Home/Pro), 7.3 GB ISO from Microsoft | `image build windows` |

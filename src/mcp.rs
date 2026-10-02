@@ -322,7 +322,7 @@ enum OsArg {
 struct CreateArgs {
     os: OsArg,
     /// Default: ubuntu 24.04, windows 11, arch rolling. Ubuntu: any release, e.g. "22.04", "26.04";
-    /// "x86apps" (or "<release>-x86apps", e.g. "22.04-x86apps") is Ubuntu that also runs
+    /// "x86apps" (or "22.04-x86apps"; x86apps is for 22.04 and 24.04 only) is Ubuntu that also runs
     /// x86_64 and i386 Linux programs; "24.04-YYYYMMDD" pins a published build (download-only).
     /// Windows: "11-25h2", "11-24h2" or "11-23h2". Omitted, Windows uses 25H2, or the newest
     /// installed Windows 11 image if 25H2 isn't built. Arch: the default, "rolling"; "x86apps"
