@@ -56,7 +56,7 @@ URL="https://github.com/$REPO/releases/download/v$VERSION/$ASSET"
 
 # --- download + verify -----------------------------------------------------
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/agentpc-install.XXXXXX")
-trap 'rm -rf "$TMP"' EXIT INT TERM
+trap 'rm -rf "$TMP" ${NEW:+"$NEW"}' EXIT INT TERM
 
 say "Downloading agentpc $VERSION"
 curl -fSL --retry 3 --progress-bar -o "$TMP/$ASSET" "$URL" || die "download failed: $URL"
@@ -75,9 +75,11 @@ SRC=$(find "$TMP" -type f -name agentpc -perm -u+x | head -n 1)
 # --- install ---------------------------------------------------------------
 mkdir -p "$INSTALL_DIR"
 # Copy then rename, so a running agentpc (e.g. an open MCP session) keeps its old inode.
-cp "$SRC" "$INSTALL_DIR/.agentpc.new"
-chmod 755 "$INSTALL_DIR/.agentpc.new"
-mv -f "$INSTALL_DIR/.agentpc.new" "$INSTALL_DIR/agentpc"
+# A temp name of its own, so two installers at once can't write into each other's copy.
+NEW=$(mktemp "$INSTALL_DIR/.agentpc.XXXXXX")
+cp "$SRC" "$NEW"
+chmod 755 "$NEW"
+mv -f "$NEW" "$INSTALL_DIR/agentpc"
 BIN="$INSTALL_DIR/agentpc"
 say "Installed $BIN"
 

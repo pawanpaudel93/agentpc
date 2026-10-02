@@ -49,6 +49,11 @@ check "sudo -v passes through" "sudo|-v|" "$(sudo_ -v)"
 check "sudo -k alone passes through" "sudo|-k|" "$(sudo_ -k)"
 check "sudo -k cmd still runs the command as x86" "sudo|-k|/x/$x|id|" "$(sudo_ -k id | sed "s|$t/real|/x|g")"
 check "sudo -i opens an x86 bash" "sudo|-i|/x/FEXBash|" "$(sudo_ -i | sed "s|$t/real|/x|g")"
+check "bare sudo is the real sudo's (no shell)" "sudo|" "$(sudo_)"
+check "sudo -ki opens an x86 bash" "sudo|-ki|/x/FEXBash|" "$(sudo_ -ki | sed "s|$t/real|/x|g")"
+check "sudo -s opens an x86 bash" "sudo|-s|/x/FEXBash|" "$(sudo_ -s | sed "s|$t/real|/x|g")"
+check "sudo --login opens an x86 bash" "sudo|--login|/x/FEXBash|" "$(sudo_ --login | sed "s|$t/real|/x|g")"
+check "sudo -E alone is the real sudo's" "sudo|-E|" "$(sudo_ -E)"
 check "an argument with spaces survives" "sudo|/x/$x|sh|-c|echo a b|" "$(sudo_ sh -c 'echo a b' | sed "s|$t/real|/x|g")"
 
 # --- maintscript-uname / maintscript-dpkg ---
@@ -66,6 +71,10 @@ check "uname -a in an amd64 maintainer script" "Linux vm 6.8.0 x86_64 GNU/Linux"
     "$(DPKG_MAINTSCRIPT_ARCH=amd64 u -a)"
 check "uname -m in an i386 maintainer script" i686 "$(DPKG_MAINTSCRIPT_ARCH=i386 u -m)"
 check "uname -m in an arm64 maintainer script" aarch64 "$(DPKG_MAINTSCRIPT_ARCH=arm64 u -m)"
+printf '#!/bin/sh\nexit 7\n' > "$t/real/failing"; chmod 755 "$t/real/failing"
+cp "$helpers/maintscript-uname" "$t/bin/failing"
+DPKG_MAINTSCRIPT_ARCH=amd64 "$sh_" "$t/bin/failing" -m >/dev/null 2>&1
+check "a failing command's status survives the wrapper" 7 "$?"
 check "arch in an amd64 maintainer script" x86_64 "$(DPKG_MAINTSCRIPT_ARCH=amd64 a -m)"
 check "dpkg --print-architecture outside" "real-dpkg --print-architecture" "$(d --print-architecture)"
 check "dpkg --print-architecture in amd64" amd64 "$(DPKG_MAINTSCRIPT_ARCH=amd64 d --print-architecture)"
@@ -119,10 +128,35 @@ unit "$t/lib" multi.service "Type=oneshot
 ExecStart=$t/x86prog
 ExecStart=$t/armprog
 $hard"
+# A unit hardened only by a later-sorting drop-in of its own: ours must sort after it.
+unit "$t/lib" late.service "ExecStart=$t/x86prog"
+mkdir -p "$t/lib/late.service.d"
+printf '[Service]\nMemoryDenyWriteExecute=yes\n' > "$t/lib/late.service.d/zzz-hardening.conf"
 "$sh_" "$helpers/agentpc-fex" "$t/out"
+# Hardening for many units at once: a prefix drop-in, a template drop-in, all services.
+w=$t/wide; mkdir -p "$w/lib" "$w/etc"
+unit "$w/lib" app-web.service "ExecStart=$t/x86prog"
+unit "$w/lib" app-arm.service "ExecStart=$t/armprog"
+unit "$w/lib" job@.service "ExecStart=$t/i386prog %i"
+unit "$w/lib" plain.service "ExecStart=$t/x86prog"
+mkdir -p "$w/etc/app-.service.d" "$w/etc/job@.service.d"
+printf '[Service]\nLockPersonality=yes\n' > "$w/etc/app-.service.d/harden.conf"
+printf '[Service]\nMemoryDenyWriteExecute=yes\n' > "$w/etc/job@.service.d/harden.conf"
+AGENTPC_UNIT_DIRS="$w/etc $w/lib" "$sh_" "$helpers/agentpc-fex" "$w/out"
+check "prefix and template drop-ins: their x86 units relaxed, others not" \
+    "app-web.service.d job@.service.d " "$(cd "$w/out" 2>/dev/null && ls -d -- *.d | sort | tr '\n' ' ')"
+mkdir -p "$w/etc/service.d"
+printf '[Service]\nMemoryDenyWriteExecute=yes\n' > "$w/etc/service.d/harden.conf"
+rm -rf "$w/out"
+AGENTPC_UNIT_DIRS="$w/etc $w/lib" "$sh_" "$helpers/agentpc-fex" "$w/out"
+check "an all-services drop-in: every x86 service relaxed" \
+    "app-web.service.d job@.service.d plain.service.d " "$(cd "$w/out" 2>/dev/null && ls -d -- *.d | sort | tr '\n' ' ')"
 got=$(cd "$t/out" 2>/dev/null && ls -d -- *.d | sort | tr '\n' ' ')
 check "generator relaxes exactly the hardened x86 units" \
-    "dropin.service.d i386.service.d multi.service.d over.service.d quoted.service.d x86.service.d " "$got"
+    "dropin.service.d i386.service.d late.service.d multi.service.d over.service.d quoted.service.d x86.service.d " "$got"
+check "ours sorts after a unit's zzz-hardening.conf" "zzz-hardening~agentpc-fex.conf" "$(ls "$t/out/late.service.d")"
+check "and after it in byte order" "zzz-hardening~agentpc-fex.conf" \
+    "$(printf '%s\n' zzz-hardening.conf zzz-hardening~agentpc-fex.conf | LC_ALL=C sort | tail -n 1)"
 check "generator drop-in content" "[Service] MemoryDenyWriteExecute=no LockPersonality=no" \
     "$(grep -v '^#' "$t/out/x86.service.d/zz-agentpc-fex.conf" | tr '\n' ' ' | sed 's/ $//')"
 check "the drop-in sorts after the unit's own (hardening.conf, 50-x.conf)" zz-agentpc-fex.conf \

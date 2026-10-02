@@ -15,6 +15,9 @@ fex_version=2609.1
 # The commit the FEX-$fex_version tag points to (its peeled ^{} commit): a moved tag fails the build.
 fex_commit=9fbdc00bd6401aff3b32d79e78ff98b8a13e4dcf
 # The patch is part of the build: a changed one rebuilds FEX like a new version does.
+# agentpc uploads the patch before running this; without it the checksum below would be empty
+# and set off a rebuild that fails at the end.
+[ -f /tmp/agentpc-fex.patch ] || { echo "no /tmp/agentpc-fex.patch" >&2; exit 1; }
 fex_patch=$(sha256sum /tmp/agentpc-fex.patch | cut -d" " -f1)
 if [ "$(cat /var/lib/agentpc/fex-version 2>/dev/null)" != "$fex_version" ] ||
     [ "$(cat /var/lib/agentpc/fex-patch 2>/dev/null)" != "$fex_patch" ]; then
@@ -51,10 +54,11 @@ if [ "$(cat /var/lib/agentpc/fex-version 2>/dev/null)" != "$fex_version" ] ||
     rm -rf "$src"
     apt-get purge -y -q --autoremove $build_deps >/dev/null
     mkdir -p /var/lib/agentpc
+    # binfmt_misc's F flag holds the interpreter open: re-register the new one. Before the
+    # stamps, so a failed registration is retried on the next run instead of skipped.
+    systemctl restart systemd-binfmt
     echo "$fex_version" > /var/lib/agentpc/fex-version
     echo "$fex_patch" > /var/lib/agentpc/fex-patch
-    # binfmt_misc's F flag holds the interpreter open: re-register the new one.
-    systemctl restart systemd-binfmt
 fi
 rm -f /tmp/agentpc-fex.patch
 
@@ -92,8 +96,9 @@ if [ -n "$rootfs_url" ]; then
         fi
         echo "$rootfs_url:$rootfs_sha256" > "$rootfs_stamp"
     fi
-elif [ ! -f "$rootfs" ]; then
-    # Everything a guest downloads is checked against a pin; there is none for this release.
+else
+    # Everything a guest downloads is checked against a pin; there is none for this release
+    # (and one already here from before was never checked).
     echo "no pinned x86 root filesystem for Ubuntu $VERSION_ID: x86apps images are 22.04 or 24.04" >&2
     exit 1
 fi
@@ -168,7 +173,9 @@ systemctl daemon-reload
 # amd64 .deb). FEX looks in the RootFS first, then the real filesystem, so they load from
 # /usr/lib/x86_64-linux-gnu. Ubuntu serves amd64 from archive.ubuntu.com and arm64 from
 # ports.ubuntu.com, so each source is pinned to its architecture.
-if ! dpkg --print-foreign-architectures | grep -qx amd64; then
+# Marked done only once the package lists are in: a failed `apt-get update` is retried on the
+# next run (every step here is safe to repeat), not skipped because amd64 is registered.
+if [ ! -f /var/lib/agentpc/amd64-apt ]; then
     deb822=/etc/apt/sources.list.d/ubuntu.sources
     if [ -f "$deb822" ]; then
         grep -q '^Architectures:' "$deb822" || sed -i '/^Types: deb$/a Architectures: arm64' "$deb822"
@@ -185,6 +192,9 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
     dpkg --add-architecture amd64
     apt-get -o DPkg::Lock::Timeout=300 update -q >/dev/null
+    touch /var/lib/agentpc/amd64-apt
 fi
 
+# FEX works, and so does the kernel's binfmt registration (an x86 program run directly).
 FEXBash -c true
+"$mnt/usr/bin/true"

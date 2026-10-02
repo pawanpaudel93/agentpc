@@ -103,7 +103,8 @@ RESTORE=1
 cleanup() {
   rm -rf "$BUNDLE"
   # shellcheck disable=SC2086
-  [ "$RESTORE" = 0 ] || git checkout --quiet -- $VERSION_FILES
+  # From HEAD, index included: a failed commit leaves the bump staged.
+  [ "$RESTORE" = 0 ] || git checkout --quiet HEAD -- $VERSION_FILES
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
@@ -248,9 +249,12 @@ git push origin main || die "push of main failed; the commit and tag $TAG are lo
 git push origin "$TAG" || die "push of $TAG failed; retry: git push origin $TAG"
 
 say "Creating GitHub Release $TAG"
+# A pre-release (X.Y.Z-rc1) must not become `latest`, which install.sh and `agentpc update` take.
+PRE=
+case "$VERSION" in *-*) PRE=--prerelease ;; esac
 # shellcheck disable=SC2086
-gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" --notes-file "$DIST/NOTES.md" $ASSETS ||
-  die "release failed; retry: gh release create $TAG --repo $REPO --verify-tag --title $TAG --notes-file dist/NOTES.md $ASSETS"
+gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" $PRE --notes-file "$DIST/NOTES.md" $ASSETS ||
+  die "release failed; retry: gh release create $TAG --repo $REPO --verify-tag --title $TAG $PRE --notes-file dist/NOTES.md $ASSETS"
 
 cat <<EOF
 

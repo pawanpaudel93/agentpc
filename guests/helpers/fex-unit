@@ -16,15 +16,23 @@ case $unit in
 esac
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 dir=/etc/systemd/system/$unit.d
-# Drop-ins apply in name order, so zz- comes after the unit's own (a hardening.conf, say).
-conf=$dir/zz-fex.conf
+# Drop-ins apply in name order (byte order) whatever their directory, so this one must sort
+# after every one systemd applies to the unit: a hardening.conf of its own would set the
+# options back.
+name=zz-fex.conf
+last=$(systemctl show -p DropInPaths --value "$unit" 2>/dev/null | tr ' ' '\n' |
+    sed 's|.*/||' | grep -v -e '^$' -e 'fex\.conf$' | LC_ALL=C sort | tail -n 1)
+if [ -n "$last" ] && [ "$(printf '%s\n%s\n' "$name" "$last" | LC_ALL=C sort | tail -n 1)" != "$name" ]; then
+    name=${last%.conf}~fex.conf
+fi
+conf=$dir/$name
 if [ "${2:-}" = --undo ]; then
-    rm -f "$conf" "$dir/fex.conf"
+    rm -f "$dir/fex.conf" "$dir/zz-fex.conf" "$dir"/*~fex.conf
     rmdir "$dir" 2>/dev/null || true
     echo "removed $conf"
 else
     mkdir -p "$dir"
-    rm -f "$dir/fex.conf"
+    rm -f "$dir/fex.conf" "$dir/zz-fex.conf" "$dir"/*~fex.conf
     printf '%s\n' '# From fex-unit: FEX (x86 translation) writes and runs code, and sets the personality.' \
         '[Service]' 'MemoryDenyWriteExecute=no' 'LockPersonality=no' > "$conf"
     echo "wrote $conf; restart $unit to apply it"

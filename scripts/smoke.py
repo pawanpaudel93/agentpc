@@ -300,6 +300,17 @@ def lifecycle(m, vm, r, guest):
             return st if "STATE: exited 0" in st and "smoke-job-done" in st else None
         r.check("get_job_status reports the exit code and log tail", poll(job_done, 30))
 
+    # A job killed before it could record an exit code must not read "running" forever.
+    ok, out = sh("sleep 300", background=True)
+    job = re.search(r"\(id (\d+)", out)
+    kill = re.search(r"kill (\d+)", out)
+    if job and kill:
+        sh(f"kill {kill.group(1)}")
+        def ended():
+            _, st = m.tool("get_job_status", name=vm, id=int(job.group(1)), tail_lines=1)
+            return st if "ended without an exit code" in st else None
+        r.check("a killed background job is reported ended", poll(ended, 20), out[:200])
+
     ok, out = sh("sleep 60; echo late", timeout=3)
     r.check(
         "a foreground run is killed at its timeout",
@@ -441,7 +452,7 @@ def x86apps(m, vm, r, guest="ubuntu"):
     # which the image's FEX config sets for x86 programs.
     ok, out = sh(
         "cd /tmp && curl -fsSL https://github.com/cli/cli/releases/download/v2.60.1/gh_2.60.1_linux_amd64.tar.gz"
-        " | tar xz && for i in 1 2 3; do gh_2.60.1_linux_amd64/bin/gh --version >/dev/null || exit 1; done; echo ok"
+        " | tar xz && for i in 1 2 3; do gh_2.60.1_linux_amd64/bin/gh --version >/dev/null || exit 1; done && echo ok"
     )
     r.check("an x86_64 Go program runs (3/3)", ok and out.strip().endswith("ok"), out[-300:])
 
@@ -636,6 +647,26 @@ def windows_lifecycle(m, vm, r):
             return st if "STATE: exited 0" in st and "smoke-job-done" in st else None
         r.check("windows: get_job_status reports the exit code and log tail", poll(job_done, 60))
 
+    # A cmdlet failure sets no exit code; the job must still not report success.
+    ok, out = ps("Get-Item C:\\no-such-file", background=True)
+    job = re.search(r"\(id (\d+)", out)
+    if job:
+        def failed():
+            _, st = m.tool("get_job_status", name=vm, id=int(job.group(1)), tail_lines=5)
+            return st if "STATE: exited" in st else None
+        st = poll(failed, 60) or ""
+        r.check("windows: a background job whose cmdlet fails exits non-zero", "STATE: exited 1" in st, st[:200])
+
+    ok, out = ps("Start-Sleep 300", background=True)
+    job = re.search(r"\(id (\d+)", out)
+    if job:
+        time.sleep(3)
+        ps(f"Stop-ScheduledTask agentpc-bg-{job.group(1)}")
+        def ended():
+            _, st = m.tool("get_job_status", name=vm, id=int(job.group(1)), tail_lines=1)
+            return st if "ended without an exit code" in st else None
+        r.check("windows: a stopped background job is reported ended", poll(ended, 30), out[:200])
+
     ok, out = ps("Start-Sleep 60; 'late'", timeout=3)
     r.check("windows: a foreground run stops at its timeout", not ok and "timed out after 3s" in out and "late" not in out, out[:300])
 
@@ -781,10 +812,14 @@ def main():
     ap.add_argument("--bin", default="agentpc", help="agentpc binary to test")
     ap.add_argument("--os", default="ubuntu,windows", help="comma-separated: ubuntu,windows,x86apps,arch,arch-x86apps")
     a = ap.parse_args()
+    names = [o.strip() for o in a.os.split(",") if o.strip()]
+    known = {"ubuntu", "windows", "x86apps", "arch", "arch-x86apps"}
+    if not names or any(n not in known for n in names):
+        ap.error(f"--os takes one or more of: {', '.join(sorted(known))}")
 
     reap_stale_vms(a.bin)
     failed = 0
-    for os_name in [o.strip() for o in a.os.split(",") if o.strip()]:
+    for os_name in names:
         vm = f"smoke-{os_name}-{os.getpid()}"
         print(f"{os_name}: {vm}")
         m = Mcp(a.bin)
@@ -808,11 +843,14 @@ def main():
         except Exception as e:  # report and keep going to cleanup
             r.check("no unexpected error", False, repr(e)[:300])
         finally:
+            # A VM left behind is a failure too (it would pile up across runs).
             try:
-                m.tool("delete_vm", name=vm)
+                ok, out = m.tool("delete_vm", name=vm)
+                r.check("delete_vm", ok or "no instance" in out, out[:200])
             except Exception as e:
-                print(f"  (could not delete {vm}: {e})")
-            m.close()
+                r.check("delete_vm", False, repr(e)[:200])
+            finally:
+                m.close()
         print(f"  {os_name}: {r.failed} failed, {m.calls} tool calls, {time.time() - start:.0f}s")
         failed += r.failed
     sys.exit(1 if failed else 0)

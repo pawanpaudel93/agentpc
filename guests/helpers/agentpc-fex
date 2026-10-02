@@ -16,13 +16,42 @@ is_x86() {
     case $(od -An -t u2 -j 18 -N 2 "$1" 2>/dev/null | tr -d ' ') in 62|3) return 0 ;; esac
     return 1
 }
-# Only units that set either directive need a look: one grep per directory finds them.
+# Drop-in directories that apply to a unit, most general first: every service (service.d),
+# each dash prefix of its name (a-.service.d, a-b-.service.d), its template (a@.service.d),
+# then the unit's own.
+dropin_dirs() {
+    u=$1
+    printf '%s\n' service.d
+    base=${u%.service}
+    stem=${base%%@*}
+    p=
+    rest=$stem
+    while [ "${rest#*-}" != "$rest" ]; do
+        p=$p${rest%%-*}-
+        rest=${rest#*-}
+        printf '%s\n' "$p.service.d"
+    done
+    [ "$stem" != "$base" ] && printf '%s\n' "$stem@.service.d"
+    printf '%s\n' "$u.d"
+}
+hard='^[[:space:]]*(MemoryDenyWriteExecute|LockPersonality)[[:space:]]*=[[:space:]]*(yes|true|on|1)'
+# Only units that set either directive need a look: one grep per directory finds them. A
+# setting in a drop-in for many units (all services, a prefix, a template) puts every
+# service in question.
 # shellcheck disable=SC2086
-units=$(for dir in $dirs; do
+found=$(for dir in $dirs; do
     [ -d "$dir" ] || continue
-    grep -lsE '^[[:space:]]*(MemoryDenyWriteExecute|LockPersonality)[[:space:]]*=[[:space:]]*(yes|true|on|1)' \
-        "$dir"/*.service "$dir"/*.service.d/*.conf
+    grep -lsE "$hard" "$dir"/*.service "$dir"/*.service.d/*.conf "$dir"/service.d/*.conf
 done | sed -E 's|\.d/[^/]*$||; s|.*/||' | sort -u)
+if printf '%s\n' "$found" | grep -qxE 'service|.*-\.service|.*@\.service'; then
+    # shellcheck disable=SC2086
+    units=$(for dir in $dirs; do
+        [ -d "$dir" ] || continue
+        for f in "$dir"/*.service; do [ -f "$f" ] && printf '%s\n' "${f##*/}"; done
+    done | sort -u)
+else
+    units=$found
+fi
 for unit in $units; do
     file=
     # shellcheck disable=SC2086
@@ -30,12 +59,19 @@ for unit in $units; do
         if [ -f "$dir/$unit" ]; then file=$dir/$unit; break; fi
     done
     [ -n "$file" ] || continue
-    # Its drop-ins from every directory, in name order; a name in a higher directory hides the
-    # same name lower down. Applied after the unit file, so the last ExecStart= wins.
-    # shellcheck disable=SC2086
-    dropins=$(for dir in $dirs; do
-        for f in "$dir/$unit.d"/*.conf; do [ -f "$f" ] && printf '%s\n' "$f"; done
-    done | awk -F/ '!seen[$NF]++ { print $NF "\t" $0 }' | sort | cut -f2-)
+    # Its drop-ins from every directory and every level, in name order; a name in a more
+    # specific level, or a higher directory, hides the same name elsewhere. Applied after the
+    # unit file, so the last ExecStart= wins.
+    dropins=$(dropin_dirs "$unit" | awk '{ print NR "\t" $0 }' | sort -rn | cut -f2- |
+        while IFS= read -r d; do
+            # shellcheck disable=SC2086
+            for dir in $dirs; do
+                for f in "$dir/$d"/*.conf; do [ -f "$f" ] && printf '%s\n' "$f"; done
+            done
+        done | awk -F/ '!seen[$NF]++ { print $NF "\t" $0 }' | LC_ALL=C sort | cut -f2-)
+    # Nothing here sets the options (a template or prefix drop-in that does applies to other
+    # units): leave it alone.
+    { cat "$file"; for f in $dropins; do cat "$f"; done; } 2>/dev/null | grep -qE "$hard" || continue
     # Every ExecStart= that stays (a oneshot unit may have several), prefixes (-@:+!)
     # dropped; an empty one clears those before it.
     cmds=$( { cat "$file"; for f in $dropins; do cat "$f"; done; } 2>/dev/null |
@@ -57,10 +93,16 @@ for unit in $units; do
 $cmds
 EOF_CMDS
     [ -n "$x86" ] || continue
+    # Drop-ins apply in name order whatever their directory or level (byte order, as
+    # systemd compares them), so this one must sort after every one that applies: a unit's
+    # own hardening.conf would set the options back.
+    name=zz-agentpc-fex.conf
+    last=$(for f in $dropins; do printf '%s\n' "${f##*/}"; done | LC_ALL=C sort | tail -n 1)
+    if [ -n "$last" ] && [ "$(printf '%s\n%s\n' "$name" "$last" | LC_ALL=C sort | tail -n 1)" != "$name" ]; then
+        name=${last%.conf}~agentpc-fex.conf
+    fi
     mkdir -p "$out/$unit.d"
-    # Drop-ins apply in name order whatever their directory, so a unit's own hardening.conf
-    # would set the options back after this one; zz- sorts last.
     printf '%s\n' "# agentpc-fex generator: $x86 is an x86 program, which FEX runs." \
-        '[Service]' 'MemoryDenyWriteExecute=no' 'LockPersonality=no' > "$out/$unit.d/zz-agentpc-fex.conf"
+        '[Service]' 'MemoryDenyWriteExecute=no' 'LockPersonality=no' > "$out/$unit.d/$name"
 done
 exit 0

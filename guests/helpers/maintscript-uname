@@ -11,4 +11,6 @@ case ${DPKG_MAINTSCRIPT_ARCH:-} in
     i386) m=i686 ;;
     *) exec "$real" "$@" ;;
 esac
-"$real" "$@" | sed "s/aarch64/$m/g"
+# The real command's status stays: a pipe would report sed's.
+out=$("$real" "$@") || exit
+printf '%s\n' "$out" | sed "s/aarch64/$m/g"

@@ -12,6 +12,9 @@ fex_version=2609.1
 # The commit the FEX-$fex_version tag points to (its peeled ^{} commit): a moved tag fails the build.
 fex_commit=9fbdc00bd6401aff3b32d79e78ff98b8a13e4dcf
 # The patch is part of the build: a changed one rebuilds FEX like a new version does.
+# agentpc uploads the patch before running this; without it the checksum below would be empty
+# and set off a rebuild that fails at the end.
+[ -f /tmp/agentpc-fex.patch ] || { echo "no /tmp/agentpc-fex.patch" >&2; exit 1; }
 fex_patch=$(sha256sum /tmp/agentpc-fex.patch | cut -d" " -f1)
 if [ "$(cat /var/lib/agentpc/fex-version 2>/dev/null)" != "$fex_version" ] ||
     [ "$(cat /var/lib/agentpc/fex-patch 2>/dev/null)" != "$fex_patch" ]; then
@@ -45,10 +48,11 @@ if [ "$(cat /var/lib/agentpc/fex-version 2>/dev/null)" != "$fex_version" ] ||
     # shellcheck disable=SC2086
     pacman -Rns --noconfirm $build_deps >/dev/null
     mkdir -p /var/lib/agentpc
+    # binfmt_misc's F flag holds the interpreter open: re-register the new one. Before the
+    # stamps, so a failed registration is retried on the next run instead of skipped.
+    systemctl restart systemd-binfmt
     echo "$fex_version" > /var/lib/agentpc/fex-version
     echo "$fex_patch" > /var/lib/agentpc/fex-patch
-    # binfmt_misc's F flag holds the interpreter open: re-register the new one.
-    systemctl restart systemd-binfmt
 fi
 rm -f /tmp/agentpc-fex.patch
 
@@ -170,4 +174,6 @@ mkdir -p /etc/systemd/system-generators
 install -m 755 /tmp/agentpc-helpers/agentpc-fex /etc/systemd/system-generators/agentpc-fex
 systemctl daemon-reload
 
+# FEX works, and so does the kernel's binfmt registration (an x86 program run directly).
 FEXBash -c true
+"$rootfs/usr/bin/true"
