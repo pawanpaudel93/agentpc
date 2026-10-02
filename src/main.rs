@@ -267,7 +267,7 @@ or use any other name (windows-custom).")]
         #[arg(required = true)]
         images: Vec<String>,
     },
-    /// Recapture the RAM snapshot new VMs resume from (build and pull do this)
+    /// Apply this agentpc's guest setup to the image and recapture the snapshot VMs resume from (build and pull do this; its VMs must be deleted first)
     Snapshot {
         /// Image, e.g. ubuntu-24.04
         image: String,

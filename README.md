@@ -249,7 +249,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 | `agentpc image ls` (`list`) | List local images with their OS versions |
 | `agentpc image info <image>` | Version, source, build date and desktop server of an image |
 | `agentpc image rm <image>…` (`delete`) | Delete local images (refused while VMs, or a build, pull or snapshot, use one) |
-| `agentpc image snapshot <image>` | Recapture the snapshot VMs resume from (build and pull do this) |
+| `agentpc image snapshot <image>` | Apply this agentpc's guest setup to the image and recapture the snapshot VMs resume from (build and pull do this); its VMs must be deleted first |
 | `agentpc image push <image>` | Maintainers: publish an Ubuntu or Arch image to ghcr.io |
 
 ### Setup
