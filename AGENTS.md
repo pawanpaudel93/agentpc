@@ -117,7 +117,8 @@ Rules:
   (`windows-11-24h2`, `windows-11-23h2`; `agentpc image build --help` lists them).
   If `list_vms` shows no windows image, ask the user to run that. Don't start a build
   yourself unless asked.
-- The login for every guest is `agent` / `agent`. Everything binds to 127.0.0.1.
+- The login for every guest is `agent` / `agent` (desktop and sudo; SSH takes only agentpc's
+  key). Everything binds to 127.0.0.1.
 - VMs you create, start, reset or restore over MCP are stopped (never deleted) when the
   session ends, unless `AGENTPC_KEEP_RUNNING=1`. If a session's server is killed instead, the
   next agentpc MCP server to start stops them. `list_vms` shows `owner_running: false` for a VM

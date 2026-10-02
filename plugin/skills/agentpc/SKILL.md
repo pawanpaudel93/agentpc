@@ -200,8 +200,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   `agentpc image build windows` (downloads the official ISO from Microsoft, 7.3 GB). Other
   versions: `windows-11-24h2`, `windows-11-23h2`. Pass `version` (e.g. `"11-24h2"`) when the
   Windows release matters; without it you get 25H2, or the newest Windows 11 image installed.
-- Don't put real credentials or secrets into a VM. The guest login is `agent` / `agent`, and
-  the VMs are reachable from anything on the Mac.
+- Don't put real credentials or secrets into a VM. The guest login is `agent` / `agent` (desktop
+  and sudo; SSH takes only agentpc's key), and the VMs are reachable from anything on the Mac.
 - VMs you create, start, reset or restore are stopped (never deleted) when the session ends,
   unless `AGENTPC_KEEP_RUNNING=1`. If a session's server is killed instead, the
   next agentpc MCP server to start stops them. `list_vms` shows `owner_running: false` for a VM

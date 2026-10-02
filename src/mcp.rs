@@ -38,7 +38,8 @@ Flow: list_vms -> create_vm (or start_vm on one you created) -> take_screenshot 
 use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance to a clean
 install; checkpoint_vm/restore_vm save and return to any point in seconds (disk and memory) --
 checkpoint before a risky or slow-to-redo step. run_command runs PowerShell on Windows and bash
-on Ubuntu and Arch; the guest login is agent/agent. create_vm takes an optional version (Ubuntu
+on Ubuntu and Arch; the guest login is agent/agent (SSH
+takes only agentpc's key). create_vm takes an optional version (Ubuntu
 release like \"22.04\"; Windows \"11-25h2\", \"11-24h2\", \"11-23h2\"; Arch is rolling: no version,
 or \"rolling-YYYYMMDD\" / \"rolling-x86apps-YYYYMMDD\" to pin a published build; \"x86apps\" on
 Ubuntu or Arch, see below); list_vms shows which images exist.

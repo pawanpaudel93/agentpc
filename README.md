@@ -365,7 +365,8 @@ moves to its new ports the next time it starts):
 | `47300 + n` | VNC |
 | `8100` | Browser viewer, shared by all VMs |
 
-The guest login is `agent` / `agent`. Each VM also has its own VNC password (see
+The guest login is `agent` / `agent` for the desktop and `sudo`; SSH takes only agentpc's key
+(password logins are off). Each VM also has its own VNC password (see
 [Security](#security)).
 
 ## How it works
@@ -586,7 +587,11 @@ To only reclaim disk space, `agentpc clean` deletes what can be downloaded again
   from `agentpc info <name>` carries it (`&password=…`) so the browser viewer connects without a
   prompt; a native VNC client (`vnc://127.0.0.1:<port>`) asks for it — copy it from that URL or
   read `~/.agentpc/instances/<name>/vnc-pass`.
-- Guests use the fixed login `agent` / `agent`.
+- Guests use the fixed login `agent` / `agent` for the desktop and `sudo`. SSH takes only
+  agentpc's key, since every VM's SSH port is reachable from the other VMs and local users.
+- `~/.agentpc` is private to you (0700): it holds guest disks, RAM checkpoints and the SSH key.
+- The browser viewer link carries the VNC password after `#`, which no request sends, and is
+  only given out when the server on port 8100 is agentpc's own.
 - To keep agents unblocked, Windows VMs have UAC prompts, SmartScreen and Windows Update turned
   off. Don't use them for anything that needs those protections.
 - VMs can reach the internet and, through its gateway `10.0.2.2`, services on your Mac. Create
