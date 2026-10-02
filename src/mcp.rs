@@ -1503,10 +1503,16 @@ fn job_id() -> u64 {
             last + 1024
         }
     };
-    let prev = LAST
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| Some(next(last)))
-        .unwrap_or(0);
-    next(prev)
+    // A compare-exchange loop: fetch_update is deprecated on newer toolchains (try_update),
+    // and try_update is missing on older ones down to the 1.88 minimum.
+    let mut last = LAST.load(Ordering::SeqCst);
+    loop {
+        let id = next(last);
+        match LAST.compare_exchange(last, id, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return id,
+            Err(seen) => last = seen,
+        }
+    }
 }
 
 /// What a command printed on one stream: only its first and last bytes are kept while
