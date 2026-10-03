@@ -405,7 +405,9 @@ The guest login is `agent` / `agent` for the desktop and `sudo`; SSH takes only 
 - **Image distribution.** Ubuntu and Arch images are OCI artifacts on GitHub Container Registry: a
   compressed qcow2 split into 64 MB parts, downloaded in parallel and checksum-verified. A pull
   checks free disk space first; an interrupted one keeps its verified parts, and pulling again
-  resumes from them.
+  resumes from them. Every layer and the image config are checked against their manifest
+  digest and size, and the joined disk must pass `qemu-img check` before it replaces the
+  current image.
 - **Pinned downloads.** What an image build fetches is pinned and verified: FEX by tag and
   commit, the Ubuntu and Arch x86 root filesystems and cua-driver's installers and binaries by
   SHA-256, the Arch Linux ARM tarball by its signature, and Chrome from Google's signed apt

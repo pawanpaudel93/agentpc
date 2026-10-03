@@ -291,13 +291,7 @@ fn bake_base(image: &Image) -> Result<()> {
     std::fs::copy(inst.vars(), &vars_tmp)?;
     // The old snapshot was captured from the old base; it is recaptured next.
     image.remove_snapshot();
-    std::fs::rename(&vars_tmp, &vars)?;
-    std::fs::rename(&disk_tmp, &disk)?;
-    for p in [&disk, &vars] {
-        let mut perm = std::fs::metadata(p)?.permissions();
-        perm.set_readonly(true);
-        std::fs::set_permissions(p, perm)?;
-    }
+    promote_files(&disk_tmp, &vars_tmp, &disk, &vars)?;
     std::fs::remove_dir_all(&inst.dir)?;
     guard.keep();
     Ok(())
@@ -509,16 +503,9 @@ fn build_arch(image: &Image, name: &str) -> Result<()> {
     // would resume the previous build.
     image.remove_snapshot();
     // Blank vars: edk2 initializes them at first boot and finds systemd-boot on the disk.
-    // In place whole before the disk, which is what makes the image exist.
     let vars_tmp = vars.with_extension("fd.tmp");
     std::fs::File::create(&vars_tmp)?.set_len(64 << 20)?;
-    std::fs::rename(&vars_tmp, &vars)?;
-    std::fs::rename(&tmp, &disk)?;
-    for p in [&disk, &vars] {
-        let mut perm = std::fs::metadata(p)?.permissions();
-        perm.set_readonly(true);
-        std::fs::set_permissions(p, perm)?;
-    }
+    promote_files(&tmp, &vars_tmp, &disk, &vars)?;
     std::fs::remove_dir_all(&inst.dir)?;
     // The image is in place and the helper VM gone; snapshot_locked guards its own VM.
     guard.keep();
@@ -1160,6 +1147,24 @@ pub fn remove(image: &Image) -> Result<String> {
     Ok(format!("removed {image}"))
 }
 
+/// Swap a new disk and vars in for an image's current ones. The image exists while its disk
+/// does, so the old disk goes first: an interruption leaves no image (fetched or built again
+/// on next use), never a new firmware file beside the old disk or the reverse.
+fn promote_files(disk_tmp: &Path, vars_tmp: &Path, disk: &Path, vars: &Path) -> Result<()> {
+    match std::fs::remove_file(disk) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    std::fs::rename(vars_tmp, vars)?;
+    std::fs::rename(disk_tmp, disk)?;
+    for p in [disk, vars] {
+        let mut perm = std::fs::metadata(p)?.permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(p, perm)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_ssh_key() -> Result<()> {
     let key = ssh_key();
     if key.exists() {
@@ -1724,17 +1729,9 @@ fn promote_image(inst: &Instance) -> Result<()> {
     )?;
     // An old snapshot would resume the previous build.
     image.remove_snapshot();
-    // The vars go in first, whole (a temp file renamed), then the disk: the image exists
-    // once its disk does, so an interruption can't leave one with missing or cut-off vars.
     let vars_tmp = vars.with_extension("fd.tmp");
     std::fs::copy(inst.vars(), &vars_tmp)?;
-    std::fs::rename(&vars_tmp, &vars)?;
-    std::fs::rename(&tmp, &disk)?;
-    for p in [&disk, &vars] {
-        let mut perm = std::fs::metadata(p)?.permissions();
-        perm.set_readonly(true);
-        std::fs::set_permissions(p, perm)?;
-    }
+    promote_files(&tmp, &vars_tmp, &disk, &vars)?;
     std::fs::remove_dir_all(&inst.dir)?;
     let size = std::fs::metadata(&disk)?.len() as f64 / 1e9;
     log!("{image} image ready ({size:.1} GB)");
@@ -1743,6 +1740,38 @@ fn promote_image(inst: &Instance) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn promotion_never_leaves_new_vars_beside_an_old_disk() {
+        let dir = std::env::temp_dir().join(format!("agentpc-promote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (disk, vars) = (dir.join("img.qcow2"), dir.join("img.vars.fd"));
+        let (disk_tmp, vars_tmp) = (dir.join("img.qcow2.tmp"), dir.join("img.vars.fd.tmp"));
+        std::fs::write(&disk, "old disk").unwrap();
+        std::fs::write(&vars, "old vars").unwrap();
+        // Interrupted before the vars could go in: no image at all, not the old disk.
+        std::fs::write(&disk_tmp, "new disk").unwrap();
+        assert!(super::promote_files(&disk_tmp, &vars_tmp, &disk, &vars).is_err());
+        assert!(
+            !disk.exists(),
+            "an image must not exist with mismatched files"
+        );
+        // A whole promotion swaps both and leaves them read-only.
+        std::fs::write(&vars_tmp, "new vars").unwrap();
+        super::promote_files(&disk_tmp, &vars_tmp, &disk, &vars).unwrap();
+        assert_eq!(std::fs::read_to_string(&disk).unwrap(), "new disk");
+        assert_eq!(std::fs::read_to_string(&vars).unwrap(), "new vars");
+        assert!(std::fs::metadata(&disk).unwrap().permissions().readonly());
+        assert!(!disk_tmp.exists() && !vars_tmp.exists());
+        for p in [&disk, &vars] {
+            let mut perm = std::fs::metadata(p).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perm.set_readonly(false);
+            std::fs::set_permissions(p, perm).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn guest_setups_install_the_pinned_cua_driver() {
         let tag = format!("cua-driver-rs-v{}", super::CUA_DRIVER_VERSION);

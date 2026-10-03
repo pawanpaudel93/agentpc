@@ -28,6 +28,10 @@ const VARS_TYPE: &str = "application/vnd.agentpc.efi-vars";
 const PART_SIZE: &str = "64m";
 const PUSH_ATTEMPTS: u32 = 5;
 const PARALLEL_DOWNLOADS: usize = 6;
+/// Pushed parts are 64 MB and vars.fd is 64 MB; anything far larger is not an agentpc layer.
+const MAX_LAYER: u64 = 512 << 20;
+/// The image config is a small JSON document.
+const MAX_CONFIG: u64 = 64 << 10;
 
 /// One package for all images, tagged by image name (`<repo>:ubuntu-24.04`).
 /// `AGENTPC_IMAGE_REPO` overrides the repo (e.g. a local test registry).
@@ -36,8 +40,24 @@ fn reference(tag: &str) -> String {
     format!("{repo}:{tag}")
 }
 
+/// Plain HTTP only for a registry on this Mac: `localhost` or a loopback address, with an
+/// optional port. A name that merely starts with one (`localhost.example.com`) is remote.
 fn plain_http(host: &str) -> bool {
-    host.starts_with("localhost") || host.starts_with("127.0.0.1")
+    let name = match host.strip_prefix('[') {
+        // [::1]:5000
+        Some(rest) => rest.split_once(']').map_or(rest, |(h, _)| h),
+        None => host.rsplit_once(':').map_or(host, |(h, port)| {
+            if port.bytes().all(|b| b.is_ascii_digit()) {
+                h
+            } else {
+                host
+            }
+        }),
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Publish the local image (maintainers). Uses `oras` and its stored login.
@@ -304,16 +324,15 @@ async fn download(image: &Image) -> Result<()> {
     if manifest["artifactType"] != ARTIFACT_TYPE {
         bail!("{at} is not an agentpc image");
     }
-    let config_digest = manifest["config"]["digest"]
-        .as_str()
-        .context("manifest has no config")?;
-    let mut info: image::ImageInfo = auth(http.get(format!("{base}/blobs/{config_digest}")))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await
-        .context("image config is not agentpc image info")?;
+    let config = Descriptor::of(&manifest["config"], MAX_CONFIG).context("bad image config")?;
+    let config_bytes = fetch_bounded(
+        auth(http.get(format!("{base}/blobs/{}", config.digest))),
+        &config,
+    )
+    .await
+    .context("image config")?;
+    let mut info: image::ImageInfo =
+        serde_json::from_slice(&config_bytes).context("image config is not agentpc image info")?;
     info.pulled_from = Some(at);
     log!("{} (built {} from {})", info.version, info.built, info.base);
     let layers = manifest["layers"]
@@ -321,7 +340,7 @@ async fn download(image: &Image) -> Result<()> {
         .context("manifest has no layers")?;
     let total: u64 = layers.iter().filter_map(|l| l["size"].as_u64()).sum();
 
-    let blobs: Vec<Blob> = layers.iter().map(Blob::of).collect::<Result<_>>()?;
+    let blobs = Blob::all(layers)?;
 
     // Parts kept from an earlier, interrupted pull are reused when their content still
     // matches this manifest's digest; anything else there (another manifest's parts,
@@ -406,8 +425,15 @@ async fn download(image: &Image) -> Result<()> {
     }
     out.flush().await?;
     drop(out);
-    // Checked before QEMU or qemu-img ever opens it, and before the old image goes.
-    if let Err(e) = check_downloaded(&disk_tmp, &work.join("vars.fd")) {
+    // The header first, before qemu-img opens the file (it would follow a backing file);
+    // then the whole structure, so a corrupt download never replaces a working image.
+    if let Err(e) = check_downloaded(&disk_tmp, &work.join("vars.fd")).and_then(|()| {
+        run(
+            "qemu-img",
+            &["check", "-q", "-f", "qcow2", &disk_tmp.to_string_lossy()],
+        )
+        .context("the downloaded disk failed qemu-img check; the current image is kept")
+    }) {
         let _ = std::fs::remove_file(&disk_tmp);
         return Err(e);
     }
@@ -467,11 +493,43 @@ async fn anonymous_token(http: &reqwest::Client, base: &str, repo: &str) -> Resu
         .map(String::from))
 }
 
+/// A manifest's reference to a blob: its digest and declared size.
+struct Descriptor {
+    digest: String,
+    /// Hex sha256 the content must have (the digest without its `sha256:` prefix).
+    sha256: String,
+    size: u64,
+}
+
+impl Descriptor {
+    fn of(d: &Value, max: u64) -> Result<Self> {
+        let digest = d["digest"].as_str().context("no digest")?;
+        let sha256 = digest
+            .strip_prefix("sha256:")
+            .context("only sha256 digests are supported")?;
+        if sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            bail!("malformed digest {digest}");
+        }
+        let size = d["size"].as_u64().context("no size")?;
+        if size == 0 || size > max {
+            bail!("declared size {size} is out of range");
+        }
+        Ok(Self {
+            digest: digest.into(),
+            sha256: sha256.into(),
+            size,
+        })
+    }
+}
+
 /// One layer of an image manifest: a disk part or the vars.
 struct Blob {
     title: String,
     digest: String,
-    /// Hex sha256 the content must have (the digest without its `sha256:` prefix).
     sha256: String,
     size: u64,
 }
@@ -481,21 +539,57 @@ impl Blob {
         let title = l["annotations"]["org.opencontainers.image.title"]
             .as_str()
             .context("layer without title")?;
-        if title.is_empty() || title.contains('/') || title.starts_with('.') {
+        // Exactly the names a push makes. Anything looser could name another layer's
+        // in-progress `.part` file and swap content after its checksum passed.
+        let part = title
+            .strip_prefix("disk.qcow2.part-")
+            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase()));
+        if !part && title != "vars.fd" {
             bail!("bad layer title {title}");
         }
-        let digest = l["digest"].as_str().context("layer without digest")?;
-        let sha256 = digest
-            .strip_prefix("sha256:")
-            .context("only sha256 digests are supported")?
-            .to_ascii_lowercase();
+        let d = Descriptor::of(l, MAX_LAYER).with_context(|| format!("layer {title}"))?;
         Ok(Self {
             title: title.into(),
-            digest: digest.into(),
-            sha256,
-            size: l["size"].as_u64().unwrap_or(0),
+            digest: d.digest,
+            sha256: d.sha256,
+            size: d.size,
         })
     }
+
+    /// Every layer, each title once, with exactly one vars.fd and at least one disk part.
+    fn all(layers: &[Value]) -> Result<Vec<Self>> {
+        let blobs: Vec<Self> = layers.iter().map(Self::of).collect::<Result<_>>()?;
+        let mut titles = std::collections::HashSet::new();
+        for b in &blobs {
+            if !titles.insert(b.title.as_str()) {
+                bail!("layer {} appears twice", b.title);
+            }
+        }
+        if !titles.contains("vars.fd") || titles.len() < 2 {
+            bail!("image is missing its disk or vars");
+        }
+        Ok(blobs)
+    }
+}
+
+/// A small blob in memory, never more than it declares, checked against its digest.
+async fn fetch_bounded(req: reqwest::RequestBuilder, d: &Descriptor) -> Result<Vec<u8>> {
+    let mut stream = req.send().await?.error_for_status()?.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        body.extend_from_slice(&chunk?);
+        if body.len() as u64 > d.size {
+            bail!("larger than its manifest says");
+        }
+    }
+    let got: String = Sha256::digest(&body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if got != d.sha256 {
+        bail!("checksum mismatch");
+    }
+    Ok(body)
 }
 
 /// Hex sha256 of a file's content, or `None` if it can't be read.
@@ -780,28 +874,165 @@ mod tests {
 
     #[test]
     fn reads_manifest_layers() {
-        let l = serde_json::json!({
-            "digest": "sha256:ABCDEF",
-            "size": 42,
-            "annotations": {"org.opencontainers.image.title": "disk.qcow2.part-aaa"}
-        });
-        let b = Blob::of(&l).unwrap();
-        assert_eq!(b.title, "disk.qcow2.part-aaa");
-        assert_eq!(b.digest, "sha256:ABCDEF");
-        assert_eq!(b.sha256, "abcdef");
-        assert_eq!(b.size, 42);
-        for title in ["../x", "", ".hidden"] {
-            let l = serde_json::json!({
-                "digest": "sha256:ab",
+        let hex = "ab".repeat(32);
+        let layer = |title: &str, digest: &str, size: u64| {
+            serde_json::json!({
+                "digest": digest,
+                "size": size,
                 "annotations": {"org.opencontainers.image.title": title}
-            });
-            assert!(Blob::of(&l).is_err(), "{title}");
+            })
+        };
+        let b = Blob::of(&layer("disk.qcow2.part-aaa", &format!("sha256:{hex}"), 42)).unwrap();
+        assert_eq!(b.title, "disk.qcow2.part-aaa");
+        assert_eq!(b.sha256, hex);
+        assert_eq!(b.size, 42);
+        let ok = format!("sha256:{hex}");
+        // Only the names a push makes: a path, a dotfile, or another layer's `.part` temp name
+        // (which would let two downloads share a file) are refused.
+        for title in [
+            "../x",
+            "",
+            ".hidden",
+            "disk.qcow2.part-aaa.part",
+            "disk.qcow2.part-",
+            "disk.qcow2.part-AA",
+            "vars.fd.part",
+            "notes.txt",
+        ] {
+            assert!(Blob::of(&layer(title, &ok, 1)).is_err(), "{title}");
         }
-        let md5 = serde_json::json!({
-            "digest": "md5:ab",
-            "annotations": {"org.opencontainers.image.title": "vars.fd"}
-        });
-        assert!(Blob::of(&md5).is_err());
+        // Digest and size must be well formed and in range.
+        for (digest, size) in [
+            ("md5:ab", 1),
+            ("sha256:ab", 1),
+            (&*format!("sha256:{}", "AB".repeat(32)), 1),
+            (&*format!("sha256:{}", "zz".repeat(32)), 1),
+            (&*ok, 0),
+            (&*ok, MAX_LAYER + 1),
+        ] {
+            assert!(
+                Blob::of(&layer("vars.fd", digest, size)).is_err(),
+                "{digest} {size}"
+            );
+        }
+        assert!(
+            Blob::of(&serde_json::json!({
+                "digest": ok,
+                "annotations": {"org.opencontainers.image.title": "vars.fd"}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_layers_are_unique_and_complete() {
+        let ok = format!("sha256:{}", "ab".repeat(32));
+        let layer = |title: &str| {
+            serde_json::json!({
+                "digest": ok,
+                "size": 1,
+                "annotations": {"org.opencontainers.image.title": title}
+            })
+        };
+        assert!(Blob::all(&[layer("disk.qcow2.part-aaa"), layer("vars.fd")]).is_ok());
+        for layers in [
+            vec![
+                layer("vars.fd"),
+                layer("disk.qcow2.part-aaa"),
+                layer("disk.qcow2.part-aaa"),
+            ],
+            vec![layer("vars.fd")],
+            vec![layer("disk.qcow2.part-aaa")],
+            vec![],
+        ] {
+            assert!(Blob::all(&layers).is_err());
+        }
+    }
+
+    #[test]
+    fn only_loopback_registries_use_plain_http() {
+        for host in [
+            "localhost",
+            "localhost:5000",
+            "LOCALHOST",
+            "127.0.0.1",
+            "127.0.0.1:5000",
+            "127.1.2.3",
+            "[::1]:5000",
+        ] {
+            assert!(plain_http(host), "{host}");
+        }
+        for host in [
+            "ghcr.io",
+            "localhost.example.com",
+            "localhost.example.com:5000",
+            "127.0.0.1.example.com",
+            "127.0.0.1.nip.io:80",
+            "10.0.0.1",
+            "[2001:db8::1]:5000",
+        ] {
+            assert!(!plain_http(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn config_blobs_are_bounded_and_checked() {
+        use std::io::{Read, Write};
+        let body = br#"{"version":"x"}"#;
+        let sha: String = Sha256::digest(body)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (declared, digest, served, ok) in [
+            (body.len() as u64, sha.clone(), &body[..], true),
+            (body.len() as u64, "00".repeat(32), &body[..], false),
+            (4, sha.clone(), &body[..], false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let served = served.to_vec();
+            let server = std::thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut req = [0u8; 1024];
+                let _ = s.read(&mut req);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    served.len()
+                );
+                let _ = s.write_all(&served);
+            });
+            let d = Descriptor {
+                digest: format!("sha256:{digest}"),
+                sha256: digest,
+                size: declared,
+            };
+            let got = runtime.block_on(fetch_bounded(http.get(url), &d));
+            server.join().unwrap();
+            assert_eq!(got.is_ok(), ok);
+        }
+    }
+
+    #[test]
+    fn structurally_broken_qcow2_fails_the_check_that_guards_replacement() {
+        if crate::qemu::which("qemu-img").is_none() {
+            return; // qemu-img is installed wherever images are pulled
+        }
+        // A header check_downloaded accepts, with an impossible cluster size.
+        let mut h = vec![0u8; 104];
+        h[..4].copy_from_slice(b"QFI\xfb");
+        h[4..8].copy_from_slice(&3u32.to_be_bytes());
+        assert!(check_qcow2_header(&h).is_ok());
+        let p = std::env::temp_dir().join(format!("agentpc-broken-{}.qcow2", std::process::id()));
+        std::fs::write(&p, &h).unwrap();
+        let checked = run(
+            "qemu-img",
+            &["check", "-q", "-f", "qcow2", &p.to_string_lossy()],
+        );
+        std::fs::remove_file(&p).unwrap();
+        assert!(checked.is_err());
     }
 
     #[test]
