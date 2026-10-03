@@ -2,7 +2,7 @@
 //! WebSocket itself (per-instance port), so no proxy is needed.
 
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -126,8 +126,12 @@ fn verify_identity(key: &[u8], nonce: &[u8; 32], response: &str) -> bool {
 /// Prove identity with a fresh nonce, so an observed response cannot authenticate a
 /// different listener after the genuine viewer exits.
 fn ours() -> bool {
+    Viewer::local().ours()
+}
+
+fn ours_at(port: u16, token: &Path) -> bool {
     use std::io::{Read, Write};
-    let Ok(key) = read_trimmed(&token_file()) else {
+    let Ok(key) = read_trimmed(token) else {
         return false;
     };
     if key.is_empty() {
@@ -137,7 +141,7 @@ fn ours() -> bool {
         return false;
     };
     let Ok(mut s) =
-        TcpStream::connect_timeout(&([127, 0, 0, 1], PORT).into(), Duration::from_millis(300))
+        TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(300))
     else {
         return false;
     };
@@ -161,10 +165,6 @@ fn ours() -> bool {
 
 fn novnc_dir() -> PathBuf {
     cache_dir().join("novnc")
-}
-
-fn pid_file() -> PathBuf {
-    home().join("viewer.pid")
 }
 
 fn ensure_novnc() -> Result<()> {
@@ -216,58 +216,172 @@ fn ensure_novnc() -> Result<()> {
     Ok(())
 }
 
-fn listening() -> bool {
-    TcpStream::connect_timeout(&([127, 0, 0, 1], PORT).into(), Duration::from_millis(300)).is_ok()
+fn pid_file() -> PathBuf {
+    home().join("viewer.pid")
 }
 
-/// Start the detached viewer server if it isn't up.
-pub fn ensure_running() -> Result<()> {
-    if listening() {
-        if ours() {
-            return Ok(());
-        }
-        // A viewer from an older protocol gives way to this one; anything else keeps the
-        // port, and no VM's password goes near it.
-        match read_trimmed(&pid_file()).and_then(|p| Ok(p.parse::<i32>()?)) {
-            Ok(pid) if pid_is_our_viewer(pid) => {
-                kill(pid, 15);
-                for _ in 0..20 {
-                    if !listening() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-            _ => bail!("127.0.0.1:{PORT} is in use by another program; the browser viewer is off"),
+/// Serializes starting and stopping the shared viewer. It is never deleted (so every
+/// process locks the same inode) and is always the innermost lock: callers may already
+/// hold an instance lock, but nothing takes another lock while holding this one.
+fn lock_file() -> PathBuf {
+    home().join("viewer.lock")
+}
+
+/// How long a freshly spawned viewer has to answer an identity challenge.
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A started viewer server, as `Viewer::ensure` waits for it.
+trait Started {
+    fn id(&self) -> u32;
+    /// True once it has exited (for instance, it could not bind the port).
+    fn exited(&mut self) -> bool;
+    /// Stop a viewer that never became ready.
+    fn stop(&mut self);
+}
+
+impl Started for std::process::Child {
+    fn id(&self) -> u32 {
+        std::process::Child::id(self)
+    }
+    fn exited(&mut self) -> bool {
+        !matches!(self.try_wait(), Ok(None))
+    }
+    fn stop(&mut self) {
+        let _ = self.kill();
+        let _ = self.wait();
+    }
+}
+
+/// Where the shared viewer lives: its port and the files that coordinate it.
+struct Viewer {
+    port: u16,
+    lock: PathBuf,
+    token: PathBuf,
+    pid: PathBuf,
+}
+
+impl Viewer {
+    fn local() -> Self {
+        Viewer {
+            port: PORT,
+            lock: lock_file(),
+            token: token_file(),
+            pid: pid_file(),
         }
     }
-    ensure_novnc()?;
-    // A fresh private key for this viewer. Only nonce-bound HMACs cross the socket.
-    let token = hex(&random_bytes()?);
-    crate::instance::write_private(&token_file(), &token)?;
-    use std::os::unix::process::CommandExt;
-    let child = Command::new(std::env::current_exe()?)
-        .arg("__viewer")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .context("spawn viewer")?;
-    std::fs::write(pid_file(), child.id().to_string())?;
-    Ok(())
-}
 
-/// Stop the viewer once no instance is running.
-pub fn stop_if_idle() {
-    if Instance::list().is_ok_and(|l| l.iter().all(|i| !i.running())) {
-        if let Ok(pid) = read_trimmed(&pid_file()).and_then(|p| Ok(p.parse::<i32>()?))
+    fn listening(&self) -> bool {
+        TcpStream::connect_timeout(
+            &([127, 0, 0, 1], self.port).into(),
+            Duration::from_millis(300),
+        )
+        .is_ok()
+    }
+
+    fn ours(&self) -> bool {
+        ours_at(self.port, &self.token)
+    }
+
+    /// Make sure our viewer answers on the port. The whole check, key rotation, spawn,
+    /// readiness wait and PID publication run under the viewer lock, so a concurrent start
+    /// can't rotate the key between our spawn and its bind (which would leave a viewer that
+    /// can no longer prove itself, and a PID file naming a process that never served).
+    fn ensure<S: Started>(
+        &self,
+        prepare: impl FnOnce() -> Result<()>,
+        spawn: impl FnOnce() -> Result<S>,
+        ready_timeout: Duration,
+    ) -> Result<()> {
+        let _lock = crate::instance::lock(&self.lock, None)?;
+        if self.listening() {
+            if self.ours() {
+                return Ok(());
+            }
+            // A viewer from an older protocol gives way to this one; anything else keeps
+            // the port, and no VM's password goes near it.
+            match read_trimmed(&self.pid).and_then(|p| Ok(p.parse::<i32>()?)) {
+                Ok(pid) if pid_is_our_viewer(pid) => {
+                    kill(pid, 15);
+                    for _ in 0..20 {
+                        if !self.listening() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+                _ => bail!(
+                    "127.0.0.1:{} is in use by another program; the browser viewer is off",
+                    self.port
+                ),
+            }
+        }
+        prepare()?;
+        // A fresh private key for this viewer. Only nonce-bound HMACs cross the socket.
+        crate::instance::write_private(&self.token, &hex(&random_bytes()?))?;
+        let mut child = spawn()?;
+        let deadline = std::time::Instant::now() + ready_timeout;
+        loop {
+            // Only an answer keyed with the key just written proves the listener is the
+            // child: a foreign program holding the port can't produce it.
+            if self.ours() {
+                std::fs::write(&self.pid, child.id().to_string())?;
+                return Ok(());
+            }
+            if child.exited() {
+                bail!(
+                    "the browser viewer exited before it was ready (is 127.0.0.1:{} in use?)",
+                    self.port
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                child.stop();
+                bail!("the browser viewer did not become ready");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Stop the viewer if `idle`. Never waits for the lock: a start holding it belongs to a
+    /// VM that is booting, so the viewer isn't idle, and shutdown deadlines stay bounded.
+    fn stop_if_idle(&self, idle: impl FnOnce() -> bool) -> bool {
+        let Some(_lock) = crate::instance::try_lock(&self.lock) else {
+            return false;
+        };
+        if !idle() {
+            return false;
+        }
+        if let Ok(pid) = read_trimmed(&self.pid).and_then(|p| Ok(p.parse::<i32>()?))
             && pid_is_our_viewer(pid)
         {
             kill(pid, 15);
         }
-        let _ = std::fs::remove_file(pid_file());
+        let _ = std::fs::remove_file(&self.pid);
+        true
     }
+}
+
+/// Start the detached viewer server if it isn't up, and wait until it proves itself.
+pub fn ensure_running() -> Result<()> {
+    Viewer::local().ensure(
+        ensure_novnc,
+        || {
+            use std::os::unix::process::CommandExt;
+            Command::new(std::env::current_exe()?)
+                .arg("__viewer")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .context("spawn viewer")
+        },
+        READY_TIMEOUT,
+    )
+}
+
+/// Stop the viewer once no instance is running.
+pub fn stop_if_idle() {
+    Viewer::local().stop_if_idle(|| Instance::list().is_ok_and(|l| l.iter().all(|i| !i.running())));
 }
 
 /// Confirm `pid` is our viewer subprocess (`agentpc __viewer`) before signalling it, so a
@@ -284,13 +398,19 @@ fn pid_is_our_viewer(pid: i32) -> bool {
 
 /// Foreground server loop (`agentpc __viewer`).
 pub fn serve() -> Result<()> {
-    let root = novnc_dir();
+    // The key is read once, before binding: `Viewer::ensure` holds the viewer lock until
+    // this process answers with it, so it can't be rotated in between.
     let key = read_trimmed(&token_file())?;
     if key.is_empty() {
         bail!("viewer identity key is empty");
     }
     let server =
         tiny_http::Server::http(("127.0.0.1", PORT)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    serve_on(&server, &key, &novnc_dir());
+    Ok(())
+}
+
+fn serve_on(server: &tiny_http::Server, key: &str, root: &Path) {
     for req in server.incoming_requests() {
         let path = req
             .url()
@@ -337,12 +457,207 @@ pub fn serve() -> Result<()> {
         };
         let _ = req.respond(resp);
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    fn fixture(label: &str) -> Viewer {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "agentpc-viewer-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        Viewer {
+            port,
+            lock: dir.join("viewer.lock"),
+            token: dir.join("viewer.token"),
+            pid: dir.join("viewer.pid"),
+        }
+    }
+
+    fn remove(viewer: &Viewer) {
+        let _ = std::fs::remove_dir_all(viewer.lock.parent().unwrap());
+    }
+
+    /// An in-process stand-in for `agentpc __viewer`: like the real one, it reads the key
+    /// once at startup (after `delay`), then binds the port and serves identity proofs.
+    struct TestServer {
+        server: Arc<OnceLock<Arc<tiny_http::Server>>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn spawn(viewer: &Viewer, delay: Duration) -> Self {
+            let (port, token) = (viewer.port, viewer.token.clone());
+            let server = Arc::new(OnceLock::new());
+            let shared = server.clone();
+            let thread = std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                let key = read_trimmed(&token).unwrap();
+                let Ok(bound) = tiny_http::Server::http(("127.0.0.1", port)) else {
+                    return;
+                };
+                let bound = shared.get_or_init(|| Arc::new(bound)).clone();
+                serve_on(&bound, &key, Path::new("/nonexistent"));
+            });
+            TestServer {
+                server,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Started for TestServer {
+        fn id(&self) -> u32 {
+            std::process::id()
+        }
+        fn exited(&mut self) -> bool {
+            self.thread.as_ref().is_none_or(|t| t.is_finished())
+        }
+        fn stop(&mut self) {
+            if let Some(server) = self.server.get() {
+                server.unblock();
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_viewer_starts_spawn_once_and_keep_a_provable_key() {
+        let viewer = Arc::new(fixture("concurrent"));
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let servers = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let starts: Vec<_> = (0..4)
+            .map(|_| {
+                let (viewer, spawned, servers) = (viewer.clone(), spawned.clone(), servers.clone());
+                std::thread::spawn(move || {
+                    viewer.ensure(
+                        || Ok(()),
+                        || {
+                            spawned.fetch_add(1, Ordering::SeqCst);
+                            // Slow to read its key and bind: without the lock held through
+                            // readiness, another start would rotate the key meanwhile.
+                            let server = TestServer::spawn(&viewer, Duration::from_millis(150));
+                            servers.lock().unwrap().push(server.server.clone());
+                            Ok(server)
+                        },
+                        Duration::from_secs(5),
+                    )
+                })
+            })
+            .collect();
+        for start in starts {
+            start.join().unwrap().unwrap();
+        }
+        assert_eq!(spawned.load(Ordering::SeqCst), 1);
+        assert!(viewer.ours());
+        assert_eq!(
+            read_trimmed(&viewer.pid).unwrap(),
+            std::process::id().to_string()
+        );
+        // A later start finds the proven viewer and neither rotates its key nor respawns.
+        let key = read_trimmed(&viewer.token).unwrap();
+        viewer
+            .ensure(
+                || Ok(()),
+                || -> Result<TestServer> { panic!("must not spawn") },
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(read_trimmed(&viewer.token).unwrap(), key);
+        for server in servers.lock().unwrap().iter() {
+            if let Some(server) = server.get() {
+                server.unblock();
+            }
+        }
+        remove(&viewer);
+    }
+
+    #[test]
+    fn a_foreign_listener_keeps_the_port_without_a_key_rotation_or_spawn() {
+        let viewer = fixture("foreign");
+        let _foreign = std::net::TcpListener::bind(("127.0.0.1", viewer.port)).unwrap();
+        let err = viewer
+            .ensure(
+                || panic!("must not prepare"),
+                || -> Result<TestServer> { panic!("must not spawn") },
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("in use by another program"));
+        assert!(!viewer.token.exists());
+        assert!(!viewer.pid.exists());
+        remove(&viewer);
+    }
+
+    struct Fake {
+        exits: bool,
+        stopped: Arc<AtomicUsize>,
+    }
+
+    impl Started for Fake {
+        fn id(&self) -> u32 {
+            1
+        }
+        fn exited(&mut self) -> bool {
+            self.exits
+        }
+        fn stop(&mut self) {
+            self.stopped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_viewer_that_never_proves_itself_is_not_published() {
+        for exits in [true, false] {
+            let viewer = fixture("unready");
+            let stopped = Arc::new(AtomicUsize::new(0));
+            let stop_count = stopped.clone();
+            let err = viewer
+                .ensure(
+                    || Ok(()),
+                    move || {
+                        Ok(Fake {
+                            exits,
+                            stopped: stop_count,
+                        })
+                    },
+                    Duration::from_millis(200),
+                )
+                .unwrap_err();
+            assert!(!viewer.pid.exists(), "{err:#}");
+            assert_eq!(stopped.load(Ordering::SeqCst), usize::from(!exits));
+            remove(&viewer);
+        }
+    }
+
+    #[test]
+    fn stopping_never_waits_for_a_start_in_progress() {
+        let viewer = fixture("stop");
+        let held = crate::instance::lock(&viewer.lock, None).unwrap();
+        assert!(!viewer.stop_if_idle(|| panic!("a start is in progress")));
+        drop(held);
+        assert!(!viewer.stop_if_idle(|| false));
+        std::fs::write(&viewer.pid, "not a pid").unwrap();
+        assert!(viewer.stop_if_idle(|| true));
+        assert!(!viewer.pid.exists());
+        remove(&viewer);
+    }
 
     #[test]
     fn viewer_identity_proofs_are_nonce_bound_and_do_not_expose_the_key() {

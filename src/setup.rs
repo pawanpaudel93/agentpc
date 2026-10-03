@@ -195,11 +195,20 @@ fn codex_server(
 }
 
 /// Keep a managed field's surrounding whitespace and comments when replacing its value.
+/// The existing item is replaced in place: `insert` would also reset the key's decor, which
+/// holds the comment lines and blank lines above it.
 fn set_codex_value(server: &mut dyn toml_edit::TableLike, key: &str, mut value: toml_edit::Value) {
-    if let Some(old) = server.get(key).and_then(toml_edit::Item::as_value) {
-        *value.decor_mut() = old.decor().clone();
+    match server.get_mut(key) {
+        Some(item) => {
+            if let Some(old) = item.as_value() {
+                *value.decor_mut() = old.decor().clone();
+            }
+            *item = toml_edit::Item::Value(value);
+        }
+        None => {
+            server.insert(key, toml_edit::Item::Value(value));
+        }
     }
-    server.insert(key, toml_edit::Item::Value(value));
 }
 
 /// Set only the existing server's command and args, preserving other settings and TOML
@@ -1246,6 +1255,30 @@ mod tests {
                 assert!(out.contains("# keep command"));
             }
         }
+    }
+
+    #[test]
+    fn codex_update_keeps_comments_and_blank_lines_around_managed_keys() {
+        // Quoted header and keys, comments and blank lines above and beside each managed key.
+        let text = "# top\n[mcp_servers.\"agentpc\"] # header\n\n# the binary\n\"command\" = \"/old\"   # trailing\n\n# args below\nargs = [ # open\n  \"mcp\",\n  \"old-extra\",\n] # after args\nenv = { AGENTPC_HOME = \"/vms\" } # env\n\n[tail]\ny = 2\n";
+        let out = codex_with_command(text, "/new").unwrap().unwrap();
+        assert_eq!(
+            out,
+            "# top\n[mcp_servers.\"agentpc\"] # header\n\n# the binary\n\"command\" = \"/new\"   # trailing\n\n# args below\nargs = [\"mcp\"] # after args\nenv = { AGENTPC_HOME = \"/vms\" } # env\n\n[tail]\ny = 2\n"
+        );
+        // Unchanged values round-trip byte for byte, and timeouts go after existing keys.
+        assert_eq!(codex_with_command(&out, "/new").unwrap().unwrap(), out);
+        let timed = codex_with_timeouts(&out).unwrap().unwrap();
+        assert!(
+            timed.starts_with(&out[..out.find("\n[tail]").unwrap()]),
+            "{timed}"
+        );
+        // Inline tables keep the decor of the values they replace.
+        let inline = "mcp_servers = { agentpc = { command = '/old' , args = [ 'x' ] , env = { A = '1' } } } # inline\n";
+        assert_eq!(
+            codex_with_command(inline, "/new").unwrap().unwrap(),
+            "mcp_servers = { agentpc = { command = \"/new\" , args = [\"mcp\"] , env = { A = '1' } } } # inline\n"
+        );
     }
 
     #[test]
