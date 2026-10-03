@@ -181,6 +181,7 @@ h1 {
   letter-spacing: -0.02em;
   line-height: 0.98;
   margin: 0 0 22px;
+  overflow-wrap: anywhere;
   text-wrap: balance;
 }
 
