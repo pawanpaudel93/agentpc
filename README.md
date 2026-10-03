@@ -169,7 +169,7 @@ pick the server up automatically.
 | Tool | Description |
 | --- | --- |
 | `list_vms` | VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, `x86_tso`) and the available images with their OS versions |
-| `create_vm` | Create a VM (optionally of a given version, size, or offline) and wait until its desktop is ready. Retrying it with the same `name` and image in the same session returns the VM already created, booting it if it was stopped |
+| `create_vm` | Create a VM (optionally of a given version, size, or offline) and wait until its desktop is ready. Retrying it with the same `name` and image in the same session returns the VM already created, booting it if it was stopped. `open_in_browser: true` opens its viewer in the Mac’s default browser after readiness (default false; per-call only). Browser-launch failure warns without failing creation |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down cleanly |
 | `reset_vm` | Discard all changes: back to a fresh copy of the image |
 | `checkpoint_vm` / `restore_vm` | Save a VM's disk and memory under a label; go back to it in seconds |
@@ -226,7 +226,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 
 | Command | Description |
 | --- | --- |
-| `agentpc create <image> [name] [--memory GB] [--cpus N] [--offline]` | Create a VM from `ubuntu`, `windows`, `arch` or a version such as `ubuntu-22.04`; fetches Ubuntu and Arch images if missing. A name is up to 64 letters, digits, `.` `-` `_`. `--memory` is 2–64 GB, `--cpus` 1–16 (default 4); a non-default size boots cold instead of resuming. `--offline`: no internet or access to this Mac |
+| `agentpc create <image> [name] [--memory GB] [--cpus N] [--offline] [--open]` | Create a VM from `ubuntu`, `windows`, `arch` or a version such as `ubuntu-22.04`; fetches Ubuntu and Arch images if missing. A name is up to 64 letters, digits, `.` `-` `_`. `--memory` is 2–64 GB, `--cpus` 1–16 (default 4); a non-default size boots cold instead of resuming. `--offline`: no internet or access to this Mac. `--open` (alias `--open-in-browser`): open the ready VM’s viewer in the Mac’s default browser; off by default |
 | `agentpc list [--json]` (`ls`) | VMs and images; `--json` gives the same data as the MCP `list_vms` tool |
 | `agentpc info <name>` | Viewer URL (with the VNC password), SSH and VNC details, checkpoints, and on x86apps VMs how x86 programs run (`x86 programs: FEX, hardware\|emulated TSO`) |
 | `agentpc start <name>… \| --all` | Boot stopped VMs |

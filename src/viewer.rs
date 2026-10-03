@@ -35,6 +35,47 @@ pub fn url(inst: &Instance) -> String {
     )
 }
 
+/// Opening a browser is a per-call convenience, not a VM setting or a creation failure.
+pub fn open_created(result: Result<String>, requested: bool) -> Result<String> {
+    after_create(result, requested, |name| {
+        let inst = Instance::load(name)?;
+        let at = url(&inst);
+        if !at.starts_with("http://127.0.0.1:") {
+            bail!("the local viewer is unavailable");
+        }
+        // noVNC's URL can contain a VNC credential; never echo it or opener diagnostics.
+        let status = Command::new("open")
+            .arg(at)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("launch default browser")?;
+        if !status.success() {
+            bail!("default browser launcher failed");
+        }
+        Ok(())
+    })
+}
+
+fn after_create(
+    result: Result<String>,
+    requested: bool,
+    open: impl FnOnce(&str) -> Result<()>,
+) -> Result<String> {
+    let mut info = result?;
+    if requested {
+        let name = info
+            .split_whitespace()
+            .next()
+            .context("created VM has no name")?;
+        if open(name).is_err() {
+            info.push_str("\n  warning: VM is ready, but its viewer could not be opened in the Mac's default browser");
+        }
+    }
+    Ok(info)
+}
+
 /// What our viewer answers at `/.agentpc-viewer`: a random token in a private file, which
 /// another program on this port can't know.
 fn token_file() -> PathBuf {
@@ -236,4 +277,47 @@ pub fn serve() -> Result<()> {
         let _ = req.respond(resp);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_opens_only_after_success_and_when_requested() {
+        let info = "ubuntu-7 (ubuntu): ready";
+        assert_eq!(
+            after_create(Ok(info.into()), false, |_| panic!("must not open")).unwrap(),
+            info
+        );
+        assert!(
+            after_create(Err(anyhow::anyhow!("boot failed")), true, |_| panic!(
+                "must not open"
+            ))
+            .is_err()
+        );
+        let mut opened = false;
+        assert_eq!(
+            after_create(Ok(info.into()), true, |name| {
+                assert_eq!(name, "ubuntu-7");
+                opened = true;
+                Ok(())
+            })
+            .unwrap(),
+            info
+        );
+        assert!(opened);
+    }
+
+    #[test]
+    fn browser_failure_warns_without_failing_the_vm_or_exposing_diagnostics() {
+        let info = "ubuntu-7 (ubuntu): ready";
+        let out = after_create(Ok(info.into()), true, |_| {
+            bail!("private launcher diagnostics")
+        })
+        .unwrap();
+        assert!(out.starts_with(info));
+        assert!(out.contains("warning: VM is ready"));
+        assert!(!out.contains("private launcher diagnostics"));
+    }
 }

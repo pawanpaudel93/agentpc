@@ -343,6 +343,10 @@ struct CreateArgs {
     /// and forward_port (TCP only) still work. For testing offline behaviour or untrusted software.
     #[serde(default)]
     offline: bool,
+    /// Open the ready VM's desktop viewer in the Mac's default browser (not inside the guest).
+    /// Default false. Per-call only; a launch failure warns without failing VM creation.
+    #[serde(default)]
+    open_in_browser: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -528,6 +532,7 @@ impl Gateway {
             OsArg::Arch => Os::Arch,
         };
         let owner = self.owner_tag(&ctx);
+        let open_in_browser = a.open_in_browser;
         let image = match a.version {
             Some(v) => format!("{os}-{v}"),
             None => os.to_string(),
@@ -565,7 +570,12 @@ impl Gateway {
             self.claim(name, &ctx);
             // Through boot even when QEMU runs: a VM that never became ready is waited for
             // again (and a paused one resumed), rather than reported ready.
-            return text(with_progress(&ctx, move || ops::boot(&inst)).await);
+            return text(
+                with_progress(&ctx, move || {
+                    crate::viewer::open_created(ops::boot(&inst), open_in_browser)
+                })
+                .await,
+            );
         }
         let requested = a.name.clone();
         // Tracked before it boots: a client that disconnects mid-create must still have it
@@ -578,13 +588,16 @@ impl Gateway {
         }
         let tag = owner.clone();
         let res = with_progress(&ctx, move || {
-            ops::create(
-                &Image::resolve(&image)?,
-                a.name.as_deref(),
-                a.memory_gb,
-                a.cpus,
-                a.offline,
-                Some(&tag),
+            crate::viewer::open_created(
+                ops::create(
+                    &Image::resolve(&image)?,
+                    a.name.as_deref(),
+                    a.memory_gb,
+                    a.cpus,
+                    a.offline,
+                    Some(&tag),
+                ),
+                open_in_browser,
             )
         })
         .await;
@@ -1766,6 +1779,31 @@ fn reply(r: Result<Vec<ContentBlock>>) -> CallToolResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn browser_open_argument_defaults_off_and_is_optional_in_schema() {
+        let default: super::CreateArgs =
+            serde_json::from_value(serde_json::json!({"os": "ubuntu"})).unwrap();
+        assert!(!default.open_in_browser);
+        let requested: super::CreateArgs =
+            serde_json::from_value(serde_json::json!({"os": "ubuntu", "open_in_browser": true}))
+                .unwrap();
+        assert!(requested.open_in_browser);
+        assert!(
+            serde_json::from_value::<super::CreateArgs>(
+                serde_json::json!({"os": "ubuntu", "open_in_browser": "true"})
+            )
+            .is_err()
+        );
+        let schema = serde_json::to_value(schemars::schema_for!(super::CreateArgs)).unwrap();
+        assert_eq!(schema["properties"]["open_in_browser"]["type"], "boolean");
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("open_in_browser"))
+        );
+    }
+
     #[test]
     fn captures_short_output_whole() {
         let mut c = super::Captured::default();

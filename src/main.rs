@@ -55,6 +55,9 @@ enum Cmd {
         /// No internet or access to this Mac (SSH, the viewer and forwarded ports still work)
         #[arg(long)]
         offline: bool,
+        /// Open the ready VM's desktop viewer in this Mac's default browser
+        #[arg(long, visible_alias = "open-in-browser")]
+        open: bool,
     },
     /// List VMs and images
     #[command(visible_alias = "ls")]
@@ -294,13 +297,17 @@ fn run(cli: Cli) -> Result<()> {
             memory,
             cpus,
             offline,
-        } => out(ops::create(
-            &Image::resolve(&image)?,
-            name.as_deref(),
-            memory,
-            cpus,
-            offline,
-            None,
+            open,
+        } => out(viewer::open_created(
+            ops::create(
+                &Image::resolve(&image)?,
+                name.as_deref(),
+                memory,
+                cpus,
+                offline,
+                None,
+            ),
+            open,
         )),
         Cmd::List { json } => out(if json {
             ops::list_json()
@@ -493,4 +500,26 @@ fn each<T>(items: Vec<T>, op: impl Fn(T) -> Result<String>) -> Result<()> {
 fn out(r: Result<String>) -> Result<()> {
     println!("{}", r?.trim_end());
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn browser_open_is_opt_in_with_a_visible_alias() {
+        for (flags, expected) in [
+            (vec![], false),
+            (vec!["--open"], true),
+            (vec!["--open-in-browser"], true),
+        ] {
+            let mut args = vec!["agentpc", "create", "ubuntu"];
+            args.extend(flags);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Cmd::Create { open, .. } = cli.cmd else {
+                panic!("not create")
+            };
+            assert_eq!(open, expected);
+        }
+    }
 }

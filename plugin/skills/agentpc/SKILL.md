@@ -24,7 +24,7 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 | Tool | Use |
 | --- | --- |
 | `list_vms` | VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, `x86_tso`) and the available images with OS versions. Start here. |
-| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New VM (`ubuntu`, `windows` or `arch`, optionally a version such as `22.04`, `x86apps` or `22.04-x86apps`; x86apps is for 22.04 and 24.04 only); returns when the desktop is ready. `name`: up to 64 letters, digits, `.` `-` `_`; retrying with the same `name` and image in the same session returns the VM already made (booting it if stopped). `offline: true` cuts it off from the internet and this Mac |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?, open_in_browser?)` | New VM (`ubuntu`, `windows` or `arch`, optionally a version such as `22.04`, `x86apps` or `22.04-x86apps`; x86apps is for 22.04 and 24.04 only); returns when the desktop is ready. `name`: up to 64 letters, digits, `.` `-` `_`; retrying with the same `name` and image in the same session returns the VM already made (booting it if stopped). `offline: true` cuts it off from the internet and this Mac. `open_in_browser: true` opens the ready VM’s viewer in the Mac’s default browser (default false; not a saved VM setting). A browser-launch failure warns without failing creation. |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down |
 | `reset_vm(name)` | Discard all changes: back to a clean install |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save the VM's disk and memory; go back to that state in seconds; or drop one checkpoint |

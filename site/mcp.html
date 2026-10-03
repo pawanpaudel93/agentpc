@@ -193,7 +193,10 @@ tool_timeout_sec = 900</code></pre>
                     <code translate="no">"11-25h2"</code>, <code translate="no">"11-24h2"</code>,
                     <code translate="no">"11-23h2"</code>; Arch is rolling, so the default, <code translate="no">"rolling"</code>, <code translate="no">"x86apps"</code>, or a pinned <code translate="no">"rolling-YYYYMMDD"</code> / <code translate="no">"rolling-x86apps-YYYYMMDD"</code> download), <code translate="no">name</code> (up to 64 letters, digits, <code translate="no">.</code> <code translate="no">-</code> <code translate="no">_</code>),
                     <code translate="no">memory_gb</code> (2–64, default 8 Windows / 4 Ubuntu and Arch),
-                    <code translate="no">cpus</code> (1–16, default 4) and <code translate="no">offline</code>.
+                    <code translate="no">cpus</code> (1–16, default 4), <code translate="no">offline</code> and
+                    <code translate="no">open_in_browser</code> (default false). Set <code translate="no">open_in_browser: true</code>
+                    to open the ready VM’s viewer in the Mac’s default browser, not a browser inside the guest.
+                    This is a per-call action, not a saved setting; a browser-launch failure warns without failing creation.
                     A non-default size boots cold (~25 s Windows, ~15 s Ubuntu and Arch). Retrying with the same name and image in the same
                     session returns the VM it already made, booting it if it was stopped.
                   </td>

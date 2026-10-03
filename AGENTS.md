@@ -12,7 +12,7 @@ can run `agentpc mcp-install` (or install first: see README.md).
 | Tool | Use |
 | --- | --- |
 | `list_vms` | VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, `x86_tso`) and the images (with OS version) they come from. Start here. |
-| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?)` | New clone: ubuntu/arch ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready; `name` is up to 64 letters, digits, `.` `-` `_`. Retrying with the same `name` and image in the same session returns the VM it already made (booting it if stopped). `memory_gb` 2–64, `cpus` 1–16 (default 4). `offline` cuts off the internet. |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?, open_in_browser?)` | New clone: ubuntu/arch ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready; `name` is up to 64 letters, digits, `.` `-` `_`. Retrying with the same `name` and image in the same session returns the VM it already made (booting it if stopped). `memory_gb` 2–64, `cpus` 1–16 (default 4). `offline` cuts off the internet. `open_in_browser: true` opens the ready VM’s viewer in the Mac’s default browser (default false; not a saved VM setting). A browser-launch failure warns without failing creation. |
 | `start_vm` / `stop_vm` / `reset_vm` / `delete_vm` | Lifecycle. `reset_vm` = back to a clean install. |
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save disk + memory before a risky step; restore in seconds; or drop one checkpoint. |
 | `take_screenshot(name, save_to?)` | Hypervisor screenshot; works even while booting or hung. `save_to` also writes the PNG to a Mac path. |
