@@ -335,6 +335,16 @@ def lifecycle(m, vm, r, guest):
         r.check("stop_job leaves a finished job as it was", ok and "already exited with code 0" in out, out[:200])
     ok, out = m.tool("stop_job", name=vm, id=1)
     r.check("stop_job refuses an unknown job", not ok and "no such job" in out, out[:200])
+    # A job that started a server and returned: its wrapper exited, the server must still stop.
+    ok, out = sh("nohup sleep 3304 >/dev/null 2>&1 & echo started", background=True)
+    job = re.search(r"\(id (\d+)", out)
+    if job:
+        alive = "pgrep -fx 'sleep 3304' | wc -l"
+        poll(lambda: "STATE: exited 0" in m.tool("get_job_status", name=vm, id=int(job.group(1)))[1], 15)
+        r.check("a server the job left running is still up", stdout(sh(alive)[1]) == "1")
+        ok, out = m.tool("stop_job", name=vm, id=int(job.group(1)))
+        r.check("stop_job stops what an exited job left running", ok and "left running" in out
+                and stdout(sh(alive)[1]) == "0", out[:200])
 
     ok, out = sh("sleep 60; echo late", timeout=3)
     r.check(

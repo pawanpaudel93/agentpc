@@ -1086,7 +1086,8 @@ impl Gateway {
         title = "Stop job",
         description = "Stop a background job started by run_command (background: true): the job and every\n\
                           process it started (on Linux, its whole session; on Windows, its process tree).\n\
-                          get_job_status then reports it as stopped. A job already finished is left as is.",
+                          get_job_status then reports it as stopped. For a job that already exited, it\n\
+                          stops only what the job left running (a server it started) and keeps its exit code.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1465,10 +1466,11 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
     let script = match inst.os {
         // Separate lines: `a && b &` would background the whole list, and that shell would
         // hold the SSH session open. The wrapper records the exit code in <id>.exit so
-        // get_job_status can report it after the job ends.
+        // get_job_status can report it after the job ends. AGENTPC_JOB marks every process
+        // the job starts (inherited), so stop_job can find them after the wrapper is gone.
         Os::Ubuntu | Os::Arch => format!(
             "d=~/agentpc-bg; mkdir -p $d && echo {b64} | base64 -d > $d/{id}.sh || exit 1\n\
-             {env} setsid nohup bash -c 'bash \"$0\"; echo $? > \"$1\"' \
+             {env} AGENTPC_JOB={id} setsid nohup bash -c 'bash \"$0\"; echo $? > \"$1\"' \
              $d/{id}.sh $d/{id}.exit > $d/{id}.log 2>&1 < /dev/null &\n\
              echo $! > $d/{id}.pid\n\
              echo \"started in the background (id {id}, pid $!). \
@@ -1508,25 +1510,24 @@ async fn job_status(name: &str, id: u64, tail_lines: usize) -> Result<String> {
             "d=~/agentpc-bg\n\
              if [ ! -f $d/{id}.log ]; then echo 'STATE: no such job'; exit 0; fi\n\
              if [ -f $d/{id}.exit ]; then echo \"STATE: exited $(cat $d/{id}.exit)\"; \
-             elif [ -f $d/{id}.stopped ]; then echo 'STATE: stopped by stop_job'; \
              elif p=$(cat $d/{id}.pid 2>/dev/null) && grep -qs {id}.sh /proc/$p/cmdline; \
              then echo 'STATE: running'; \
+             elif [ -f $d/{id}.stopped ]; then echo 'STATE: stopped by stop_job'; \
              else echo 'STATE: ended without an exit code (killed, or the VM restarted)'; fi\n\
              echo '--- log tail ---'; tail -n {tail_lines} $d/{id}.log",
         ),
         Os::Windows => format!(
             r#"$d = "$env:USERPROFILE\agentpc-bg"; $log = "$d\{id}.log"; $exit = "$d\{id}.exit"
-if (-not (Test-Path $log)) {{ 'STATE: no such job'; exit 0 }}
+$t = Get-ScheduledTask -TaskName 'agentpc-bg-{id}' -ErrorAction SilentlyContinue
+if (-not (Test-Path $log) -and -not $t) {{ 'STATE: no such job'; exit 0 }}
+# Ended only once the task has run and is no longer running (just after Start-ScheduledTask
+# it can still read Ready, not yet having run). A disabled task is one stop_job cancelled.
+$ran = $t -and ($t | Get-ScheduledTaskInfo).LastRunTime.Year -gt 2000
+$live = $t -and $t.State -ne 'Disabled' -and ($t.State -in 'Running', 'Queued' -or -not $ran)
 if (Test-Path $exit) {{ "STATE: exited $((Get-Content $exit -Raw).Trim())" }}
+elseif ($live) {{ 'STATE: running' }}
 elseif (Test-Path "$d\{id}.stopped") {{ 'STATE: stopped by stop_job' }}
-else {{
-  # Ended only once the task has run and is no longer running (just after Start-ScheduledTask
-  # it can still read Ready, not yet having run).
-  $t = Get-ScheduledTask -TaskName 'agentpc-bg-{id}' -ErrorAction SilentlyContinue
-  $ran = $t -and ($t | Get-ScheduledTaskInfo).LastRunTime.Year -gt 2000
-  if ($t -and ($t.State -in 'Running', 'Queued' -or -not $ran)) {{ 'STATE: running' }}
-  else {{ 'STATE: ended without an exit code (stopped, or the VM restarted)' }}
-}}
+else {{ 'STATE: ended without an exit code (stopped, or the VM restarted)' }}
 '--- log tail ---'; if (Test-Path $log) {{ Get-Content $log -Tail {tail_lines} }}"#
         ),
     };
@@ -1551,51 +1552,93 @@ async fn stop_job(name: &str, id: u64) -> Result<String> {
 
 fn stop_job_script(os: Os, id: u64) -> String {
     match os {
-        // The job runs under `setsid`, so its wrapper's pid is also its session id, and every
-        // process it starts (unless one makes a session of its own) shares that session. The
-        // pid is checked to still be this job's wrapper first: a reused one is someone else's.
-        // sudo, so processes the job started as root (sudo inside it) stop too.
+        // The job's processes: its whole session while its wrapper (checked by command line,
+        // so a reused pid is never taken for it) still runs, and every process carrying its
+        // AGENTPC_JOB marker plus their descendants (sudo resets the environment, so what
+        // sudo starts is found as a child). A session id alone is not trusted once the
+        // wrapper is gone: after a reboot or pid reuse it can name someone else's session.
+        // Each round rescans, so a pid that exits and is reused is never signalled; .stopped
+        // is written only once nothing is left. root (sudo) reads every environment and can
+        // signal what the job started as root.
         Os::Ubuntu | Os::Arch => format!(
-            "d=~/agentpc-bg\n\
-             [ -f $d/{id}.log ] || {{ echo 'no such job {id}'; exit 3; }}\n\
-             if [ -f $d/{id}.exit ]; then echo \"job {id} already exited with code $(cat $d/{id}.exit)\"; exit 0; fi\n\
-             p=$(cat $d/{id}.pid 2>/dev/null)\n\
-             case $p in ''|*[!0-9]*) echo 'job {id} has no recorded pid'; exit 3 ;; esac\n\
-             if [ -d /proc/$p ] && ! grep -qs {id}.sh /proc/$p/cmdline; then\n\
-               touch $d/{id}.stopped; echo \"job {id} is not running\"; exit 0\n\
-             fi\n\
-             k() {{ sudo -n pkill \"$@\" 2>/dev/null || pkill \"$@\" 2>/dev/null; }}\n\
-             n=$(pgrep -s $p | wc -l)\n\
-             touch $d/{id}.stopped\n\
-             if [ \"$n\" -eq 0 ]; then echo \"job {id} is not running\"; exit 0; fi\n\
-             k -TERM -s $p\n\
-             i=0; while pgrep -s $p >/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done\n\
-             if pgrep -s $p >/dev/null; then k -KILL -s $p; sleep 0.3; fi\n\
-             if pgrep -s $p >/dev/null; then echo \"job {id}: some of its processes would not stop\"; exit 1; fi\n\
-             echo \"stopped job {id} ($n process(es))\""
+            r#"d=~/agentpc-bg
+[ -f $d/{id}.log ] || {{ echo 'no such job {id}'; exit 3; }}
+S=; sudo -n true 2>/dev/null && S='sudo -n'
+p=$(cat $d/{id}.pid 2>/dev/null); case $p in ''|*[!0-9]*) p= ;; esac
+members() {{
+  {{
+    if [ -n "$p" ] && grep -qs {id}.sh /proc/$p/cmdline; then pgrep -s "$p"; fi
+    marked=$($S grep -lsxz 'AGENTPC_JOB={id}' /proc/[0-9]*/environ 2>/dev/null | sed 's|^/proc/||; s|/environ$||')
+    if [ -n "$marked" ]; then
+      ps -eo pid=,ppid= | awk -v seed="$(echo $marked)" '
+        BEGIN {{ n = split(seed, a, " "); for (i = 1; i <= n; i++) s[a[i]] = 1 }}
+        {{ pid[NR] = $1; pp[$1] = $2 }}
+        END {{ do {{ c = 0; for (i in pid) {{ q = pid[i]; if (!(q in s) && (pp[q] in s)) {{ s[q] = 1; c = 1 }} }} }} while (c)
+              for (q in s) print q }}'
+    fi
+  }} | grep -vx -e '' -e "$$" | sort -un
+}}
+# A process's start time (field 22 of /proc/<pid>/stat, counted after its "(comm)").
+st() {{ sed 's/.*) //' /proc/$1/stat 2>/dev/null | awk '{{ print $20 }}'; }}
+first=$(for q in $(members); do echo "$q:$(st $q)"; done)
+# The first scan's processes stay targets while they live (pid and start time unchanged),
+# even once the wrapper is gone: one that ignores TERM still gets KILL.
+targets() {{
+  {{ members; for e in $first; do q=${{e%%:*}}; [ "$(st $q)" = "${{e#*:}}" ] && echo "$q"; done; }} | sort -un
+}}
+n=$(echo "$first" | grep -c .)
+if [ "$n" -eq 0 ]; then
+  if [ -f $d/{id}.exit ]; then echo "job {id} already exited with code $(cat $d/{id}.exit)"; else echo "job {id} is not running"; fi
+  exit 0
+fi
+$S kill -TERM $(targets) 2>/dev/null
+i=0; while [ -n "$(targets)" ] && [ $i -lt 25 ]; do sleep 0.2; i=$((i + 1)); done
+for r in 1 2 3; do
+  left=$(targets); [ -z "$left" ] && break
+  $S kill -KILL $left 2>/dev/null; sleep 0.3
+done
+if [ -n "$(targets)" ]; then echo "job {id}: some of its processes would not stop"; exit 1; fi
+if [ -f $d/{id}.exit ]; then echo "job {id} had exited with code $(cat $d/{id}.exit); stopped $n process(es) it left running"
+else touch $d/{id}.stopped; echo "stopped job {id} ($n process(es))"; fi"#
         ),
-        // The job is a scheduled task whose PowerShell runs <id>.ps1: stop that process tree
-        // (what it started included), then the task itself.
+        // The job is a scheduled task whose PowerShell runs <id>.ps1. The task is disabled
+        // first, so a job not yet started never starts. Its process tree counts a process as a
+        // child only if it was created after its parent: a parent id that Windows reused after
+        // the real parent exited would otherwise pull in unrelated processes. Rounds rescan
+        // until nothing is left; .stopped is written only then.
         Os::Windows => format!(
             r#"$d = "$env:USERPROFILE\agentpc-bg"; $task = 'agentpc-bg-{id}'
-if (-not (Test-Path "$d\{id}.log")) {{ "no such job {id}"; exit 3 }}
+$t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+if (-not (Test-Path "$d\{id}.log") -and -not $t) {{ "no such job {id}"; exit 3 }}
 if (Test-Path "$d\{id}.exit") {{ "job {id} already exited with code $((Get-Content "$d\{id}.exit" -Raw).Trim())"; exit 0 }}
-$all = @(Get-CimInstance Win32_Process)
-$ids = @($all | Where-Object {{ $_.CommandLine -like "*\{id}.ps1*" }} | ForEach-Object {{ $_.ProcessId }})
-$seen = @{{}}
-while ($ids.Count) {{
-  $next = @()
-  foreach ($i in $ids) {{
-    if ($seen.ContainsKey($i)) {{ continue }}
-    $seen[$i] = $true
-    $next += @($all | Where-Object {{ $_.ParentProcessId -eq $i }} | ForEach-Object {{ $_.ProcessId }})
-  }}
-  $ids = $next
+if ($t) {{ Disable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue | Out-Null }}
+$known = @{{}}
+function Live {{
+  $all = @(Get-CimInstance Win32_Process)
+  foreach ($r in $all) {{ if ($r.CommandLine -like "*\{id}.ps1*" -and -not $known.ContainsKey($r.ProcessId)) {{ $known[$r.ProcessId] = $r.CreationDate }} }}
+  do {{
+    $added = $false
+    foreach ($c in $all) {{
+      if ($known.ContainsKey($c.ProcessId)) {{ continue }}
+      if ($known.ContainsKey($c.ParentProcessId) -and $c.CreationDate -ge $known[$c.ParentProcessId]) {{
+        $known[$c.ProcessId] = $c.CreationDate; $added = $true
+      }}
+    }}
+  }} while ($added)
+  @($all | Where-Object {{ $known.ContainsKey($_.ProcessId) -and $known[$_.ProcessId] -eq $_.CreationDate }})
 }}
-foreach ($i in $seen.Keys) {{ Stop-Process -Id $i -Force -ErrorAction SilentlyContinue }}
+for ($i = 0; $i -lt 10; $i++) {{
+  $live = Live
+  if (-not $live.Count) {{ break }}
+  foreach ($q in $live) {{ Stop-Process -Id $q.ProcessId -Force -ErrorAction SilentlyContinue }}
+  if ($i -eq 0) {{ Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue }}
+  Start-Sleep -Milliseconds 300
+}}
 Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+$left = Live
+if ($left.Count) {{ "job {id}: $($left.Count) of its processes would not stop"; exit 1 }}
 New-Item -ItemType File -Force "$d\{id}.stopped" | Out-Null
-"stopped job {id} ($($seen.Count) process(es))""#
+if ($known.Count) {{ "stopped job {id} ($($known.Count) process(es))" }} else {{ "stopped job {id} before it started" }}"#
         ),
     }
 }
