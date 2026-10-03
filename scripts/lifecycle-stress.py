@@ -8,6 +8,7 @@ Protocol replies stay in memory; logs contain only check labels, never viewer cr
 
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -18,9 +19,11 @@ import uuid
 
 
 class Mcp:
-    def __init__(self, binary):
+    def __init__(self, binary, worker_threads=None):
         env = os.environ.copy()
         env.pop("AGENTPC_KEEP_RUNNING", None)
+        if worker_threads is not None:
+            env["TOKIO_WORKER_THREADS"] = str(worker_threads)
         self.proc = subprocess.Popen([binary, "mcp"], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
         self.lock = threading.Lock()
@@ -53,14 +56,14 @@ class Mcp:
             for future in pending.values():
                 future.set_exception(RuntimeError("MCP server exited"))
 
-    def request(self, method, params):
+    def request(self, method, params, timeout=180):
         future = Future()
         with self.lock:
             self.next_id += 1
             request_id = self.next_id
             self.pending[request_id] = future
         self.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
-        return future.result(timeout=180)
+        return future.result(timeout=timeout)
 
     def tool(self, name, /, **arguments):
         result = self.request("tools/call", {"name": name, "arguments": arguments})
@@ -104,6 +107,47 @@ def parallel(client, calls):
         return list(pool.map(lambda c: client.tool(c[0], **c[1]), calls))
 
 
+def initialization_race(binary, client, name, operation):
+    """Delay cloning under the existing image lock; race only this test-owned VM.
+
+    A nonblocking acquisition refuses to interfere with another image operation. The
+    disk is never changed; the lock is released on every path before waiting for calls.
+    """
+    home = Path(os.environ.get("AGENTPC_HOME", str(Path.home() / ".agentpc")))
+    lock_path = home / "images" / ".ubuntu-24.04.lock"
+    with lock_path.open("a+b") as lock, ThreadPoolExecutor(max_workers=2) as pool:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            require("initialization fixture image lock is idle", False)
+        created = pool.submit(client.tool, "create_vm", os="ubuntu", name=name)
+        try:
+            deadline = time.monotonic() + 15
+            while state(binary, name) is None and not created.done() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            require(f"{operation}: VM published while initialization is pending",
+                    state(binary, name) is not None and not created.done())
+            raced = pool.submit(client.tool, operation, name=name)
+            time.sleep(0.2)
+            try:
+                client.request("tools/list", {}, timeout=2)
+                responsive = True
+            except TimeoutError:
+                responsive = False
+            require(f"{operation}: one-worker MCP remains responsive while waiting for VM lock", responsive)
+            require(f"{operation}: lifecycle waits for initialization", not raced.done())
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        require(f"{operation}: create completes after clone barrier", created.result(timeout=120)[0])
+        require(f"{operation}: queued lifecycle operation succeeds", raced.result(timeout=120)[0])
+    if operation == "delete_vm":
+        require("create/delete race leaves no VM", state(binary, name) is None)
+    else:
+        require("create/start race leaves a usable VM", client.tool(
+            "run_command", name=name, command="true", timeout=15)[0])
+        require("initialization start fixture deleted", client.tool("delete_vm", name=name)[0])
+
+
 def run(binary, rounds):
     before = inventory(binary)
     image = next((i for i in before["images"] if i["image"] == "ubuntu-24.04"), None)
@@ -111,11 +155,22 @@ def run(binary, rounds):
             image and image["fast_start"] and not image.get("outdated"))
     require("no unrelated running orphan VMs", not any(
         v["state"] != "stopped" and v.get("owner_running") is False for v in before["instances"]))
-    prefix = "stress-" + uuid.uuid4().hex[:12]
+    existing_names = {vm["name"] for vm in before["instances"]}
+    while True:
+        prefix = "stress-" + uuid.uuid4().hex[:12]
+        if not any(name.startswith(prefix + "-") for name in existing_names):
+            break
     names, clients = [], []
     client = Mcp(binary)
     clients.append(client)
     try:
+        init_client = Mcp(binary, worker_threads=1)
+        clients.append(init_client)
+        for operation, suffix in [("start_vm", "init-start"), ("delete_vm", "init-delete")]:
+            name = f"{prefix}-{suffix}"
+            names.append(name)
+            initialization_race(binary, init_client, name, operation)
+        init_client.close()
         for n in range(rounds):
             vm = f"{prefix}-{n}"
             names.append(vm)

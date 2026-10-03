@@ -484,6 +484,72 @@ pub fn stop(inst: &Instance) -> Result<()> {
     Ok(())
 }
 
+/// MCP session shutdown has a shared deadline; CLI stop keeps its 180-second grace period.
+/// Reserve time for QMP quit and SIGKILL observation rather than timing out a blocking stop.
+pub fn stop_until(inst: &Instance, deadline: Instant) -> Result<()> {
+    let Some(pid) = inst.pid() else { return Ok(()) };
+    if !stop_before(
+        deadline,
+        || inst.running(),
+        |command, deadline| {
+            Qmp::connect_until(inst, deadline)
+                .and_then(|mut q| q.execute(command, None).map(|_| ()))
+        },
+        || kill(pid, 9),
+    ) {
+        bail!(
+            "{}: QEMU would not exit within the session shutdown deadline",
+            inst.name
+        );
+    }
+    Ok(())
+}
+
+fn stop_before(
+    deadline: Instant,
+    running: impl Fn() -> bool,
+    mut signal: impl FnMut(&str, Instant) -> Result<()>,
+    force: impl FnOnce(),
+) -> bool {
+    let force_at = deadline
+        .checked_sub(Duration::from_secs(10))
+        .unwrap_or(deadline);
+    let quit_at = force_at
+        .checked_sub(Duration::from_secs(2))
+        .unwrap_or(force_at);
+    if Instant::now() < quit_at {
+        let _ = signal(
+            "system_powerdown",
+            quit_at.min(Instant::now() + Duration::from_secs(1)),
+        );
+    }
+    if wait_until(&running, quit_at) {
+        return true;
+    }
+    if Instant::now() < force_at {
+        let _ = signal(
+            "quit",
+            force_at.min(Instant::now() + Duration::from_secs(1)),
+        );
+    }
+    if wait_until(&running, force_at) {
+        return true;
+    }
+    force();
+    wait_until(&running, deadline)
+}
+
+fn wait_until(running: &impl Fn() -> bool, deadline: Instant) -> bool {
+    while running() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+    true
+}
+
 /// QMP run state ("running", "paused", "postmigrate", "io-error", …), or `None` if the VM
 /// isn't up. Exposed for callers that report state (e.g. `list_json`).
 pub fn status(inst: &Instance) -> Option<String> {
@@ -533,6 +599,7 @@ pub fn screenshot(inst: &Instance, out: &Path) -> Result<Vec<u8>> {
 pub struct Qmp {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    deadline: Option<Instant>,
 }
 
 impl Qmp {
@@ -543,14 +610,70 @@ impl Qmp {
         let mut q = Self {
             reader: BufReader::new(stream.try_clone()?),
             writer: stream,
+            deadline: None,
         };
         q.read_msg()?; // greeting
         q.execute("qmp_capabilities", None)?;
         Ok(q)
     }
 
+    fn connect_until(inst: &Instance, deadline: Instant) -> Result<Self> {
+        Self::connect_path_until(&inst.qmp_socket(), deadline)
+    }
+
+    fn connect_path_until(path: &Path, deadline: Instant) -> Result<Self> {
+        // A local Unix-socket connect returns at once (accepted, or refused with no
+        // listener); the deadline then bounds every read and write below.
+        if deadline <= Instant::now() {
+            bail!("QEMU monitor deadline expired");
+        }
+        let stream = UnixStream::connect(path).context("connect to the QEMU monitor")?;
+        let mut q = Self {
+            reader: BufReader::new(stream.try_clone()?),
+            writer: stream,
+            deadline: Some(deadline),
+        };
+        q.read_msg()?;
+        q.execute("qmp_capabilities", None)?;
+        Ok(q)
+    }
+
+    fn remaining(&self) -> Result<Option<Duration>> {
+        self.deadline
+            .map(|deadline| {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    bail!("QEMU monitor deadline expired");
+                }
+                Ok(remaining)
+            })
+            .transpose()
+    }
+
     fn read_msg(&mut self) -> Result<Value> {
         let mut line = String::new();
+        if self.deadline.is_some() {
+            // read_line can keep accepting trickled bytes past a socket inactivity timeout.
+            // Recompute the absolute budget on every read, including interleaved QMP events.
+            let mut bytes = Vec::new();
+            loop {
+                self.reader.get_ref().set_read_timeout(self.remaining()?)?;
+                let buffer = self.reader.fill_buf()?;
+                if buffer.is_empty() {
+                    bail!("QMP connection closed");
+                }
+                let newline = buffer.iter().position(|&b| b == b'\n');
+                let count = newline.map_or(buffer.len(), |at| at + 1);
+                bytes.extend_from_slice(&buffer[..count]);
+                self.reader.consume(count);
+                if bytes.len() > 1 << 20 {
+                    bail!("QEMU monitor message is too large");
+                }
+                if newline.is_some() {
+                    return Ok(serde_json::from_slice(&bytes)?);
+                }
+            }
+        }
         match self.reader.read_line(&mut line) {
             Ok(0) => bail!("QMP connection closed"),
             Ok(_) => {}
@@ -570,7 +693,21 @@ impl Qmp {
         if let Some(a) = args {
             msg["arguments"] = a;
         }
-        writeln!(self.writer, "{msg}")?;
+        if self.deadline.is_some() {
+            let mut bytes = serde_json::to_vec(&msg)?;
+            bytes.push(b'\n');
+            let mut written = 0;
+            while written < bytes.len() {
+                self.writer.set_write_timeout(self.remaining()?)?;
+                let n = self.writer.write(&bytes[written..])?;
+                if n == 0 {
+                    bail!("QMP connection closed while writing");
+                }
+                written += n;
+            }
+        } else {
+            writeln!(self.writer, "{msg}")?;
+        }
         loop {
             let v = self.read_msg()?;
             if let Some(r) = v.get("return") {

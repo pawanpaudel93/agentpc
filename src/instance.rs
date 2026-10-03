@@ -404,7 +404,39 @@ impl Instance {
     }
 
     pub fn create(name: &str, image: &Image, slot: u16) -> Result<Self> {
-        let dir = instances_dir().join(name);
+        Self::create_at(name, image, slot, instances_dir().join(name))
+    }
+
+    /// User creation holds this guard from before publishing metadata through the first boot.
+    pub fn create_locked(name: &str, image: &Image, slot: u16) -> Result<(Self, std::fs::File)> {
+        Self::create_at_locked(
+            name,
+            image,
+            slot,
+            instances_dir().join(name),
+            &instance_lock_path(name),
+        )
+    }
+
+    fn create_at_locked(
+        name: &str,
+        image: &Image,
+        slot: u16,
+        dir: PathBuf,
+        lock_path: &Path,
+    ) -> Result<(Self, std::fs::File)> {
+        let guard = lock(
+            lock_path,
+            Some("waiting for another operation on this VM to finish"),
+        )?;
+        if dir.exists() {
+            bail!("instance '{name}' exists");
+        }
+        let inst = Self::create_at(name, image, slot, dir)?;
+        Ok((inst, guard))
+    }
+
+    fn create_at(name: &str, image: &Image, slot: u16, dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("image"), image.to_string())?;
         std::fs::write(dir.join("slot"), slot.to_string())?;
@@ -578,8 +610,12 @@ impl Instance {
     /// Held for the length of a lifecycle op (start/stop/reset/…) so two of them can't
     /// race on this instance's disk. Same helper as `creation_lock`; released on drop.
     pub fn lock(&self) -> Result<std::fs::File> {
+        self.lock_at(&self.lock_path())
+    }
+
+    fn lock_at(&self, path: &Path) -> Result<std::fs::File> {
         let f = lock(
-            &self.lock_path(),
+            path,
             Some("waiting for another operation on this VM to finish"),
         )?;
         // The operation it waited for may have deleted the VM.
@@ -592,7 +628,7 @@ impl Instance {
     /// Outside the VM's directory, so deleting the VM doesn't delete the lock a waiting
     /// operation holds open (a VM made again under the name would get a second lock).
     pub fn lock_path(&self) -> PathBuf {
-        home().join("locks").join(format!("{}.lock", self.name))
+        instance_lock_path(&self.name)
     }
 
     /// This VM's VNC password file (0600), created with a fresh password if absent.
@@ -669,6 +705,40 @@ fn image_lock_path(image: &Image) -> PathBuf {
 /// Never blocks. Used by `clean` to tell a crashed build's leftovers from a live build.
 pub fn try_image_lock(image: &Image) -> Option<std::fs::File> {
     try_lock(&image_lock_path(image))
+}
+
+fn instance_lock_path(name: &str) -> PathBuf {
+    home().join("locks").join(format!("{name}.lock"))
+}
+
+/// Acquire a lock within a shared operation deadline. A busy lock times out without taking it.
+pub(crate) fn lock_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let f = std::fs::File::create(path)?;
+    loop {
+        // SAFETY: flock(2) on a descriptor we own; never wait in the kernel.
+        if unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+            return Ok(Some(f));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error.into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
 }
 
 /// The lock at `path` if it's free right now, else None. Never blocks.
@@ -924,6 +994,102 @@ pub fn mac_timezone() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    fn fixture(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("agentpc-{label}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn creation_holds_instance_lock_before_publishing_metadata() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = fixture("publication-lock");
+        let path = root.join("vm.lock");
+        let dir = root.join("vm");
+        let guard = super::lock(&path, None).unwrap();
+        let (ready, received) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let thread_path = path.clone();
+        let thread_dir = dir.clone();
+        let worker = std::thread::spawn(move || {
+            let image: super::Image = "ubuntu".parse().unwrap();
+            let (inst, _guard) =
+                super::Instance::create_at_locked("vm", &image, 1, thread_dir, &thread_path)
+                    .unwrap();
+            ready.send(inst.dir.clone()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+        });
+        assert!(received.recv_timeout(Duration::from_millis(30)).is_err());
+        assert!(
+            !dir.exists(),
+            "metadata must not be published before acquiring the VM lock"
+        );
+        drop(guard);
+        let published = received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(published.join("image").is_file() && published.join("slot").is_file());
+        assert!(
+            super::try_lock(&path).is_none(),
+            "the creator must retain the guard through initialization"
+        );
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(super::try_lock(&path).is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_wait_rejects_an_instance_deleted_while_waiting() {
+        use std::time::Duration;
+        let root = fixture("deleted-waiter");
+        let path = root.join("vm.lock");
+        let image: super::Image = "ubuntu".parse().unwrap();
+        let inst = super::Instance::create_at("vm", &image, 1, root.join("vm")).unwrap();
+        let dir = inst.dir.clone();
+        let guard = super::lock(&path, None).unwrap();
+        let worker = std::thread::spawn(move || inst.lock_at(&path));
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::remove_dir_all(&dir).unwrap();
+        drop(guard);
+        assert!(
+            worker
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("was deleted")
+        );
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lock_wait_has_an_absolute_deadline() {
+        use std::time::{Duration, Instant};
+        let root = fixture("lock-deadline");
+        let path = root.join("vm.lock");
+        let guard = super::lock(&path, None).unwrap();
+        let started = Instant::now();
+        assert!(
+            super::lock_until(&path, started + Duration::from_millis(30))
+                .unwrap()
+                .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(guard);
+        assert!(
+            super::lock_until(&path, Instant::now() + Duration::from_secs(1))
+                .unwrap()
+                .is_some()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn instance_names_are_never_paths() {
         for bad in [

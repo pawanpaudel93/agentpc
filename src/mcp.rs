@@ -255,11 +255,21 @@ impl Gateway {
 
     /// Make this session a VM's owner: its tag (with this process, for `owner_running`) and
     /// the auto-stop set agree.
-    fn claim(&self, name: &str, ctx: &RequestContext<RoleServer>) {
-        if let Ok(inst) = load(name) {
-            let _ = ops::claim(&inst, &self.owner_tag(ctx));
-            self.owned.lock().unwrap().insert(name.to_string());
-        }
+    async fn claim(&self, name: &str, ctx: &RequestContext<RoleServer>) -> Result<()> {
+        let inst = load(name)?;
+        let owner = self.owner_tag(ctx);
+        self.claim_with(name, move || ops::claim(&inst, &owner))
+            .await
+    }
+
+    async fn claim_with(
+        &self,
+        name: &str,
+        claim: impl FnOnce() -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        blocking(claim).await?;
+        self.owned.lock().unwrap().insert(name.to_string());
+        Ok(())
     }
 
     /// Best-effort, bounded shutdown: gracefully stop the VMs this session left running, unless
@@ -284,21 +294,16 @@ impl Gateway {
             "MCP server exiting; stopping {} VM(s) it started",
             running.len()
         );
-        let stops = running.iter().cloned().map(|inst| {
+        // Bound the lock-holding operation itself. Cancelling a spawn_blocking waiter
+        // would leave that stop running (and its lock held) past the session deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        let stops = running.into_iter().map(|inst| {
             let mine = mine.clone();
-            // Checked again under the VM's lock: it may have changed hands since.
-            blocking(move || ops::stop_if_owned(&inst, &mine))
+            blocking(move || ops::stop_if_owned(&inst, &mine, deadline))
         });
-        let _ =
-            tokio::time::timeout(Duration::from_secs(45), futures::future::join_all(stops)).await;
-        for inst in &running {
-            // Force-quit only what is still ours (a lock held past the timeout is someone
-            // else's operation; their VM is theirs).
-            if inst.running()
-                && ops::owner(inst).is_some_and(|o| o.ends_with(&mine))
-                && crate::instance::try_lock(&inst.lock_path()).is_some()
-            {
-                qemu::quit(inst);
+        for result in futures::future::join_all(stops).await {
+            if let Err(error) = result {
+                crate::log!("session VM shutdown failed: {error:#}");
             }
         }
     }
@@ -567,7 +572,9 @@ impl Gateway {
                     differs.join(", ")
                 )));
             }
-            self.claim(name, &ctx);
+            if let Err(error) = self.claim(name, &ctx).await {
+                return text(Err(error));
+            }
             // Through boot even when QEMU runs: a VM that never became ready is waited for
             // again (and a paused one resumed), rather than reported ready.
             return text(
@@ -641,7 +648,9 @@ impl Gateway {
         ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
         // Claimed before booting, so a VM whose boot fails is still this session's to stop.
-        self.claim(&a.name, &ctx);
+        if let Err(error) = self.claim(&a.name, &ctx).await {
+            return text(Err(error));
+        }
         text(self.lifecycle(&a.name, ops::boot, &ctx).await)
     }
 
@@ -677,7 +686,9 @@ impl Gateway {
         Parameters(a): Parameters<NameArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        self.claim(&a.name, &ctx);
+        if let Err(error) = self.claim(&a.name, &ctx).await {
+            return text(Err(error));
+        }
         text(self.lifecycle(&a.name, ops::reset, &ctx).await)
     }
 
@@ -740,7 +751,9 @@ impl Gateway {
         ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
         self.drop_session(&a.name);
-        self.claim(&a.name, &ctx);
+        if let Err(error) = self.claim(&a.name, &ctx).await {
+            return text(Err(error));
+        }
         let r = async {
             let inst = load(&a.name)?;
             with_progress(&ctx, move || ops::restore(&inst, &a.label)).await
@@ -1779,6 +1792,39 @@ fn reply(r: Result<Vec<ContentBlock>>) -> CallToolResult {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "current_thread")]
+    async fn ownership_claim_does_not_block_the_async_executor() {
+        use std::time::Duration;
+        let gateway = super::Gateway::new();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (claimed, _) = tokio::join!(
+            gateway.claim_with("synthetic-vm", move || {
+                wait.recv_timeout(Duration::from_secs(1))
+                    .map_err(anyhow::Error::from)?;
+                Ok(())
+            }),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let _ = release.send(());
+            }
+        );
+        claimed.unwrap();
+        assert!(gateway.owned.lock().unwrap().contains("synthetic-vm"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_ownership_claim_is_propagated_and_not_tracked() {
+        let gateway = super::Gateway::new();
+        let error = gateway
+            .claim_with("synthetic-vm", || {
+                Err(anyhow::anyhow!("synthetic claim failure"))
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("synthetic claim failure"));
+        assert!(!gateway.owned.lock().unwrap().contains("synthetic-vm"));
+    }
+
     #[test]
     fn browser_open_argument_defaults_off_and_is_optional_in_schema() {
         let default: super::CreateArgs =

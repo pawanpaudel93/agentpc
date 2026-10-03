@@ -620,7 +620,9 @@ pub fn create(
     if crate::instance::instances_dir().join(&name).exists() {
         bail!("instance '{name}' exists");
     }
-    let inst = Instance::create(&name, image, slot)?;
+    let (inst, _instance_lock) = Instance::create_locked(&name, image, slot)?;
+    // Image builds hold their image lock before reserving a scratch slot: don't retain
+    // creation_lock while taking that image lock below.
     drop(lock);
     let made = inst
         .set_size(memory, cpus)
@@ -639,7 +641,7 @@ pub fn create(
         return Err(e);
     }
     let note = crate::image::outdated(image).map(|h| format!("\n  note: the {image} image: {h}"));
-    boot(&inst)
+    boot_locked(&inst)
         .map(|s| s + &note.unwrap_or_default())
         .map_err(|e| {
             anyhow::anyhow!(
@@ -1147,16 +1149,36 @@ pub fn claim(inst: &Instance, owner: &str) -> Result<()> {
     set_owner(inst, owner)
 }
 
-/// Stop the VM if its owner tag still ends with `tag` (this session's), checked under its
-/// lock: another session may have taken it over.
-pub fn stop_if_owned(inst: &Instance, tag: &str) -> Result<bool> {
-    let _lock = inst.lock()?;
-    if !inst.running() || !owner(inst).is_some_and(|o| o.ends_with(tag)) {
+/// Stop a session's VM within its shutdown deadline, including lock acquisition.
+/// Ownership and existence are checked only after the guard is held and remain protected
+/// throughout graceful shutdown and any force-quit.
+pub fn stop_if_owned(inst: &Instance, tag: &str, deadline: Instant) -> Result<bool> {
+    shutdown_locked(
+        &inst.lock_path(),
+        deadline,
+        || inst.dir.is_dir() && inst.running() && owner(inst).is_some_and(|o| o.ends_with(tag)),
+        |deadline| {
+            stop_forwards(inst);
+            qemu::stop_until(inst, deadline)?;
+            viewer::stop_if_idle();
+            Ok(())
+        },
+    )
+}
+
+fn shutdown_locked(
+    path: &Path,
+    deadline: Instant,
+    still_owned: impl FnOnce() -> bool,
+    stop: impl FnOnce(Instant) -> Result<()>,
+) -> Result<bool> {
+    let Some(_guard) = crate::instance::lock_until(path, deadline)? else {
+        return Ok(false);
+    };
+    if !still_owned() {
         return Ok(false);
     }
-    stop_forwards(inst);
-    qemu::stop(inst)?;
-    viewer::stop_if_idle();
+    stop(deadline)?;
     Ok(true)
 }
 
@@ -1411,6 +1433,103 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shutdown_fixture() -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "agentpc-shutdown-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn shutdown_retains_guard_through_owner_check_and_force_work() {
+        let root = shutdown_fixture();
+        let path = root.join("vm.lock");
+        assert!(
+            shutdown_locked(
+                &path,
+                Instant::now() + Duration::from_secs(1),
+                || {
+                    assert!(crate::instance::try_lock(&path).is_none());
+                    true
+                },
+                |_| {
+                    assert!(crate::instance::try_lock(&path).is_none());
+                    Ok(())
+                },
+            )
+            .unwrap()
+        );
+        assert!(crate::instance::try_lock(&path).is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_rechecks_owner_after_waiting_and_skips_a_deleted_instance() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let root = shutdown_fixture();
+        let path = root.join("vm.lock");
+        let guard = crate::instance::lock(&path, None).unwrap();
+        let owned = Arc::new(AtomicBool::new(true));
+        let stop_called = Arc::new(AtomicBool::new(false));
+        let worker_path = path.clone();
+        let worker_owned = owned.clone();
+        let worker_stop = stop_called.clone();
+        let worker = std::thread::spawn(move || {
+            shutdown_locked(
+                &worker_path,
+                Instant::now() + Duration::from_secs(1),
+                || worker_owned.load(Ordering::SeqCst),
+                |_| {
+                    worker_stop.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+        });
+        owned.store(false, Ordering::SeqCst);
+        drop(guard);
+        assert!(!worker.join().unwrap().unwrap());
+        assert!(!stop_called.load(Ordering::SeqCst));
+        assert!(
+            !shutdown_locked(
+                &path,
+                Instant::now() + Duration::from_secs(1),
+                || false,
+                |_| panic!("deleted VM must not be stopped")
+            )
+            .unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_deadline_includes_time_waiting_for_another_operation() {
+        let root = shutdown_fixture();
+        let path = root.join("vm.lock");
+        let guard = crate::instance::lock(&path, None).unwrap();
+        let start = Instant::now();
+        assert!(
+            !shutdown_locked(
+                &path,
+                start + Duration::from_millis(30),
+                || panic!("must not check without guard"),
+                |_| panic!("must not stop without guard")
+            )
+            .unwrap()
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn udp_hostfwd_commands() {

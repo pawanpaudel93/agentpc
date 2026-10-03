@@ -152,7 +152,10 @@ agentpc mcp-install                  # or pick: agentpc mcp-install claude claud
 ```
 
 Supported: Claude Code, Claude Desktop, Codex, Cursor, Gemini CLI and VS Code (restart Claude
-Desktop after registering). For any other MCP client, add:
+Desktop after registering). Updating an existing JSON `mcpServers.agentpc` or Codex
+`[mcp_servers.agentpc]` entry preserves custom environment/options while refreshing the
+managed command and arguments. Invalid config is refused, not replaced; multiline TOML
+values are edited as complete values. For any other MCP client, add:
 
 ```json
 {
@@ -193,7 +196,9 @@ snapshot ids and browser sessions are gone: take a new snapshot and run `browser
 VMs an MCP session created, started, reset or restored are stopped (never deleted) when the
 session ends, unless `AGENTPC_KEEP_RUNNING=1`. If the session's server was killed instead, the
 next MCP server to start stops them; `list_vms` marks such VMs `owner_running: false`, and
-`create_vm` with the same name and image hands one back to the session that asks.
+`create_vm` with the same name and image hands one back to the session that asks. Session shutdown is
+bounded at about 45 s per VM (lock wait, ACPI shutdown, then a forced quit); a VM another
+session has taken over is left alone.
 
 ### Approval prompts
 
@@ -597,7 +602,9 @@ To only reclaim disk space, `agentpc clean` deletes what can be downloaded again
   agentpc's key, since every VM's SSH port is reachable from the other VMs and local users.
 - `~/.agentpc` is private to you (0700): it holds guest disks, RAM checkpoints and the SSH key.
 - The browser viewer link carries the VNC password after `#`, which no request sends, and is
-  only given out when the server on port 8100 is agentpc's own.
+  only given out when the server on port 8100 is agentpc's own. Commands verify
+  the viewer with a fresh HMAC-SHA256 challenge; the private identity key is never served
+  over HTTP, and an observed response cannot authenticate a different challenge.
 - To keep agents unblocked, Windows VMs have UAC prompts, SmartScreen and Windows Update turned
   off. Don't use them for anything that needs those protections.
 - VMs can reach the internet and, through its gateway `10.0.2.2`, services on your Mac. Create
@@ -618,8 +625,10 @@ python3 scripts/lifecycle-stress.py --bin target/release/agentpc --rounds 3
 ```
 
 The lifecycle stress suite requires an existing, current Ubuntu snapshot; it never
-downloads or builds images. It races named creates, starts, stops and deletes, then
-checks killed-session orphan recovery and graceful session shutdown. It uses only
+downloads or builds images. It briefly holds an idle image lock to delay cloning,
+checks that queued start/delete calls wait for initialization, and verifies a one-worker
+MCP server remains responsive. It then races named creates, starts, stops and deletes
+and checks killed-session orphan recovery and graceful session shutdown. It uses only
 uniquely named task-owned VMs, deletes them afterward, and refuses to start when
 unrelated running orphan VMs could be reaped. Logs omit raw MCP responses and
 viewer credentials. CI checks its syntax; VM tests run locally on Apple Silicon.
