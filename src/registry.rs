@@ -108,17 +108,19 @@ pub fn push(image: &Image) -> Result<()> {
         .filter(|n| n.starts_with("disk.qcow2.part-"))
         .collect();
     parts.sort();
-    // :<image> (newest build of that version), :<image>-<build date> (pinned), and bare
-    // :<os> for the default version.
-    let mut tags = vec![image.to_string(), format!("{image}-{}", info.built)];
+    // Only rolling tags go in the push: including the dated tag here would overwrite
+    // an earlier publication after recapturing an image with the same build date.
+    let mut tags = vec![image.to_string()];
+    let dated = format!("{image}-{}", info.built);
     if image.version == os.default_version() {
         tags.push(os.to_string());
     }
     let target = reference(&tags.join(","));
     let host = target.split('/').next().unwrap_or_default().to_string();
-    let mut cmd = Command::new(oras);
+    let mut cmd = Command::new(&oras);
     cmd.current_dir(&work)
-        .args(["push", &target, "--artifact-type", ARTIFACT_TYPE]);
+        .args(["push", &target, "--artifact-type", ARTIFACT_TYPE])
+        .args(["--export-manifest", "manifest.json"]);
     // GitHub shows a ghcr package on the repo page only when the manifest names its source.
     cmd.arg("--annotation")
         .arg("org.opencontainers.image.source=https://github.com/pawanpaudel93/agentpc");
@@ -146,9 +148,70 @@ pub fn push(image: &Image) -> Result<()> {
         log!("push failed; retrying ({attempt}/{PUSH_ATTEMPTS})");
         std::thread::sleep(std::time::Duration::from_secs(5));
     }
+    // Use the uploaded manifest's digest, not a rolling tag another publisher could move.
+    let digest = file_sha256(&work.join("manifest.json")).context("hash pushed manifest")?;
+    let repo = target.rsplit_once(':').context("bad push reference")?.0;
+    if publish_dated_tag(&oras, repo, &dated, &digest, plain_http(&host))
+        .context("rolling tags were published, but dated-tag publication failed; retry the push")?
+    {
+        tags.push(dated);
+    } else {
+        log!("kept existing :{dated}; it still pins its original publication");
+    }
     std::fs::remove_dir_all(&work)?;
     log!("pushed {} as :{}", info.version, tags.join(", :"));
     Ok(())
+}
+
+/// Dated tags are write-once through agentpc. Registries without immutable-tag enforcement
+/// still require publishers on different machines to serialize publication of a new date.
+fn publish_dated_tag(
+    oras: &Path,
+    repo: &str,
+    tag: &str,
+    digest: &str,
+    plain: bool,
+) -> Result<bool> {
+    // Check after pushing rolling tags, so even a previously empty repo now exists.
+    let mut list = Command::new(oras);
+    list.args(["repo", "tags", repo, "--format", "json"]);
+    if plain {
+        list.arg("--plain-http");
+    }
+    let output = list.output().context("list registry tags")?;
+    if !output.status.success() {
+        bail!(
+            "could not check existing tags; refusing to write :{tag} (check network and oras login)"
+        );
+    }
+    if !dated_tag_available(&output.stdout, tag)? {
+        return Ok(false);
+    }
+    let at = format!("{repo}@sha256:{digest}");
+    let mut cmd = Command::new(oras);
+    cmd.args(["tag", &at, tag]);
+    if plain {
+        cmd.arg("--plain-http");
+    }
+    if !cmd.status().context("publish dated tag")?.success() {
+        bail!("could not publish :{tag}");
+    }
+    Ok(true)
+}
+
+fn dated_tag_available(output: &[u8], tag: &str) -> Result<bool> {
+    let value: Value = serde_json::from_slice(output).context("registry tag list is not JSON")?;
+    let tags = value["tags"]
+        .as_array()
+        .context("registry tag list has no tags array")?;
+    let mut available = true;
+    for existing in tags {
+        let existing = existing.as_str().context("registry tag is not a string")?;
+        if existing == tag {
+            available = false;
+        }
+    }
+    Ok(available)
 }
 
 /// Held by a push of `image` (`clean` checks it before removing `cache/push-<image>`).
@@ -561,6 +624,131 @@ fn replace_readonly(from: &Path, to: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dated_tags_are_write_once_and_checks_fail_closed() {
+        let tag = "ubuntu-24.04-20261003";
+        assert!(dated_tag_available(br#"{"tags":[]}"#, tag).unwrap());
+        assert!(dated_tag_available(br#"{"tags":["ubuntu","ubuntu-24.04"]}"#, tag).unwrap());
+        assert!(!dated_tag_available(br#"{"tags":["ubuntu-24.04-20261003"]}"#, tag).unwrap());
+        for output in [
+            &b"not JSON"[..],
+            &b"{}"[..],
+            &b"{\"tags\":null}"[..],
+            &b"{\"tags\":[42]}"[..],
+            &b"{\"tags\":[\"ubuntu-24.04-20261003\",42]}"[..],
+        ] {
+            assert!(dated_tag_available(output, tag).is_err());
+        }
+    }
+
+    #[test]
+    fn dated_publication_preserves_existing_tags_and_uses_uploaded_digest() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("agentpc-tags-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let tag = "ubuntu-24.04-20261003";
+        let digest = "a".repeat(64);
+        // Network/auth failures and malformed responses must never reach `oras tag`.
+        for (case, output, exit, want) in [
+            ("new", r#"{"tags":[]}"#, 0, Some(true)),
+            (
+                "existing",
+                r#"{"tags":["ubuntu-24.04-20261003"]}"#,
+                0,
+                Some(false),
+            ),
+            ("network", "", 1, None),
+            ("malformed", "{}", 0, None),
+        ] {
+            let dir = root.join(case);
+            std::fs::create_dir_all(&dir).unwrap();
+            let fake = dir.join("oras");
+            std::fs::write(&fake, format!(
+                "#!/bin/sh\nif [ \"$1\" = repo ]; then\n  printf '%s' '{output}'\n  exit {exit}\nfi\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/called\"\n"
+            )).unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let result = publish_dated_tag(&fake, "localhost:5000/test", tag, &digest, true);
+            match want {
+                Some(want) => assert_eq!(result.unwrap(), want),
+                None => assert!(result.is_err()),
+            }
+            let called = dir.join("called");
+            if want == Some(true) {
+                assert_eq!(
+                    std::fs::read_to_string(called).unwrap(),
+                    format!("tag\nlocalhost:5000/test@sha256:{digest}\n{tag}\n--plain-http\n")
+                );
+            } else {
+                assert!(!called.exists(), "{case} must not write a dated tag");
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_and_invalid_blob_downloads_can_be_retried() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let root =
+            std::env::temp_dir().join(format!("agentpc-download-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let dest = root.join("disk.qcow2.part-aaa");
+        let sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let blob = Blob {
+            title: "disk.qcow2.part-aaa".into(),
+            digest: format!("sha256:{sha}"),
+            sha256: sha.into(),
+            size: 3,
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        // Close the connection mid-body, exceed the manifest's size, return bad content,
+        // then retry from a leftover partial file with the correct body.
+        for (length, body, success) in [
+            (6, "ab", false),
+            (4, "abcd", false),
+            (3, "xyz", false),
+            (3, "abc", true),
+        ] {
+            std::fs::write(root.join("disk.qcow2.part-aaa.part"), b"old partial bytes").unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}"
+                )
+                .unwrap();
+            });
+            let done = AtomicU64::new(0);
+            let result = runtime.block_on(fetch_blob(&http, &base, None, &blob, &dest, &done, 3));
+            server.join().unwrap();
+            assert_eq!(result.is_ok(), success, "body {body}: {result:?}");
+            if success {
+                assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+                assert_eq!(file_sha256(&dest).as_deref(), Some(sha));
+                assert!(!root.join("disk.qcow2.part-aaa.part").exists());
+            } else {
+                assert!(
+                    !dest.exists(),
+                    "a failed download must not become a verified part"
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn qcow2(version: u32, backing: u64, incompat: u64) -> Vec<u8> {
         let mut h = vec![0u8; 104];

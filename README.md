@@ -345,7 +345,11 @@ name. Windows images can't be redistributed:
 
 A pinned build is download-only: `image build` refuses it, and a `create` whose download fails
 doesn't fall back to building today's instead. Short names work too (`ubuntu-x86apps-YYYYMMDD`
-is `ubuntu-24.04-x86apps-YYYYMMDD`).
+is `ubuntu-24.04-x86apps-YYYYMMDD`). A push updates rolling tags but leaves an
+existing dated tag untouched, even after recapturing the local image. The dated tag
+still selects its original publication, not necessarily the current rolling image.
+Publishers on different machines must serialize pushes for a new date: without
+registry-side immutable tags, a tag check and creation are not atomic.
 
 ## Configuration
 
