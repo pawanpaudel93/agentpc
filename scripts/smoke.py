@@ -306,13 +306,35 @@ def lifecycle(m, vm, r, guest):
     # A job killed before it could record an exit code must not read "running" forever.
     ok, out = sh("sleep 300", background=True)
     job = re.search(r"\(id (\d+)", out)
-    kill = re.search(r"kill (\d+)", out)
-    if job and kill:
-        sh(f"kill {kill.group(1)}")
+    if job:
+        sh(f"kill $(cat ~/agentpc-bg/{job.group(1)}.pid)")
         def ended():
             _, st = m.tool("get_job_status", name=vm, id=int(job.group(1)), tail_lines=1)
             return st if "ended without an exit code" in st else None
         r.check("a killed background job is reported ended", poll(ended, 20), out[:200])
+
+    # stop_job stops the job and everything it started, root processes (sudo) included.
+    ok, out = sh("sleep 3301 & sleep 3302 & sudo -n sleep 3303 & wait", background=True)
+    job = re.search(r"\(id (\d+)", out)
+    if r.check("background run_command points at stop_job", ok and job and "stop_job" in out, out[:300]):
+        jid = int(job.group(1))
+        count = "pgrep -fx 'sleep 330[123]' | wc -l"
+        r.check("the job's processes are running", poll(lambda: stdout(sh(count)[1]) == "3", 15))
+        ok, out = m.tool("stop_job", name=vm, id=jid)
+        r.check("stop_job stops the job", ok and "stopped job" in out, out[:300])
+        r.check("stop_job leaves none of its processes behind", stdout(sh(count)[1]) == "0")
+        _, st = m.tool("get_job_status", name=vm, id=jid, tail_lines=1)
+        r.check("get_job_status reports the job stopped", "STATE: stopped by stop_job" in st, st[:200])
+        ok, out = m.tool("stop_job", name=vm, id=jid)
+        r.check("stop_job again is harmless", ok, out[:200])
+    ok, out = sh("echo quick", background=True)
+    job = re.search(r"\(id (\d+)", out)
+    if job:
+        poll(lambda: "STATE: exited" in m.tool("get_job_status", name=vm, id=int(job.group(1)))[1], 15)
+        ok, out = m.tool("stop_job", name=vm, id=int(job.group(1)))
+        r.check("stop_job leaves a finished job as it was", ok and "already exited with code 0" in out, out[:200])
+    ok, out = m.tool("stop_job", name=vm, id=1)
+    r.check("stop_job refuses an unknown job", not ok and "no such job" in out, out[:200])
 
     ok, out = sh("sleep 60; echo late", timeout=3)
     r.check(
@@ -663,15 +685,18 @@ def windows_lifecycle(m, vm, r):
         st = poll(failed, 60) or ""
         r.check("windows: a background job whose cmdlet fails exits non-zero", "STATE: exited 1" in st, st[:200])
 
-    ok, out = ps("Start-Sleep 300", background=True)
+    # stop_job ends the job's whole process tree, a program it started included.
+    ok, out = ps("Start-Process ping -ArgumentList '-n 3300 127.0.0.1'; Start-Sleep 3300", background=True)
     job = re.search(r"\(id (\d+)", out)
     if job:
-        time.sleep(3)
-        ps(f"Stop-ScheduledTask agentpc-bg-{job.group(1)}")
-        def ended():
-            _, st = m.tool("get_job_status", name=vm, id=int(job.group(1)), tail_lines=1)
-            return st if "ended without an exit code" in st else None
-        r.check("windows: a stopped background job is reported ended", poll(ended, 30), out[:200])
+        jid = int(job.group(1))
+        pings = "@(Get-Process ping -ErrorAction SilentlyContinue).Count"
+        r.check("windows: the job's processes are running", poll(lambda: stdout(ps(pings)[1]) == "1", 30))
+        ok, out = m.tool("stop_job", name=vm, id=jid)
+        r.check("windows: stop_job stops the job", ok and "stopped job" in out, out[:300])
+        r.check("windows: stop_job leaves no child behind", stdout(ps(pings)[1]) == "0")
+        _, st = m.tool("get_job_status", name=vm, id=jid, tail_lines=1)
+        r.check("windows: get_job_status reports the job stopped", "STATE: stopped by stop_job" in st, st[:200])
 
     ok, out = ps("Start-Sleep 60; 'late'", timeout=3)
     r.check("windows: a foreground run stops at its timeout", not ok and "timed out after 3s" in out and "late" not in out, out[:300])

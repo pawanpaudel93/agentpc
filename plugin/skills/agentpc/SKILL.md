@@ -31,7 +31,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 | `delete_vm(name)` | Delete a VM with its disk and checkpoints |
 | `take_screenshot(name, save_to?)` | PNG screenshot; works even while booting or hung. `save_to` also writes it to a Mac path |
 | `run_command(name, command, timeout?, background?)` | Shell command: PowerShell on Windows, bash on Ubuntu and Arch. Returns `exit code: N` plus stdout and stderr, each trimmed to its first and last 10,000 characters. Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` (servers, long jobs) returns a job id to poll with `get_job_status` |
-| `get_job_status(name, id, tail_lines?)` | Background job's state (running, or exited with its code) plus its log tail |
+| `get_job_status(name, id, tail_lines?)` | Background job's state (running, exited with its code, or stopped) plus its log tail |
+| `stop_job(name, id)` | Stop a background job and everything it started; a finished job is left as is |
 | `upload_file` / `download_file` | Copy files or folders between this Mac and a VM |
 | `forward_port(name, guest_port, host_port?, protocol?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). TCP (default) is an SSH tunnel: reaches a server on the guest's own `127.0.0.1`. `protocol: "udp"` is a QEMU host forward: the guest server must listen on `0.0.0.0`; not on offline VMs. Lasts until the VM stops |
 | `list_forwards(name)` / `delete_forward(name, host_port, protocol?)` | List a VM's forwards (with protocol) / stop one |

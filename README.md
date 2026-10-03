@@ -182,7 +182,8 @@ pick the server up automatically.
 | `delete_vm` | Delete a VM with its disk and checkpoints |
 | `take_screenshot` | PNG screenshot from the hypervisor; `save_to` also writes it to a path on your Mac |
 | `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu and Arch); returns exit code, stdout and stderr. A foreground run is killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id for `get_job_status` |
-| `get_job_status` | Check a background job by its id: still running or exited (with its code), plus the tail of its log |
+| `get_job_status` | Check a background job by its id: still running, exited (with its code) or stopped, plus the tail of its log |
+| `stop_job` | Stop a background job and everything it started (its session on Linux, its process tree on Windows) |
 | `upload_file` / `download_file` | Copy files or folders between your Mac and a VM |
 | `forward_port` | Reach a server running in a VM from your Mac (TCP over an SSH tunnel, works even for servers bound to the guest's own `127.0.0.1`; or `protocol: "udp"` for a UDP server listening on `0.0.0.0`) |
 | `list_forwards` / `delete_forward` | List a VM's active port forwards / stop one by its host port (and optional protocol) |

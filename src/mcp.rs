@@ -102,7 +102,8 @@ Rules:
   a session that is gone; if it was yours (your session restarted), create_vm with its name and
   image takes it back.
 - Long jobs and servers: use run_command with background: true (it keeps running after the call
-  and returns a job id); poll it with get_job_status. Foreground run_command times out (default 120 s).
+  and returns a job id); poll it with get_job_status and end it with stop_job. Foreground run_command
+  times out (default 120 s).
 - Reach a server in the VM from the Mac with forward_port (works even for servers bound to the
   guest's own 127.0.0.1); it returns a 127.0.0.1:<port> address and lasts until the VM stops.
   For a UDP server pass protocol: \"udp\"; it must listen on 0.0.0.0 (on Windows, also allow
@@ -464,6 +465,13 @@ struct JobArgs {
     /// Lines of the log to return from the end (default 50).
     #[serde(default = "default_tail")]
     tail_lines: usize,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct StopJobArgs {
+    name: String,
+    /// Job id returned by a `background: true` run_command.
+    id: u64,
 }
 
 fn default_tail() -> usize {
@@ -1074,6 +1082,23 @@ impl Gateway {
     }
 
     #[tool(
+        name = "stop_job",
+        title = "Stop job",
+        description = "Stop a background job started by run_command (background: true): the job and every\n\
+                          process it started (on Linux, its whole session; on Windows, its process tree).\n\
+                          get_job_status then reports it as stopped. A job already finished is left as is.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn stop_job(&self, Parameters(a): Parameters<StopJobArgs>) -> CallToolResult {
+        text(stop_job(&a.name, a.id).await)
+    }
+
+    #[tool(
         title = "Delete checkpoint",
         description = "Delete a checkpoint by label, freeing its disk and memory snapshot. The VM is not\n\
                           affected.",
@@ -1448,7 +1473,7 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
              echo $! > $d/{id}.pid\n\
              echo \"started in the background (id {id}, pid $!). \
              Poll it with get_job_status name={name} id={id}. \
-             Output: $HOME/agentpc-bg/{id}.log. Stop it with: kill $!\"",
+             Output: $HOME/agentpc-bg/{id}.log. Stop it with stop_job name={name} id={id}.\"",
             env = ops::LINUX_SESSION_ENV
         ),
         Os::Windows => format!(
@@ -1462,7 +1487,7 @@ $p = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -Ru
 $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $task -Action $a -Principal $p -Settings $s -Force | Out-Null
 Start-ScheduledTask -TaskName $task
-"started in the background as scheduled task $task (id {id}). Poll it with get_job_status name={name} id={id}. Output: $log. Stop it with: Stop-ScheduledTask $task (and Stop-Process for anything it started)""#
+"started in the background as scheduled task $task (id {id}). Poll it with get_job_status name={name} id={id}. Output: $log. Stop it with stop_job name={name} id={id}.""#
         ),
     };
     let out = exec(name, &script, 60, false).await?;
@@ -1483,6 +1508,7 @@ async fn job_status(name: &str, id: u64, tail_lines: usize) -> Result<String> {
             "d=~/agentpc-bg\n\
              if [ ! -f $d/{id}.log ]; then echo 'STATE: no such job'; exit 0; fi\n\
              if [ -f $d/{id}.exit ]; then echo \"STATE: exited $(cat $d/{id}.exit)\"; \
+             elif [ -f $d/{id}.stopped ]; then echo 'STATE: stopped by stop_job'; \
              elif p=$(cat $d/{id}.pid 2>/dev/null) && grep -qs {id}.sh /proc/$p/cmdline; \
              then echo 'STATE: running'; \
              else echo 'STATE: ended without an exit code (killed, or the VM restarted)'; fi\n\
@@ -1492,6 +1518,7 @@ async fn job_status(name: &str, id: u64, tail_lines: usize) -> Result<String> {
             r#"$d = "$env:USERPROFILE\agentpc-bg"; $log = "$d\{id}.log"; $exit = "$d\{id}.exit"
 if (-not (Test-Path $log)) {{ 'STATE: no such job'; exit 0 }}
 if (Test-Path $exit) {{ "STATE: exited $((Get-Content $exit -Raw).Trim())" }}
+elseif (Test-Path "$d\{id}.stopped") {{ 'STATE: stopped by stop_job' }}
 else {{
   # Ended only once the task has run and is no longer running (just after Start-ScheduledTask
   # it can still read Ready, not yet having run).
@@ -1507,6 +1534,70 @@ else {{
     Ok(out
         .split_once("--- stdout ---\n")
         .map_or_else(|| out.clone(), |(_, s)| s.trim().to_string()))
+}
+
+/// Stop a background job and everything it started (see exec_background), and mark it stopped
+/// so get_job_status says so. A job that already exited is left alone.
+async fn stop_job(name: &str, id: u64) -> Result<String> {
+    let inst = load(name)?;
+    if !inst.running() {
+        bail!("VM {name} is not running; start_vm first");
+    }
+    let out = exec(name, &stop_job_script(inst.os, id), 60, false).await?;
+    Ok(out
+        .split_once("--- stdout ---\n")
+        .map_or_else(|| out.clone(), |(_, s)| s.trim().to_string()))
+}
+
+fn stop_job_script(os: Os, id: u64) -> String {
+    match os {
+        // The job runs under `setsid`, so its wrapper's pid is also its session id, and every
+        // process it starts (unless one makes a session of its own) shares that session. The
+        // pid is checked to still be this job's wrapper first: a reused one is someone else's.
+        // sudo, so processes the job started as root (sudo inside it) stop too.
+        Os::Ubuntu | Os::Arch => format!(
+            "d=~/agentpc-bg\n\
+             [ -f $d/{id}.log ] || {{ echo 'no such job {id}'; exit 3; }}\n\
+             if [ -f $d/{id}.exit ]; then echo \"job {id} already exited with code $(cat $d/{id}.exit)\"; exit 0; fi\n\
+             p=$(cat $d/{id}.pid 2>/dev/null)\n\
+             case $p in ''|*[!0-9]*) echo 'job {id} has no recorded pid'; exit 3 ;; esac\n\
+             if [ -d /proc/$p ] && ! grep -qs {id}.sh /proc/$p/cmdline; then\n\
+               touch $d/{id}.stopped; echo \"job {id} is not running\"; exit 0\n\
+             fi\n\
+             k() {{ sudo -n pkill \"$@\" 2>/dev/null || pkill \"$@\" 2>/dev/null; }}\n\
+             n=$(pgrep -s $p | wc -l)\n\
+             touch $d/{id}.stopped\n\
+             if [ \"$n\" -eq 0 ]; then echo \"job {id} is not running\"; exit 0; fi\n\
+             k -TERM -s $p\n\
+             i=0; while pgrep -s $p >/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done\n\
+             if pgrep -s $p >/dev/null; then k -KILL -s $p; sleep 0.3; fi\n\
+             if pgrep -s $p >/dev/null; then echo \"job {id}: some of its processes would not stop\"; exit 1; fi\n\
+             echo \"stopped job {id} ($n process(es))\""
+        ),
+        // The job is a scheduled task whose PowerShell runs <id>.ps1: stop that process tree
+        // (what it started included), then the task itself.
+        Os::Windows => format!(
+            r#"$d = "$env:USERPROFILE\agentpc-bg"; $task = 'agentpc-bg-{id}'
+if (-not (Test-Path "$d\{id}.log")) {{ "no such job {id}"; exit 3 }}
+if (Test-Path "$d\{id}.exit") {{ "job {id} already exited with code $((Get-Content "$d\{id}.exit" -Raw).Trim())"; exit 0 }}
+$all = @(Get-CimInstance Win32_Process)
+$ids = @($all | Where-Object {{ $_.CommandLine -like "*\{id}.ps1*" }} | ForEach-Object {{ $_.ProcessId }})
+$seen = @{{}}
+while ($ids.Count) {{
+  $next = @()
+  foreach ($i in $ids) {{
+    if ($seen.ContainsKey($i)) {{ continue }}
+    $seen[$i] = $true
+    $next += @($all | Where-Object {{ $_.ParentProcessId -eq $i }} | ForEach-Object {{ $_.ProcessId }})
+  }}
+  $ids = $next
+}}
+foreach ($i in $seen.Keys) {{ Stop-Process -Id $i -Force -ErrorAction SilentlyContinue }}
+Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+New-Item -ItemType File -Force "$d\{id}.stopped" | Out-Null
+"stopped job {id} ($($seen.Count) process(es))""#
+        ),
+    }
 }
 
 /// Keep the first and last `keep` characters of `s`, noting how much was cut.

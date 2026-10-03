@@ -254,7 +254,11 @@ tool_timeout_sec = 900</code></pre>
                 </tr>
                 <tr>
                   <td><code translate="no">get_job_status</code></td>
-                  <td>A background job's state (running, or exited with its code) and the tail of its log (<code translate="no">tail_lines</code>, default 50).</td>
+                  <td>A background job's state (running, exited with its code, or stopped) and the tail of its log (<code translate="no">tail_lines</code>, default 50).</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">stop_job</code></td>
+                  <td>Stop a background job and everything it started: its session on Linux, its process tree on Windows. A finished job is left as is.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">upload_file</code> / <code translate="no">download_file</code></td>
@@ -423,6 +427,7 @@ delete_vm        { "name": "install-test" }</code></pre>
             <div class="code-panel">
               <pre><code translate="no">run_command     { "name": "ubuntu-1", "command": "npm run dev", "background": true }  <span class="comment"># → job id 1</span>
 get_job_status  { "name": "ubuntu-1", "id": 1, "tail_lines": 40 }
+stop_job        { "name": "ubuntu-1", "id": 1 }  <span class="comment"># when done: the server and its children</span>
 forward_port    { "name": "ubuntu-1", "guest_port": 3000 }  <span class="comment"># → 127.0.0.1:&lt;port&gt; on the Mac</span></code></pre>
             </div>
             <p>
