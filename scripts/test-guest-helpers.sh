@@ -162,6 +162,27 @@ check "generator drop-in content" "[Service] MemoryDenyWriteExecute=no LockPerso
 check "the drop-in sorts after the unit's own (hardening.conf, 50-x.conf)" zz-agentpc-fex.conf \
     "$(printf '%s\n' hardening.conf 50-x.conf zz-agentpc-fex.conf | sort | tail -1)"
 
+# --- fex-unit (writes /etc/systemd/system/<unit>.d; here a scratch dir) ---
+fu=$t/fexunit; mkdir -p "$fu/bin" "$fu/etc"
+printf '#!/bin/sh\necho 0\n' > "$fu/bin/id"
+# systemctl show -p DropInPaths prints the unit's drop-ins; daemon-reload does nothing.
+printf '#!/bin/sh\n[ "$1" = show ] && cat "%s/dropins" 2>/dev/null; exit 0\n' "$fu" > "$fu/bin/systemctl"
+chmod 755 "$fu/bin"/*
+fexunit() { PATH="$fu/bin:$PATH" AGENTPC_SYSTEMD_DIR="$fu/etc" "$sh_" "$helpers/fex-unit" "$@" >/dev/null; }
+: > "$fu/dropins"
+fexunit demo
+check "fex-unit with no other drop-ins writes zz-fex.conf" zz-fex.conf "$(ls "$fu/etc/demo.service.d")"
+# A unit's own hardening drop-in whose name happens to end in fex.conf must still sort first.
+printf '%s\n' /usr/lib/systemd/system/demo.service.d/zzz-fex.conf > "$fu/dropins"
+fexunit demo
+check "fex-unit sorts after a unit's zzz-fex.conf" "zzz-fex~fex.conf" "$(ls "$fu/etc/demo.service.d")"
+# Its own earlier drop-in doesn't count, and a rerun replaces it rather than adding another.
+printf '%s\n' "$fu/etc/demo.service.d/zz-fex.conf" > "$fu/dropins"
+fexunit demo
+check "fex-unit ignores only its own names" zz-fex.conf "$(ls "$fu/etc/demo.service.d")"
+fexunit demo --undo
+check "fex-unit --undo removes its drop-in" "" "$(ls "$fu/etc" 2>/dev/null)"
+
 echo
 if [ "$fails" -gt 0 ]; then
     echo "$fails failed"

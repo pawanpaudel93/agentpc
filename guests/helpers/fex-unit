@@ -15,13 +15,17 @@ case $unit in
     *) unit=$unit.service ;;
 esac
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
-dir=/etc/systemd/system/$unit.d
+# AGENTPC_SYSTEMD_DIR (default /etc/systemd/system) is where the drop-in goes; tests point it
+# at a scratch directory.
+dir=${AGENTPC_SYSTEMD_DIR:-/etc/systemd/system}/$unit.d
 # Drop-ins apply in name order (byte order) whatever their directory, so this one must sort
 # after every one systemd applies to the unit: a hardening.conf of its own would set the
-# options back.
+# options back. Only this script's own names (fex.conf, zz-fex.conf, *~fex.conf) are
+# skipped: a unit's zzz-fex.conf is someone else's and must be sorted after.
 name=zz-fex.conf
 last=$(systemctl show -p DropInPaths --value "$unit" 2>/dev/null | tr ' ' '\n' |
-    sed 's|.*/||' | grep -v -e '^$' -e 'fex\.conf$' | LC_ALL=C sort | tail -n 1)
+    sed 's|.*/||' | grep -v -x -e '' -e 'fex\.conf' -e 'zz-fex\.conf' -e '.*~fex\.conf' |
+    LC_ALL=C sort | tail -n 1)
 if [ -n "$last" ] && [ "$(printf '%s\n%s\n' "$name" "$last" | LC_ALL=C sort | tail -n 1)" != "$name" ]; then
     name=${last%.conf}~fex.conf
 fi
