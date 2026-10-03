@@ -22,7 +22,8 @@ for f in guests/arch/prepare.sh guests/arch/x86apps.sh guests/ubuntu/*.sh guests
 done
 say "shellcheck"
 shellcheck -S warning install.sh guests/arch/*.sh guests/ubuntu/*.sh guests/helpers/* \
-  scripts/check.sh scripts/release.sh scripts/test-guest-helpers.sh
+  scripts/check.sh scripts/release.sh scripts/test-guest-helpers.sh \
+  scripts/test-arch-power-key.sh
 
 say "guest helpers (bash)"
 HELPER_SH=bash bash scripts/test-guest-helpers.sh >/dev/null
@@ -32,6 +33,9 @@ if command -v dash >/dev/null 2>&1; then
 else
   echo "    (no dash here; CI's guest-helpers job runs them with it)"
 fi
+
+say "Arch power key reaches logind"
+sh scripts/test-arch-power-key.sh >/dev/null
 
 say "static site SEO and links"
 python3 scripts/test-site.py

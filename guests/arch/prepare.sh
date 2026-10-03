@@ -45,6 +45,31 @@ cat > /etc/chromium/policies/managed/agentpc.json <<'EOF'
 }
 EOF
 
+# Power button: the ACPI press `agentpc stop` sends must shut the guest down.
+# xfce4-power-manager takes logind's handle-power-key inhibitor and then, at its default
+# power-button-action (0, "do nothing"), ignores the press, so a stop waited out its timeout
+# and was forced. logind-handle-power-key hands the key back to logind (HandlePowerKey,
+# default poweroff), session or not: system-wide for every new session, and in the running
+# one (the snapshot's) through its xfconfd, which makes the power manager drop the inhibitor.
+xfpm=/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-power-manager.xml
+mkdir -p "${xfpm%/*}"
+cat > "$xfpm" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+
+<channel name="xfce4-power-manager" version="1.0">
+  <property name="xfce4-power-manager" type="empty">
+    <property name="logind-handle-power-key" type="bool" value="true"/>
+  </property>
+</channel>
+EOF
+bus=/run/user/$(id -u agent)/bus
+if [ -S "$bus" ]; then
+    runuser -u agent -- env DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" xfconf-query \
+        -c xfce4-power-manager -p /xfce4-power-manager/logind-handle-power-key \
+        -n -t bool -s true ||
+        echo "prepare: could not hand the power key to logind in the running session" >&2
+fi
+
 # SSH takes agentpc's key only. Every VM's SSH port is reachable from the other VMs (at
 # 10.0.2.2) and from other users of this Mac, and the shared agent/agent login would open it
 # to them. sshd keeps the first value it reads, so 00- comes before any other drop-in.
