@@ -7,6 +7,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 
 use crate::instance::{Instance, cache_dir, home, kill, read_trimmed};
 
@@ -76,16 +78,62 @@ fn after_create(
     Ok(info)
 }
 
-/// What our viewer answers at `/.agentpc-viewer`: a random token in a private file, which
-/// another program on this port can't know.
+/// Private HMAC key shared by the viewer and the commands that verify its identity.
+/// It is never returned by the HTTP server.
 fn token_file() -> PathBuf {
     home().join("viewer.token")
 }
 
-/// Whether the server on PORT is our viewer (it answers with the token).
+fn random_bytes() -> Result<[u8; 32]> {
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+        .context("read /dev/urandom")?;
+    Ok(bytes)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
+fn identity_mac(key: &[u8], nonce: &[u8; 32]) -> Hmac<Sha256> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(b"agentpc-viewer-identity-v1\0");
+    mac.update(nonce);
+    mac
+}
+
+fn identity_response(url: &str, key: &[u8]) -> Option<String> {
+    let nonce = unhex(url.strip_prefix("/.agentpc-viewer?nonce=")?)?;
+    Some(hex(&identity_mac(key, &nonce).finalize().into_bytes()))
+}
+
+fn verify_identity(key: &[u8], nonce: &[u8; 32], response: &str) -> bool {
+    unhex(response.trim()).is_some_and(|tag| identity_mac(key, nonce).verify_slice(&tag).is_ok())
+}
+
+/// Prove identity with a fresh nonce, so an observed response cannot authenticate a
+/// different listener after the genuine viewer exits.
 fn ours() -> bool {
     use std::io::{Read, Write};
-    let Ok(token) = read_trimmed(&token_file()) else {
+    let Ok(key) = read_trimmed(&token_file()) else {
+        return false;
+    };
+    if key.is_empty() {
+        return false;
+    }
+    let Ok(nonce) = random_bytes() else {
         return false;
     };
     let Ok(mut s) =
@@ -94,16 +142,21 @@ fn ours() -> bool {
         return false;
     };
     let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-    if s.write_all(b"GET /.agentpc-viewer HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-        .is_err()
-    {
+    let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
+    let request = format!(
+        "GET /.agentpc-viewer?nonce={} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        hex(&nonce)
+    );
+    if s.write_all(request.as_bytes()).is_err() {
         return false;
     }
-    let mut body = String::new();
-    let _ = s.take(4096).read_to_string(&mut body);
-    body.split("\r\n\r\n")
-        .nth(1)
-        .is_some_and(|b| b.trim() == token)
+    let mut response = String::new();
+    if s.take(4096).read_to_string(&mut response).is_err() {
+        return false;
+    }
+    response
+        .split_once("\r\n\r\n")
+        .is_some_and(|(_, body)| verify_identity(key.as_bytes(), &nonce, body))
 }
 
 fn novnc_dir() -> PathBuf {
@@ -173,8 +226,8 @@ pub fn ensure_running() -> Result<()> {
         if ours() {
             return Ok(());
         }
-        // An older agentpc's viewer (it has no token) gives way to this one; anything else
-        // keeps the port, and no VM's password goes near it.
+        // A viewer from an older protocol gives way to this one; anything else keeps the
+        // port, and no VM's password goes near it.
         match read_trimmed(&pid_file()).and_then(|p| Ok(p.parse::<i32>()?)) {
             Ok(pid) if pid_is_our_viewer(pid) => {
                 kill(pid, 15);
@@ -189,12 +242,8 @@ pub fn ensure_running() -> Result<()> {
         }
     }
     ensure_novnc()?;
-    // A fresh token for this viewer, private to this user.
-    let mut buf = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
-        .context("read /dev/urandom")?;
-    let token: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    // A fresh private key for this viewer. Only nonce-bound HMACs cross the socket.
+    let token = hex(&random_bytes()?);
     crate::instance::write_private(&token_file(), &token)?;
     use std::os::unix::process::CommandExt;
     let child = Command::new(std::env::current_exe()?)
@@ -236,6 +285,10 @@ fn pid_is_our_viewer(pid: i32) -> bool {
 /// Foreground server loop (`agentpc __viewer`).
 pub fn serve() -> Result<()> {
     let root = novnc_dir();
+    let key = read_trimmed(&token_file())?;
+    if key.is_empty() {
+        bail!("viewer identity key is empty");
+    }
     let server =
         tiny_http::Server::http(("127.0.0.1", PORT)).map_err(|e| anyhow::anyhow!("{e}"))?;
     for req in server.incoming_requests() {
@@ -253,8 +306,16 @@ pub fn serve() -> Result<()> {
         };
         let file = root.join(&path);
         let resp = if path == ".agentpc-viewer" {
-            let token = read_trimmed(&token_file()).unwrap_or_default();
-            tiny_http::Response::from_string(token).boxed()
+            match identity_response(req.url(), key.as_bytes()) {
+                Some(proof) => tiny_http::Response::from_string(proof)
+                    .with_header(
+                        tiny_http::Header::from_bytes("Cache-Control", "no-store").unwrap(),
+                    )
+                    .boxed(),
+                None => tiny_http::Response::from_string("invalid identity challenge")
+                    .with_status_code(400)
+                    .boxed(),
+            }
         } else if !path.contains("..") && file.is_file() {
             let mime = match file.extension().and_then(|e| e.to_str()) {
                 Some("html") => "text/html",
@@ -282,6 +343,39 @@ pub fn serve() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewer_identity_proofs_are_nonce_bound_and_do_not_expose_the_key() {
+        let key = [7u8; 32];
+        let nonce = [1u8; 32];
+        let other = [2u8; 32];
+        let url = format!("/.agentpc-viewer?nonce={}", hex(&nonce));
+        let proof = identity_response(&url, &key).unwrap();
+        assert_eq!(proof.len(), 64);
+        assert!(proof != hex(&key));
+        assert!(verify_identity(&key, &nonce, &proof));
+        assert!(!verify_identity(&key, &other, &proof));
+        assert!(!verify_identity(&[8u8; 32], &nonce, &proof));
+        assert!(!verify_identity(&key, &nonce, "invalid"));
+        assert!(!verify_identity(&key, &nonce, &hex(&key)));
+        for malformed in [
+            "/.agentpc-viewer".to_string(),
+            "/.agentpc-viewer?nonce=".to_string(),
+            "/.agentpc-viewer?nonce=zz".to_string(),
+            format!("{url}&extra=1"),
+            format!("/different?nonce={}", hex(&nonce)),
+        ] {
+            assert!(identity_response(&malformed, &key).is_none());
+        }
+    }
+
+    #[test]
+    fn viewer_identity_challenges_are_fresh() {
+        let first = random_bytes().unwrap();
+        let second = random_bytes().unwrap();
+        assert!(first != second);
+        assert_eq!(unhex(&hex(&first)), Some(first));
+    }
 
     #[test]
     fn browser_opens_only_after_success_and_when_requested() {

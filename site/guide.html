@@ -385,6 +385,7 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
             <h2>Security</h2>
             <ul>
               <li>Everything listens on <code translate="no">127.0.0.1</code> only.</li>
+              <li>Before handing out a viewer link, agentpc authenticates the local viewer with a fresh HMAC-SHA256 challenge. The private identity key is not returned over HTTP; a recorded response cannot authenticate a different challenge.</li>
               <li>The desktop-control servers inside VMs are unauthenticated; any process on your Mac can reach them.</li>
               <li>Each VM has its own VNC password. The viewer URL from <code translate="no">agentpc info</code> carries it in the URL fragment, so the browser viewer connects without a prompt. <code translate="no">--open</code> and <code translate="no">open_in_browser: true</code> open that same local viewer. Treat these links as credentials: do not share them, include them in logs, or capture the address bar in screenshots; browsers can retain visited URLs in history.</li>
               <li>Guests use the fixed login <code translate="no">agent</code> / <code translate="no">agent</code> for the desktop and sudo; SSH takes only agentpc's key. Windows VMs have UAC prompts, SmartScreen and Windows Update turned off.</li>

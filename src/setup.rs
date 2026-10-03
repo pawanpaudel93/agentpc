@@ -78,7 +78,12 @@ fn json_register(path: &Path, bin: &str) -> Result<()> {
     let servers = servers
         .as_object_mut()
         .with_context(|| format!("{}: mcpServers is not an object", path.display()))?;
-    servers.insert(SERVER.into(), json!({"command": bin, "args": ["mcp"]}));
+    let server = servers.entry(SERVER).or_insert_with(|| json!({}));
+    let server = server
+        .as_object_mut()
+        .with_context(|| format!("{}: agentpc is not an object", path.display()))?;
+    server.insert("command".into(), json!(bin));
+    server.insert("args".into(), json!(["mcp"]));
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -86,29 +91,50 @@ fn json_register(path: &Path, bin: &str) -> Result<()> {
     Ok(())
 }
 
-/// Replace a config file whole: write a temp file beside it (keeping the old file's mode)
-/// and rename it over, so an interruption or a full disk never leaves half a config.
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+/// Create a private temporary file beside a config without following or truncating an
+/// existing path (a stale temp or symlink must be left untouched).
+fn create_config_temp(path: &Path) -> Result<(PathBuf, std::fs::File)> {
+    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_file_name(format!(
         ".{}.agentpc-{}.tmp",
         path.file_name()
             .map_or("config".into(), |n| n.to_string_lossy()),
         std::process::id()
     ));
-    std::fs::write(&tmp, contents)
-        .and_then(|()| match std::fs::metadata(path) {
-            Ok(m) => std::fs::set_permissions(
-                &tmp,
-                std::fs::Permissions::from_mode(m.permissions().mode()),
-            ),
-            Err(_) => Ok(()),
-        })
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })
-        .with_context(|| format!("write {}", path.display()))
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("create private config temp {}", tmp.display()))?;
+    Ok((tmp, file))
+}
+
+/// Replace a config file whole: keep its old mode, but create the temp privately before
+/// writing any content. Rename on the same filesystem keeps interruptions from tearing it.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let permissions = match std::fs::metadata(path) {
+        Ok(m) => m.permissions(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::Permissions::from_mode(0o600)
+        }
+        Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+    };
+    let (tmp, mut file) = create_config_temp(path)?;
+    let result = (|| -> Result<()> {
+        file.write_all(contents.as_bytes())?;
+        file.set_permissions(permissions)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    // Only a temp we created is eligible for removal: create_new failures never reach here.
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.with_context(|| format!("write {}", path.display()))
 }
 
 /// True when the agentpc Claude Code plugin is installed. The plugin already ships an MCP
@@ -137,7 +163,7 @@ fn codex_update_command(bin: &str) -> Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => bail!("can't read {}: {e}; not touching it", path.display()),
     };
-    let Some(out) = codex_with_command(&text, bin) else {
+    let Some(out) = codex_with_command(&text, bin)? else {
         return Ok(false);
     };
     write_atomic(&path, &out)?;
@@ -145,53 +171,65 @@ fn codex_update_command(bin: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// `text` with the `[mcp_servers.agentpc]` section's `command` and `args` set to run `bin`,
-/// every other line as it was; None without that section.
-fn codex_with_command(text: &str, bin: &str) -> Option<String> {
-    let header = format!("[mcp_servers.{SERVER}]");
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.iter().position(|l| l.trim() == header)?;
-    let end = lines[start + 1..]
-        .iter()
-        .position(|l| l.trim_start().starts_with('['))
-        .map_or(lines.len(), |i| start + 1 + i);
-    let key = |l: &str| {
-        l.split('=')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches('"')
-            .to_string()
-    };
-    let command = format!("command = {}", toml_string(bin));
-    let args = "args = [\"mcp\"]".to_string();
-    let missing = |k: &str| !lines[start + 1..end].iter().any(|l| key(l) == k);
-    let mut out: Vec<String> = Vec::new();
-    for (i, l) in lines.iter().enumerate() {
-        let inside = i > start && i < end;
-        if inside && key(l) == "command" {
-            out.push(command.clone());
-        } else if inside && key(l) == "args" {
-            out.push(args.clone());
-        } else {
-            out.push((*l).to_string());
-        }
-        if i == start {
-            // Keys the section lacks go right under its header.
-            if missing("command") {
-                out.push(command.clone());
-            }
-            if missing("args") {
-                out.push(args.clone());
-            }
-        }
-    }
-    Some(out.join("\n") + "\n")
+/// Parse without quoting input in the error: a client's config can contain credentials.
+fn codex_document(text: &str) -> Result<toml_edit::DocumentMut> {
+    text.parse()
+        .map_err(|_| anyhow::anyhow!("Codex config is not valid TOML; not touching it"))
 }
 
-/// A TOML basic string.
-fn toml_string(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+fn codex_server(
+    document: &mut toml_edit::DocumentMut,
+) -> Result<Option<&mut dyn toml_edit::TableLike>> {
+    let Some(servers) = document.get_mut("mcp_servers") else {
+        return Ok(None);
+    };
+    let servers = servers
+        .as_table_like_mut()
+        .context("Codex mcp_servers is not a table; not touching it")?;
+    let Some(server) = servers.get_mut(SERVER) else {
+        return Ok(None);
+    };
+    Ok(Some(server.as_table_like_mut().context(
+        "Codex mcp_servers.agentpc is not a table; not touching it",
+    )?))
+}
+
+/// Keep a managed field's surrounding whitespace and comments when replacing its value.
+fn set_codex_value(server: &mut dyn toml_edit::TableLike, key: &str, mut value: toml_edit::Value) {
+    if let Some(old) = server.get(key).and_then(toml_edit::Item::as_value) {
+        *value.decor_mut() = old.decor().clone();
+    }
+    server.insert(key, toml_edit::Item::Value(value));
+}
+
+/// Set only the existing server's command and args, preserving other settings and TOML
+/// formatting. Replacing parsed values also handles multiline arrays and quoted keys.
+fn codex_with_command(text: &str, bin: &str) -> Result<Option<String>> {
+    let mut document = codex_document(text)?;
+    let Some(server) = codex_server(&mut document)? else {
+        return Ok(None);
+    };
+    set_codex_value(server, "command", bin.into());
+    let mut args = toml_edit::Array::new();
+    args.push("mcp");
+    set_codex_value(server, "args", args.into());
+    Ok(Some(document.to_string()))
+}
+
+/// Add timeout defaults only when absent, using the same parsed server table as updates.
+fn codex_with_timeouts(text: &str) -> Result<Option<String>> {
+    let mut document = codex_document(text)?;
+    let Some(server) = codex_server(&mut document)? else {
+        return Ok(None);
+    };
+    let mut changed = false;
+    for (key, default) in [("tool_timeout_sec", 900), ("startup_timeout_sec", 60)] {
+        if !server.contains_key(key) {
+            set_codex_value(server, key, default.into());
+            changed = true;
+        }
+    }
+    Ok(changed.then(|| document.to_string()))
 }
 
 /// codex has no CLI flag for MCP timeouts, so add them to the `[mcp_servers.agentpc]` block
@@ -199,45 +237,14 @@ fn toml_string(s: &str) -> String {
 /// short default would abort the tool call. Existing values are left untouched.
 fn codex_set_timeouts() -> Result<()> {
     let path = user_home().join(".codex/config.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(()); // no config: codex uses its defaults, nothing to amend
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => bail!("can't read {}: {e}; not touching it", path.display()),
     };
-    let header = format!("[mcp_servers.{SERVER}]");
-    let lines: Vec<&str> = text.lines().collect();
-    let Some(start) = lines.iter().position(|l| l.trim() == header) else {
+    let Some(out) = codex_with_timeouts(&text)? else {
         return Ok(());
     };
-    // The section runs to the next table header or end of file.
-    let end = lines[start + 1..]
-        .iter()
-        .position(|l| l.trim_start().starts_with('['))
-        .map_or(lines.len(), |i| start + 1 + i);
-    let has = |key: &str| {
-        lines[start + 1..end]
-            .iter()
-            .any(|l| l.trim_start().starts_with(key))
-    };
-    let mut add: Vec<&str> = Vec::new();
-    if !has("tool_timeout_sec") {
-        add.push("tool_timeout_sec = 900");
-    }
-    if !has("startup_timeout_sec") {
-        add.push("startup_timeout_sec = 60");
-    }
-    if add.is_empty() {
-        return Ok(());
-    }
-    let mut out = String::new();
-    for (i, line) in lines.iter().enumerate() {
-        out.push_str(line);
-        out.push('\n');
-        if i == start {
-            for a in &add {
-                out.push_str(a);
-                out.push('\n');
-            }
-        }
-    }
     write_atomic(&path, &out)?;
     log!("set codex MCP timeouts in {}", path.display());
     Ok(())
@@ -647,6 +654,12 @@ fn image_of_file(name: &str) -> Option<Image> {
     .ok()
 }
 
+/// Current image locks must keep their inode even when the image is absent: another
+/// process may already be waiting on it before a fresh build or pull begins.
+fn canonical_image_lock(name: &str) -> bool {
+    image_of_file(name).is_some_and(|image| name == format!(".{image}.lock"))
+}
+
 /// A file in `~/.agentpc/lib` that `clean` may remove: another build's `hvf-tso-*.dylib`
 /// or a leftover `hvf-tso-*.tmp` from writing one, never this build's `current` library.
 fn stale_tso_lib(name: &str, current: &str) -> bool {
@@ -831,24 +844,17 @@ pub fn clean(dry_run: bool) -> Result<String> {
                 "half-written image file from an interrupted build",
             ));
         } else if name.starts_with('.') && name.ends_with(".lock") && name != ".lock" {
-            // An image's lock file is `.<image>.lock` by its full name. Any other one (an
-            // alias or old name an earlier agentpc used, a deleted image's) is left over,
-            // unless someone holds it right now.
-            let image = image_of_file(&name).filter(|i| name == format!(".{i}.lock"));
-            if image.as_ref().is_some_and(Image::exists) {
+            // Never unlink a canonical lock, even while holding it: a new opener would
+            // lock a different inode while existing waiters still use the original.
+            if canonical_image_lock(&name) {
                 continue;
             }
-            // At an image's own lock path, `held` may already hold it (any_image_busy took
-            // every image lock): ask it, rather than lock the file a second time.
-            let busy = match &image {
-                Some(i) => held.image_busy(i),
-                None => held.busy(&e.path()),
-            };
-            if busy {
+            // Aliases and old names no current command uses are removable when idle.
+            if held.busy(&e.path()) {
                 in_use.push(e.path());
                 continue;
             }
-            targets.push((e.path(), "lock file of an image that no longer exists"));
+            targets.push((e.path(), "obsolete image lock file"));
         } else if let Some(i) = image_of_file(&name)
             && !i.exists()
         {
@@ -1032,6 +1038,112 @@ pub fn uninstall(keep_data: bool, yes: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_dir(label: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "agentpc-setup-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn atomic_config_temps_start_private_and_final_modes_are_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fixture_dir("private-temp");
+        let path = dir.join("synthetic.json");
+        let (tmp, file) = create_config_temp(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o077, 0);
+        drop(file);
+        std::fs::remove_file(tmp).unwrap();
+        write_atomic(&path, "synthetic content").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_atomic(&path, "updated synthetic content").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "updated synthetic content"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_config_write_never_clobbers_existing_temp_or_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let dir = fixture_dir("temp-collision");
+        let path = dir.join("synthetic.json");
+        std::fs::write(&path, "original config").unwrap();
+        let (tmp, file) = create_config_temp(&path).unwrap();
+        drop(file);
+        std::fs::write(&tmp, "existing temp").unwrap();
+        assert!(write_atomic(&path, "replacement").is_err());
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "existing temp");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original config");
+        std::fs::remove_file(&tmp).unwrap();
+        let target = dir.join("synthetic-target.txt");
+        std::fs::write(&target, "leave this alone").unwrap();
+        symlink(&target, &tmp).unwrap();
+        assert!(write_atomic(&path, "replacement").is_err());
+        assert!(
+            std::fs::symlink_metadata(&tmp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "leave this alone"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original config");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn json_register_rejects_nonobject_server_without_modifying_config() {
+        let dir = fixture_dir("invalid-server");
+        let path = dir.join("synthetic.json");
+        let text = r#"{"mcpServers":{"agentpc":7}}"#;
+        std::fs::write(&path, text).unwrap();
+        assert!(json_register(&path, "/bin/agentpc").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn canonical_image_locks_are_kept_independent_of_image_existence() {
+        for name in [
+            ".ubuntu-24.04.lock",
+            ".ubuntu-22.04.lock",
+            ".arch-rolling.lock",
+            ".arch-rolling-x86apps.lock",
+            ".windows-11-25h2.lock",
+        ] {
+            assert!(canonical_image_lock(name), "must keep {name}");
+        }
+        for name in [
+            ".ubuntu.lock",
+            ".ubuntu-x86apps.lock",
+            ".arch.lock",
+            ".lock",
+            "ubuntu-24.04.json",
+        ] {
+            assert!(!canonical_image_lock(name), "not canonical: {name}");
+        }
+    }
+
     #[test]
     fn json_register_never_overwrites_an_unreadable_config() {
         let dir = std::env::temp_dir().join(format!("agentpc-jr-{}", std::process::id()));
@@ -1047,7 +1159,7 @@ mod tests {
         // A good config keeps its other servers, and no temp file is left behind.
         std::fs::write(
             &cfg,
-            r#"{"mcpServers": {"other": {"command": "x"}}, "theme": 1}"#,
+            r#"{"mcpServers": {"other": {"command": "x"}, "agentpc": {"command": "/old", "args": ["old"], "env": {"AGENTPC_HOME": "/vms"}, "timeout": 900}}, "theme": 1}"#,
         )
         .unwrap();
         super::json_register(&cfg, "/bin/agentpc").unwrap();
@@ -1055,6 +1167,9 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert_eq!(v["mcpServers"]["other"]["command"], "x");
         assert_eq!(v["mcpServers"]["agentpc"]["command"], "/bin/agentpc");
+        assert_eq!(v["mcpServers"]["agentpc"]["args"], json!(["mcp"]));
+        assert_eq!(v["mcpServers"]["agentpc"]["env"]["AGENTPC_HOME"], "/vms");
+        assert_eq!(v["mcpServers"]["agentpc"]["timeout"], 900);
         assert_eq!(v["theme"], 1);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         // A missing file is created.
@@ -1068,8 +1183,14 @@ mod tests {
     fn codex_update_keeps_other_settings() {
         let text = "[other]\nx = 1\n\n[mcp_servers.agentpc]\ncommand = \"/old/agentpc\"\nargs = [\"mcp\"]\n\
                     tool_timeout_sec = 1200\nenv = { AGENTPC_HOME = \"/vms\" }\n\n[tail]\ny = 2\n";
-        let out = super::codex_with_command(text, "/new/agent \"pc\"").unwrap();
-        assert!(out.contains("command = \"/new/agent \\\"pc\\\"\""), "{out}");
+        let out = super::codex_with_command(text, "/new/agent \"pc\"")
+            .unwrap()
+            .unwrap();
+        let document = super::codex_document(&out).unwrap();
+        assert_eq!(
+            document["mcp_servers"]["agentpc"]["command"].as_str(),
+            Some("/new/agent \"pc\"")
+        );
         assert!(!out.contains("/old/agentpc"));
         for keep in [
             "tool_timeout_sec = 1200",
@@ -1082,13 +1203,89 @@ mod tests {
             assert!(out.contains(keep), "lost {keep}: {out}");
         }
         assert_eq!(out.matches("args = ").count(), 1);
-        // A section without command/args gets them; no section: nothing to update.
-        let out = super::codex_with_command("[mcp_servers.agentpc]\nenv = {}\n", "/b").unwrap();
-        assert!(
-            out.contains("command = \"/b\"") && out.contains("args = [\"mcp\"]"),
-            "{out}"
+        let out = super::codex_with_command("[mcp_servers.agentpc]\nenv = {}\n", "/b")
+            .unwrap()
+            .unwrap();
+        let document = super::codex_document(&out).unwrap();
+        assert_eq!(
+            document["mcp_servers"]["agentpc"]["command"].as_str(),
+            Some("/b")
         );
-        assert!(super::codex_with_command("[mcp_servers.other]\n", "/b").is_none());
+        assert_eq!(
+            document["mcp_servers"]["agentpc"]["args"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            super::codex_with_command("[mcp_servers.other]\n", "/b")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn codex_update_handles_multiline_and_inline_tables() {
+        for text in [
+            "[mcp_servers.\"agentpc\"] # keep header\n\"command\" = \"/old\" # keep command\nargs = [\n  \"mcp\",\n  \"old-extra\",\n]\n[mcp_servers.agentpc.env]\nAGENTPC_HOME = \"/vms\"\n",
+            "mcp_servers = { agentpc = { command = '/old', args = ['mcp', 'old-extra'], env = { AGENTPC_HOME = '/vms' } } }\n",
+        ] {
+            let out = codex_with_command(text, "/new/path\\with\"quotes")
+                .unwrap()
+                .unwrap();
+            let document = codex_document(&out).unwrap();
+            let server = &document["mcp_servers"]["agentpc"];
+            assert_eq!(server["command"].as_str(), Some("/new/path\\with\"quotes"));
+            let args = server["args"].as_array().unwrap();
+            assert_eq!(args.len(), 1);
+            assert_eq!(args.get(0).unwrap().as_str(), Some("mcp"));
+            assert_eq!(server["env"]["AGENTPC_HOME"].as_str(), Some("/vms"));
+            if text.contains("# keep header") {
+                assert!(out.contains("# keep header"));
+                assert!(out.contains("# keep command"));
+            }
+        }
+    }
+
+    #[test]
+    fn codex_timeouts_preserve_values_and_handle_quoted_headers() {
+        let text = "[mcp_servers.\"agentpc\"] # server\ntool_timeout_sec = 1200\nargs = [\n  \"mcp\",\n]\n[mcp_servers.agentpc.env]\nAGENTPC_HOME = \"/vms\"\n";
+        let out = codex_with_timeouts(text).unwrap().unwrap();
+        let document = codex_document(&out).unwrap();
+        let server = &document["mcp_servers"]["agentpc"];
+        assert_eq!(server["tool_timeout_sec"].as_integer(), Some(1200));
+        assert_eq!(server["startup_timeout_sec"].as_integer(), Some(60));
+        assert_eq!(server["env"]["AGENTPC_HOME"].as_str(), Some("/vms"));
+        assert!(out.contains("# server"));
+        assert!(codex_with_timeouts(&out).unwrap().is_none());
+        let out = codex_with_timeouts(
+            "mcp_servers = { agentpc = { tool_timeout_seconds_legacy = 1 } }\n",
+        )
+        .unwrap()
+        .unwrap();
+        let document = codex_document(&out).unwrap();
+        assert_eq!(
+            document["mcp_servers"]["agentpc"]["tool_timeout_sec"].as_integer(),
+            Some(900)
+        );
+        assert!(
+            codex_with_timeouts("[mcp_servers.other]\n")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn invalid_codex_configs_are_rejected_without_echoing_input() {
+        let invalid = "[mcp_servers.agentpc\n";
+        let error = codex_with_command(invalid, "/b").unwrap_err().to_string();
+        assert_eq!(error, "Codex config is not valid TOML; not touching it");
+        assert!(codex_with_timeouts(invalid).is_err());
+        for text in ["mcp_servers = 3\n", "[mcp_servers]\nagentpc = 3\n"] {
+            assert!(codex_with_command(text, "/b").is_err());
+            assert!(codex_with_timeouts(text).is_err());
+        }
     }
 
     use super::*;
