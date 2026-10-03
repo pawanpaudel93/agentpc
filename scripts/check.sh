@@ -36,8 +36,8 @@ fi
 say "static site SEO and links"
 python3 scripts/test-site.py
 
-say "smoke.py compiles"
-python3 -m py_compile scripts/smoke.py
+say "VM test scripts compile"
+python3 -m py_compile scripts/smoke.py scripts/lifecycle-stress.py
 
 say "plugin manifests parse"
 find plugin .claude-plugin -name '*.json' -print0 | xargs -0 -n1 python3 -m json.tool >/dev/null

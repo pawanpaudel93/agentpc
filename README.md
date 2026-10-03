@@ -613,7 +613,16 @@ cargo build --release                  # target/release/agentpc
 cargo clippy --all-targets -- -D warnings
 cargo test
 scripts/smoke.py --bin target/release/agentpc   # drives fresh VMs through the MCP server
+python3 scripts/lifecycle-stress.py --bin target/release/agentpc --rounds 3
 ```
+
+The lifecycle stress suite requires an existing, current Ubuntu snapshot; it never
+downloads or builds images. It races named creates, starts, stops and deletes, then
+checks killed-session orphan recovery and graceful session shutdown. It uses only
+uniquely named task-owned VMs, deletes them afterward, and refuses to start when
+unrelated running orphan VMs could be reaped. Logs omit raw MCP responses and
+viewer credentials. CI checks its syntax; VM tests run locally on Apple Silicon.
+
 
 Run the smoke test after changing guest scripts, the desktop driver or the MCP gateway (rebuild
 the affected images first). It checks that guests open apps without first-run dialogs, that the
