@@ -159,6 +159,9 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 - Act only on VMs you created. Never `reset_vm`, `stop_vm`, `restore_vm` or `delete_vm` a VM
   you didn't create unless the user asks. VMs are resettable: `reset_vm` your own broken one
   instead of repairing it, and `delete_vm` it when done.
+- Open the Mac’s browser only when the user asks to watch: `create_vm` with
+  `open_in_browser: true`. Omit it otherwise; the viewer is still available. It is a per-call
+  action, so a retry with it set can open another tab.
 - To test untrusted software or offline behaviour, `create_vm` with `offline: true`: no internet
   and no access to the Mac, while `run_command`, files, desktop tools and `forward_port` work.
 - For a heavy build, `create_vm` accepts `memory_gb` and `cpus`; a non-default size boots

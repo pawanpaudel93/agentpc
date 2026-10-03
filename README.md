@@ -49,7 +49,9 @@ binary that runs VMs with QEMU on Apple's hypervisor and serves them to agents o
   running inside a VM from your Mac.
 - **Agent-ready guests.** 1280x800 desktops with a browser (Edge on Windows, Chrome on Ubuntu, Chromium on Arch)
   and the pop-ups, update restarts and background jobs that interrupt unattended work turned off.
-- **Watch along.** Every VM has a browser viewer, so you can see what the agent is doing.
+- **Watch along.** Every VM has a browser viewer, so you can see what the agent is doing. Use
+  `agentpc create ubuntu --open` or MCP `open_in_browser: true` to open it in the Mac’s
+  default browser after readiness; neither opens a tab by default.
 - **x86 apps.** x64 Windows apps run through Prism; `ubuntu-x86apps` / `arch-x86apps` run
   x86_64 Linux programs and amd64 containers through [FEX](https://fex-emu.com).
 - **Any version, side by side.** Run Ubuntu 22.04, 24.04 and 26.04, or several Windows 11
@@ -610,8 +612,7 @@ To only reclaim disk space, `agentpc clean` deletes what can be downloaded again
 
 ```sh
 cargo build --release                  # target/release/agentpc
-cargo clippy --all-targets -- -D warnings
-cargo test
+scripts/check.sh                       # all CI checks, including site SEO/link checks
 scripts/smoke.py --bin target/release/agentpc   # drives fresh VMs through the MCP server
 python3 scripts/lifecycle-stress.py --bin target/release/agentpc --rounds 3
 ```
@@ -622,7 +623,6 @@ checks killed-session orphan recovery and graceful session shutdown. It uses onl
 uniquely named task-owned VMs, deletes them afterward, and refuses to start when
 unrelated running orphan VMs could be reaped. Logs omit raw MCP responses and
 viewer credentials. CI checks its syntax; VM tests run locally on Apple Silicon.
-
 
 Run the smoke test after changing guest scripts, the desktop driver or the MCP gateway (rebuild
 the affected images first). It checks that guests open apps without first-run dialogs, that the

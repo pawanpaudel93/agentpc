@@ -386,7 +386,7 @@ Stop-Service wuauserv; Set-Service wuauserv -StartupType Disabled</code></pre>
             <ul>
               <li>Everything listens on <code translate="no">127.0.0.1</code> only.</li>
               <li>The desktop-control servers inside VMs are unauthenticated; any process on your Mac can reach them.</li>
-              <li>Each VM has its own VNC password. The viewer URL from <code translate="no">agentpc info</code> carries it, so the browser viewer connects without a prompt.</li>
+              <li>Each VM has its own VNC password. The viewer URL from <code translate="no">agentpc info</code> carries it in the URL fragment, so the browser viewer connects without a prompt. <code translate="no">--open</code> and <code translate="no">open_in_browser: true</code> open that same local viewer. Treat these links as credentials: do not share them, include them in logs, or capture the address bar in screenshots; browsers can retain visited URLs in history.</li>
               <li>Guests use the fixed login <code translate="no">agent</code> / <code translate="no">agent</code> for the desktop and sudo; SSH takes only agentpc's key. Windows VMs have UAC prompts, SmartScreen and Windows Update turned off.</li>
               <li>VMs can reach the internet and your Mac through <code translate="no">10.0.2.2</code>. Use <code translate="no">--offline</code> for untrusted software.</li>
               <li>Treat VMs as throwaway sandboxes, not a place for secrets.</li>

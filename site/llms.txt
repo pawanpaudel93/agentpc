@@ -4,6 +4,12 @@ agentpc gives AI agents instant, resettable Windows, Ubuntu and Arch Linux ARM d
 
 The VMs are ARM64. x64 Windows apps run through Prism; x86_64 and i386 Linux programs and amd64 containers run in the `ubuntu-x86apps` and `arch-x86apps` images, through FEX. Hardware TSO (macOS 15+) is reported as `x86_tso` in `list_vms`; on Arch, `sudo fex-pacman -Sy --noconfirm --needed <pkg>` adds x86 packages. The `arch` guest (Arch Linux ARM) is like Ubuntu, with Chromium as its browser and pacman (`sudo pacman -Syu --noconfirm <pkg>`) for packages.
 
+## VM Creation and Viewing
+
+`create_vm` returns once the desktop is ready. A named create retried in the same session returns the same VM; use a unique name per task. `open_in_browser: true` opens the ready VM's viewer in the Mac's default browser, not a browser inside the guest. It defaults to false and is a per-call action, not a saved VM setting; a browser-launch failure warns without failing creation. Use it when the user asks to watch the VM. CLI equivalent: `agentpc create ubuntu --open` (alias `--open-in-browser`).
+
+Dated image tags (`…-YYYYMMDD`) select a published build and are download-only. An image push updates rolling tags but preserves existing dated tags; a refreshed rolling image can differ from its dated build. Publishers on different machines must serialize publication for a new date unless the registry enforces immutable tags.
+
 ## Links
 
 - [Website](https://agentpc.pawanpaudel.com.np/)

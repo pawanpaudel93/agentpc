@@ -117,6 +117,9 @@ Rules:
   (`windows-11-24h2`, `windows-11-23h2`; `agentpc image build --help` lists them).
   If `list_vms` shows no windows image, ask the user to run that. Don't start a build
   yourself unless asked.
+- Open the host browser only when the user asks to watch: `create_vm` with
+  `open_in_browser: true`. Omit it otherwise; the viewer is still available. Retrying with
+  it set can open another tab; it is an action, not part of the VM’s saved configuration.
 - The login for every guest is `agent` / `agent` (desktop and sudo; SSH takes only agentpc's
   key). Everything binds to 127.0.0.1.
 - VMs you create, start, reset or restore over MCP are stopped (never deleted) when the
@@ -170,8 +173,13 @@ Rules:
   `.claude-plugin/marketplace.json`. Keep the skill's tool guidance in sync with the
   "Using the VMs" section above; check with `claude plugin validate plugin --strict`.
 - Verify with `scripts/check.sh` (every CI check: fmt, clippy, tests, shellcheck, the guest
-  helper tests, plugin validation; `release.sh` runs it too) plus a real instance (`agentpc create
+  helper tests, static-site SEO/link checks, VM test script syntax and plugin validation;
+  `release.sh` runs it too) plus a real instance (`agentpc create
   ubuntu`, then the MCP tools). Unit tests can't cover the VM paths. After changing `guests/`, the desktop
   driver or the MCP gateway, rebuild the affected images and run `scripts/smoke.py --bin
   target/release/agentpc`: it drives fresh VMs through the MCP server like an agent does.
+- For lifecycle or ownership changes, also run `python3 scripts/lifecycle-stress.py --bin
+  target/release/agentpc --rounds 3`. It uses fresh task-owned Ubuntu VMs from an existing,
+  current snapshot, never downloads/builds images, and deletes its VMs afterward. It refuses
+  to start when unrelated running orphan VMs could be reaped; do not bypass that guard.
 - Never commit `target/`.
