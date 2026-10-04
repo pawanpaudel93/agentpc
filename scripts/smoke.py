@@ -720,6 +720,27 @@ def windows_lifecycle(m, vm, r):
         _, st = m.tool("get_job_status", name=vm, id=jid, tail_lines=1)
         r.check("windows: get_job_status reports the job stopped", "STATE: stopped by stop_job" in st, st[:200])
 
+    # A job that starts a server and exits: stop_job still stops the server, and leaves alone a
+    # process the job didn't start (created through WMI, so the SSH session's end keeps it).
+    def tagged(n):
+        return f"@(Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*-n {n} *' }}).Count"
+    ps("Invoke-CimMethod Win32_Process -MethodName Create "
+       "-Arguments @{ CommandLine = 'ping.exe -n 3302 127.0.0.1' } | Out-Null")
+    ok, out = ps("Start-Process ping -ArgumentList '-n 3301 127.0.0.1' -WindowStyle Hidden; 'started'",
+                 background=True)
+    job = re.search(r"\(id (\d+)", out)
+    if job:
+        jid = int(job.group(1))
+        r.check("windows: a server outlives its exited job", poll(
+            lambda: "STATE: exited 0" in m.tool("get_job_status", name=vm, id=jid)[1]
+            and stdout(ps(tagged(3301))[1]) == "1", 60))
+        ok, out = m.tool("stop_job", name=vm, id=jid)
+        r.check("windows: stop_job stops what an exited job left running",
+                ok and "left running" in out and stdout(ps(tagged(3301))[1]) == "0", out[:300])
+        r.check("windows: stop_job leaves an unrelated process alone", stdout(ps(tagged(3302))[1]) == "1")
+        ps("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*-n 3302 *' } | "
+           "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
+
     ok, out = ps("Start-Sleep 60; 'late'", timeout=3)
     r.check("windows: a foreground run stops at its timeout", not ok and "timed out after 3s" in out and "late" not in out, out[:300])
 
