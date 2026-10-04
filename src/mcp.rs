@@ -829,7 +829,8 @@ impl Gateway {
                           last 10,000 characters (write big output to a file and download_file it).\n\
                           Foreground runs are killed at `timeout` seconds (default 120) with their partial\n\
                           output returned; for servers or anything slow, pass background: true -- it keeps\n\
-                          running after the call, returns a job id, and you poll it with get_job_status. A GUI\n\
+                          running after the call, returns a job id, and you poll it with get_job_status and end\n\
+                          it with stop_job. A GUI\n\
                           installer run in the foreground should be waited on (e.g. PowerShell\n\
                           `Start-Process -Wait -PassThru`) or it returns before the install finishes.",
         annotations(
@@ -1073,8 +1074,8 @@ impl Gateway {
         name = "get_job_status",
         title = "Get job status",
         description = "Check on a background job started by run_command (background: true), by the id it\n\
-                          returned: whether it is still running or has exited (with its code), plus the tail\n\
-                          of its log.",
+                          returned: running, exited (with its code), stopped by stop_job, or ended without an\n\
+                          exit code (killed, or the VM restarted), plus the tail of its log.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn job_status(&self, Parameters(a): Parameters<JobArgs>) -> CallToolResult {
@@ -1456,9 +1457,12 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
     let id = job_id();
     // On Windows, as in the foreground: a failed last command (a cmdlet error sets no exit
     // code) ends the job with its native code, or 1, rather than a 0 that looks like success.
+    // The job first records its PowerShell's pid and creation time, so stop_job can still
+    // find what it started (a server) after it exits, even once Windows reuses that pid.
     let script = match inst.os {
         Os::Windows => format!(
-            "{command}\n$__agentpc_ok = $?\nif (-not $__agentpc_ok) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}"
+            "Set-Content -Encoding ascii \"$env:USERPROFILE\\agentpc-bg\\{id}.pid\" \"$PID $((Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\").CreationDate.ToFileTimeUtc())\"\n\
+             {command}\n$__agentpc_ok = $?\nif (-not $__agentpc_ok) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}"
         ),
         Os::Ubuntu | Os::Arch => command.to_string(),
     };
@@ -1499,7 +1503,8 @@ Start-ScheduledTask -TaskName $task
 }
 
 /// Report a background job's state from its log and exit-code file (see exec_background):
-/// running while no <id>.exit exists yet, otherwise exited with that code, plus a log tail.
+/// exited with the code in <id>.exit, else running while its process lives, else stopped by
+/// stop_job or ended without an exit code; plus a log tail.
 async fn job_status(name: &str, id: u64, tail_lines: usize) -> Result<String> {
     let inst = load(name)?;
     if !inst.running() {
@@ -1538,7 +1543,8 @@ else {{ 'STATE: ended without an exit code (stopped, or the VM restarted)' }}
 }
 
 /// Stop a background job and everything it started (see exec_background), and mark it stopped
-/// so get_job_status says so. A job that already exited is left alone.
+/// so get_job_status says so. For a job that already exited, it stops only what the job left
+/// running and keeps its exit code.
 async fn stop_job(name: &str, id: u64) -> Result<String> {
     let inst = load(name)?;
     if !inst.running() {
@@ -1601,44 +1607,56 @@ if [ -n "$(targets)" ]; then echo "job {id}: some of its processes would not sto
 if [ -f $d/{id}.exit ]; then echo "job {id} had exited with code $(cat $d/{id}.exit); stopped $n process(es) it left running"
 else touch $d/{id}.stopped; echo "stopped job {id} ($n process(es))"; fi"#
         ),
-        // The job is a scheduled task whose PowerShell runs <id>.ps1. The task is disabled
-        // first, so a job not yet started never starts. Its process tree counts a process as a
-        // child only if it was created after its parent: a parent id that Windows reused after
-        // the real parent exited would otherwise pull in unrelated processes. Rounds rescan
-        // until nothing is left; .stopped is written only then.
+        // The job is a scheduled task whose PowerShell runs <id>.ps1 and records its pid and
+        // creation time in <id>.pid. The task is disabled first, so a job not yet started
+        // never starts. A process counts as the job's only if created after its parent, and,
+        // when the parent is gone and Windows has given its pid to another process, before
+        // that one: a reused parent id never pulls in unrelated processes. Rounds rescan until
+        // nothing is left; .stopped is written only then, and only for a job without an exit
+        // code (one that already exited keeps it, and only what it left running is stopped).
         Os::Windows => format!(
             r#"$d = "$env:USERPROFILE\agentpc-bg"; $task = 'agentpc-bg-{id}'
 $t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
 if (-not (Test-Path "$d\{id}.log") -and -not $t) {{ "no such job {id}"; exit 3 }}
-if (Test-Path "$d\{id}.exit") {{ "job {id} already exited with code $((Get-Content "$d\{id}.exit" -Raw).Trim())"; exit 0 }}
 if ($t) {{ Disable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue | Out-Null }}
 $known = @{{}}
+$rec = "$((Get-Content "$d\{id}.pid" -ErrorAction SilentlyContinue))".Trim() -split ' '
+if ($rec.Count -eq 2 -and $rec[0] -match '^\d+$' -and $rec[1] -match '^\d+$') {{ $known[[uint32]$rec[0]] = [int64]$rec[1] }}
 function Live {{
   $all = @(Get-CimInstance Win32_Process)
-  foreach ($r in $all) {{ if ($r.CommandLine -like "*\{id}.ps1*" -and -not $known.ContainsKey($r.ProcessId)) {{ $known[$r.ProcessId] = $r.CreationDate }} }}
+  $holder = @{{}}
+  foreach ($r in $all) {{ $holder[$r.ProcessId] = $r.CreationDate.ToFileTimeUtc() }}
+  foreach ($r in $all) {{ if ($r.CommandLine -like "*\{id}.ps1*" -and -not $known.ContainsKey($r.ProcessId)) {{ $known[$r.ProcessId] = $holder[$r.ProcessId] }} }}
   do {{
     $added = $false
     foreach ($c in $all) {{
-      if ($known.ContainsKey($c.ProcessId)) {{ continue }}
-      if ($known.ContainsKey($c.ParentProcessId) -and $c.CreationDate -ge $known[$c.ParentProcessId]) {{
-        $known[$c.ProcessId] = $c.CreationDate; $added = $true
-      }}
+      $q = $c.ParentProcessId; $born = $holder[$c.ProcessId]
+      if ($known.ContainsKey($c.ProcessId) -or -not $known.ContainsKey($q) -or $born -lt $known[$q]) {{ continue }}
+      if ($holder.ContainsKey($q) -and $holder[$q] -ne $known[$q] -and $born -ge $holder[$q]) {{ continue }}
+      $known[$c.ProcessId] = $born; $added = $true
     }}
   }} while ($added)
-  @($all | Where-Object {{ $known.ContainsKey($_.ProcessId) -and $known[$_.ProcessId] -eq $_.CreationDate }})
+  @($all | Where-Object {{ $known.ContainsKey($_.ProcessId) -and $known[$_.ProcessId] -eq $holder[$_.ProcessId] }})
 }}
+$stopped = @{{}}
 for ($i = 0; $i -lt 10; $i++) {{
   $live = Live
   if (-not $live.Count) {{ break }}
-  foreach ($q in $live) {{ Stop-Process -Id $q.ProcessId -Force -ErrorAction SilentlyContinue }}
+  foreach ($q in $live) {{ $stopped[$q.ProcessId] = 1; Stop-Process -Id $q.ProcessId -Force -ErrorAction SilentlyContinue }}
   if ($i -eq 0) {{ Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue }}
   Start-Sleep -Milliseconds 300
 }}
-Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
 $left = Live
 if ($left.Count) {{ "job {id}: $($left.Count) of its processes would not stop"; exit 1 }}
+$n = $stopped.Count
+if (Test-Path "$d\{id}.exit") {{
+  $code = (Get-Content "$d\{id}.exit" -Raw).Trim()
+  if ($n) {{ "job {id} had exited with code $code; stopped $n process(es) it left running" }} else {{ "job {id} already exited with code $code" }}
+  exit 0
+}}
+if (-not $n -and $t -and ($t | Get-ScheduledTaskInfo).LastRunTime.Year -gt 2000) {{ "job {id} is not running"; exit 0 }}
 New-Item -ItemType File -Force "$d\{id}.stopped" | Out-Null
-if ($known.Count) {{ "stopped job {id} ($($known.Count) process(es))" }} else {{ "stopped job {id} before it started" }}"#
+if ($n) {{ "stopped job {id} ($n process(es))" }} else {{ "stopped job {id} before it started" }}"#
         ),
     }
 }
