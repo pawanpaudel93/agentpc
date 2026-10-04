@@ -1462,7 +1462,7 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
     // find what it started (a server) after it exits, even once Windows reuses that pid.
     let script = match inst.os {
         Os::Windows => format!(
-            "Set-Content -Encoding ascii \"$env:USERPROFILE\\agentpc-bg\\{id}.pid\" \"$PID $((Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\").CreationDate.ToFileTimeUtc())\"\n\
+            "Set-Content -Encoding ascii \"$env:USERPROFILE\\agentpc-bg\\{id}.pid\" \"$PID $([Diagnostics.Process]::GetCurrentProcess().StartTime.ToFileTimeUtc())\"\n\
              {command}\n$__agentpc_ok = $?\nif (-not $__agentpc_ok) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }}; exit 1 }}"
         ),
         Os::Ubuntu | Os::Arch => command.to_string(),
@@ -1633,6 +1633,8 @@ if ($t) {{ Disable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue |
 $known = @{{}}
 $rec = "$((Get-Content "$d\{id}.pid" -ErrorAction SilentlyContinue))".Trim() -split ' '
 if ($rec.Count -eq 2 -and $rec[0] -match '^\d+$' -and $rec[1] -match '^\d+$') {{ $known[[uint32]$rec[0]] = [int64]$rec[1] }}
+# Creation times compared to within 1 us: the job records its own to 100 ns, WMI to 1 us.
+function Same($a, $b) {{ [math]::Abs($a - $b) -lt 10 }}
 function Live {{
   $all = @(Get-CimInstance Win32_Process)
   $holder = @{{}}
@@ -1643,11 +1645,11 @@ function Live {{
     foreach ($c in $all) {{
       $q = $c.ParentProcessId; $born = $holder[$c.ProcessId]
       if ($known.ContainsKey($c.ProcessId) -or -not $known.ContainsKey($q) -or $born -lt $known[$q]) {{ continue }}
-      if ($holder.ContainsKey($q) -and $holder[$q] -ne $known[$q] -and $born -ge $holder[$q]) {{ continue }}
+      if ($holder.ContainsKey($q) -and -not (Same $holder[$q] $known[$q]) -and $born -ge $holder[$q]) {{ continue }}
       $known[$c.ProcessId] = $born; $added = $true
     }}
   }} while ($added)
-  @($all | Where-Object {{ $known.ContainsKey($_.ProcessId) -and $known[$_.ProcessId] -eq $holder[$_.ProcessId] }})
+  @($all | Where-Object {{ $known.ContainsKey($_.ProcessId) -and (Same $known[$_.ProcessId] $holder[$_.ProcessId]) }})
 }}
 $stopped = @{{}}
 for ($i = 0; $i -lt 10; $i++) {{
