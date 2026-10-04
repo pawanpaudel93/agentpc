@@ -154,8 +154,9 @@ agentpc mcp-install                  # or pick: agentpc mcp-install claude claud
 Supported: Claude Code, Claude Desktop, Codex, Cursor, Gemini CLI and VS Code (restart Claude
 Desktop after registering). Updating an existing JSON `mcpServers.agentpc` or Codex
 `[mcp_servers.agentpc]` entry preserves custom environment/options while refreshing the
-managed command and arguments. Invalid config is refused, not replaced; multiline TOML
-values are edited as complete values. For any other MCP client, add:
+managed command and arguments, and keeps the comments and blank lines around them. Config
+is written through a private temporary file. Invalid config is refused, not replaced;
+multiline TOML values are edited as complete values. For any other MCP client, add:
 
 ```json
 {
@@ -182,8 +183,8 @@ pick the server up automatically.
 | `delete_vm` | Delete a VM with its disk and checkpoints |
 | `take_screenshot` | PNG screenshot from the hypervisor; `save_to` also writes it to a path on your Mac |
 | `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu and Arch); returns exit code, stdout and stderr. A foreground run is killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id for `get_job_status` |
-| `get_job_status` | Check a background job by its id: still running, exited (with its code) or stopped, plus the tail of its log |
-| `stop_job` | Stop a background job and everything it started (its session on Linux, its process tree on Windows) |
+| `get_job_status` | Check a background job by its id: running, exited (with its code), stopped, or ended without an exit code, plus the tail of its log |
+| `stop_job` | Stop a background job and everything it started (its session on Linux, its process tree on Windows). For a job that already exited, it stops only what the job left running |
 | `upload_file` / `download_file` | Copy files or folders between your Mac and a VM |
 | `forward_port` | Reach a server running in a VM from your Mac (TCP over an SSH tunnel, works even for servers bound to the guest's own `127.0.0.1`; or `protocol: "udp"` for a UDP server listening on `0.0.0.0`) |
 | `list_forwards` / `delete_forward` | List a VM's active port forwards / stop one by its host port (and optional protocol) |
@@ -238,7 +239,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 | `agentpc list [--json]` (`ls`) | VMs and images; `--json` gives the same data as the MCP `list_vms` tool |
 | `agentpc info <name>` | Viewer URL (with the VNC password), SSH and VNC details, checkpoints, and on x86apps VMs how x86 programs run (`x86 programs: FEX, hardware\|emulated TSO`) |
 | `agentpc start <name>… \| --all` | Boot stopped VMs |
-| `agentpc stop <name>… \| --all` | Shut VMs down cleanly; disks are kept |
+| `agentpc stop <name>… \| --all` | Shut VMs down cleanly; disks are kept. An Arch image captured before agentpc handed the power button to logind waits out a ~3 min timeout on each stop until `agentpc image snapshot <image>` refreshes it |
 | `agentpc reset <name>…` | Discard all changes: back to a fresh copy of the image |
 | `agentpc rm <name>…` (`delete`) | Delete VMs with their disks and checkpoints |
 | `agentpc checkpoint <name> <label> [-d]` | Save a VM's disk and memory (a running VM pauses ~5 s), or delete a checkpoint |

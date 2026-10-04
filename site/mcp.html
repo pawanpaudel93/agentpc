@@ -254,7 +254,7 @@ tool_timeout_sec = 900</code></pre>
                 </tr>
                 <tr>
                   <td><code translate="no">get_job_status</code></td>
-                  <td>A background job's state (running, exited with its code, or stopped) and the tail of its log (<code translate="no">tail_lines</code>, default 50).</td>
+                  <td>A background job's state (running, exited with its code, stopped, or ended without an exit code) and the tail of its log (<code translate="no">tail_lines</code>, default 50).</td>
                 </tr>
                 <tr>
                   <td><code translate="no">stop_job</code></td>
@@ -477,7 +477,7 @@ forward_port    { "name": "ubuntu-1", "guest_port": 3000 }  <span class="comment
               <code translate="no">list_forwards</code> and <code translate="no">read_vm_log</code> are read-only.
               Tools that discard or overwrite state are marked destructive, including
               <code translate="no">download_file</code>, which writes to your Mac.
-              <code translate="no">start_vm</code> and <code translate="no">stop_vm</code> are idempotent.
+              <code translate="no">start_vm</code>, <code translate="no">stop_vm</code> and <code translate="no">stop_job</code> are idempotent.
             </p>
           </section>
         </article>
