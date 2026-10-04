@@ -345,6 +345,18 @@ def lifecycle(m, vm, r, guest):
         ok, out = m.tool("stop_job", name=vm, id=int(job.group(1)))
         r.check("stop_job stops what an exited job left running", ok and "left running" in out
                 and stdout(sh(alive)[1]) == "0", out[:200])
+    # Processes that clear their environment and detach (one as root) stay in the job's scope.
+    ok, out = sh("env -i setsid nohup sleep 3306 >/dev/null 2>&1 < /dev/null & "
+                 "sudo -n env -i setsid nohup sleep 3307 >/dev/null 2>&1 < /dev/null & echo started",
+                 background=True)
+    job = re.search(r"\(id (\d+)", out)
+    if job:
+        esc = "pgrep -fx 'sleep 330[67]' | wc -l"
+        r.check("detached env-cleared processes outlive their job",
+                poll(lambda: stdout(sh(esc)[1]) == "2", 15))
+        ok, out = m.tool("stop_job", name=vm, id=int(job.group(1)))
+        r.check("stop_job stops detached env-cleared processes", ok and stdout(sh(esc)[1]) == "0",
+                out[:200])
 
     ok, out = sh("sleep 60; echo late", timeout=3)
     r.check(

@@ -1086,7 +1086,8 @@ impl Gateway {
         name = "stop_job",
         title = "Stop job",
         description = "Stop a background job started by run_command (background: true): the job and every\n\
-                          process it started (on Linux, its whole session; on Windows, its process tree).\n\
+                          process it started (on Linux, its systemd scope, even processes that detached; on\n\
+                          Windows, its process tree).\n\
                           get_job_status then reports it as stopped. For a job that already exited, it\n\
                           stops only what the job left running (a server it started) and keeps its exit code.",
         annotations(
@@ -1470,11 +1471,15 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
     let script = match inst.os {
         // Separate lines: `a && b &` would background the whole list, and that shell would
         // hold the SSH session open. The wrapper records the exit code in <id>.exit so
-        // get_job_status can report it after the job ends. AGENTPC_JOB marks every process
-        // the job starts (inherited), so stop_job can find them after the wrapper is gone.
+        // get_job_status can report it after the job ends. The job runs in its own systemd
+        // scope (a cgroup no process can leave, even one that clears its environment and
+        // detaches), so stop_job finds everything it started; AGENTPC_JOB, which every process
+        // it starts inherits, covers a guest without a user systemd.
         Os::Ubuntu | Os::Arch => format!(
             "d=~/agentpc-bg; mkdir -p $d && echo {b64} | base64 -d > $d/{id}.sh || exit 1\n\
-             {env} AGENTPC_JOB={id} setsid nohup bash -c 'bash \"$0\"; echo $? > \"$1\"' \
+             run=; {env} systemctl --user show-environment >/dev/null 2>&1 && \
+             run='systemd-run --user --scope --quiet --unit=agentpc-job-{id} --'\n\
+             {env} AGENTPC_JOB={id} setsid nohup $run bash -c 'bash \"$0\"; echo $? > \"$1\"' \
              $d/{id}.sh $d/{id}.exit > $d/{id}.log 2>&1 < /dev/null &\n\
              echo $! > $d/{id}.pid\n\
              echo \"started in the background (id {id}, pid $!). \
@@ -1558,8 +1563,10 @@ async fn stop_job(name: &str, id: u64) -> Result<String> {
 
 fn stop_job_script(os: Os, id: u64) -> String {
     match os {
-        // The job's processes: its whole session while its wrapper (checked by command line,
-        // so a reused pid is never taken for it) still runs, and every process carrying its
+        // The job's processes: everything in its systemd scope (agentpc-job-<id>.scope, a
+        // cgroup only the job's processes are in), its whole session while its wrapper
+        // (checked by command line, so a reused pid is never taken for it) still runs, and
+        // every process carrying its
         // AGENTPC_JOB marker plus their descendants (sudo resets the environment, so what
         // sudo starts is found as a child). A session id alone is not trusted once the
         // wrapper is gone: after a reboot or pid reuse it can name someone else's session.
@@ -1571,8 +1578,10 @@ fn stop_job_script(os: Os, id: u64) -> String {
 [ -f $d/{id}.log ] || {{ echo 'no such job {id}'; exit 3; }}
 S=; sudo -n true 2>/dev/null && S='sudo -n'
 p=$(cat $d/{id}.pid 2>/dev/null); case $p in ''|*[!0-9]*) p= ;; esac
+cg=$(find /sys/fs/cgroup/user.slice -maxdepth 6 -type d -name agentpc-job-{id}.scope 2>/dev/null | head -n 1)
 members() {{
   {{
+    [ -n "$cg" ] && find "$cg" -name cgroup.procs -exec cat {{}} + 2>/dev/null
     if [ -n "$p" ] && grep -qs {id}.sh /proc/$p/cmdline; then pgrep -s "$p"; fi
     marked=$($S grep -lsxz 'AGENTPC_JOB={id}' /proc/[0-9]*/environ 2>/dev/null | sed 's|^/proc/||; s|/environ$||')
     if [ -n "$marked" ]; then
@@ -1601,7 +1610,9 @@ $S kill -TERM $(targets) 2>/dev/null
 i=0; while [ -n "$(targets)" ] && [ $i -lt 25 ]; do sleep 0.2; i=$((i + 1)); done
 for r in 1 2 3; do
   left=$(targets); [ -z "$left" ] && break
-  $S kill -KILL $left 2>/dev/null; sleep 0.3
+  $S kill -KILL $left 2>/dev/null
+  [ -n "$cg" ] && [ -e "$cg/cgroup.kill" ] && $S sh -c 'echo 1 > "$1"' sh "$cg/cgroup.kill" 2>/dev/null
+  sleep 0.3
 done
 if [ -n "$(targets)" ]; then echo "job {id}: some of its processes would not stop"; exit 1; fi
 if [ -f $d/{id}.exit ]; then echo "job {id} had exited with code $(cat $d/{id}.exit); stopped $n process(es) it left running"
