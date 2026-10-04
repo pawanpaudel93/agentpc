@@ -292,9 +292,23 @@ fn bake_base(image: &Image) -> Result<()> {
     // The old snapshot was captured from the old base; it is recaptured next.
     image.remove_snapshot();
     promote_files(&disk_tmp, &vars_tmp, &disk, &vars)?;
+    // Recorded only once the baked disk is in place: an interrupted bake bakes again.
+    let mut info = read_info(image).unwrap_or_default();
+    info.base_guest_scripts = guest_scripts_id(image);
+    write_info(image, &info)?;
     std::fs::remove_dir_all(&inst.dir)?;
     guard.keep();
     Ok(())
+}
+
+/// Whether the base disk already has this agentpc's guest setup (see `bake_base`).
+fn base_is_baked(image: &Image) -> bool {
+    read_info(image).is_some_and(|i| baked_with(&i, &guest_scripts_id(image)))
+}
+
+/// An image info's base was baked with guest setup `id` (never when it doesn't say).
+fn baked_with(info: &ImageInfo, id: &str) -> bool {
+    !info.base_guest_scripts.is_empty() && info.base_guest_scripts == id
 }
 
 /// `snapshot`, for a caller already holding the image lock.
@@ -315,7 +329,11 @@ pub(crate) fn snapshot_locked(image: &Image) -> Result<()> {
             names.join(", ")
         );
     }
-    bake_base(image)?;
+    if base_is_baked(image) {
+        log!("{image}'s base disk already has this agentpc's guest setup");
+    } else {
+        bake_base(image)?;
+    }
     let name = format!("_snap-{image}");
     if instances_dir().join(&name).is_dir() {
         if let Ok(old) = Instance::load(&name) {
@@ -758,6 +776,11 @@ pub struct ImageInfo {
     /// `base_setup_id` of the agentpc that built the image (empty: built before it was kept).
     #[serde(default)]
     pub base_setup: String,
+    /// `guest_scripts_id` baked into the base disk by `bake_base` (empty: never baked, or
+    /// baked before it was kept). It travels with a pushed image, so a pull of a base
+    /// already baked with this agentpc's guest setup isn't baked again.
+    #[serde(default)]
+    pub base_guest_scripts: String,
 }
 
 /// A fingerprint of the scripts a snapshot runs in an image's guest (`prepare.*`, and
@@ -980,6 +1003,7 @@ $cua = "$env:LOCALAPPDATA\Programs\Cua\cua-driver\bin\cua-driver.exe"
         pulled_from: None,
         guest_scripts: guest_scripts_id(&inst.image),
         base_setup: String::new(),
+        base_guest_scripts: String::new(),
     })
 }
 
@@ -1740,6 +1764,30 @@ fn promote_image(inst: &Instance) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_base_is_baked_only_with_the_same_recorded_guest_setup() {
+        use super::{ImageInfo, baked_with};
+        // Info written before the field existed (or by a pusher that predates it): bake.
+        let mut v = serde_json::to_value(ImageInfo {
+            guest_scripts: "aa".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        v.as_object_mut().unwrap().remove("base_guest_scripts");
+        let old: ImageInfo = serde_json::from_value(v).unwrap();
+        assert!(!baked_with(&old, "aa"));
+        assert!(!baked_with(&ImageInfo::default(), ""));
+        let info = ImageInfo {
+            base_guest_scripts: "aa".into(),
+            ..Default::default()
+        };
+        assert!(baked_with(&info, "aa"));
+        assert!(!baked_with(&info, "bb"));
+        // It travels with the image's config (push and pull serialize ImageInfo).
+        let back: ImageInfo = serde_json::from_slice(&serde_json::to_vec(&info).unwrap()).unwrap();
+        assert!(baked_with(&back, "aa"));
+    }
+
     #[test]
     fn promotion_never_leaves_new_vars_beside_an_old_disk() {
         let dir = std::env::temp_dir().join(format!("agentpc-promote-{}", std::process::id()));
