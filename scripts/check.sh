@@ -40,15 +40,18 @@ sh scripts/test-arch-power-key.sh >/dev/null
 say "static site SEO and links"
 python3 scripts/test-site.py
 
+say "smoke.py prints no viewer link or credential"
+python3 scripts/test-smoke-logging.py
+
 say "VM test scripts compile"
-python3 -m py_compile scripts/smoke.py scripts/lifecycle-stress.py
+python3 -m py_compile scripts/smoke.py scripts/lifecycle-stress.py scripts/test-smoke-logging.py
 
 say "plugin manifests parse"
 find plugin .claude-plugin -name '*.json' -print0 | xargs -0 -n1 python3 -m json.tool >/dev/null
 
-# AGENTS.md's tool table is the agent contract; the plugin skill and the server must have
-# every tool it lists.
-say "AGENTS.md, SKILL.md and the MCP server list the same tools"
+# AGENTS.md's tool table is the agent contract; the plugin skill, the README and the server
+# must have every tool it lists (the site's list and count are checked by test-site.py).
+say "AGENTS.md, SKILL.md, README.md and the MCP server list the same tools"
 # Every `tool` (or `tool(args)`) in the first column of the table.
 tools=$(sed -n '/^## Using the VMs/,/^## /p' AGENTS.md | grep '^| `' | cut -d'|' -f2 |
   grep -oE '`[a-z_]+[`(]' | tr -d '`(' | sort -u)
@@ -56,6 +59,7 @@ tools=$(sed -n '/^## Using the VMs/,/^## /p' AGENTS.md | grep '^| `' | cut -d'|'
 missing=
 for t in $tools; do
   grep -qE "\`${t}[\`(]" plugin/skills/agentpc/SKILL.md || missing="$missing $t(SKILL.md)"
+  grep -qE "\`${t}[\`(]" README.md || missing="$missing $t(README.md)"
   grep -qE "fn $t\(|name = \"$t\"" src/mcp.rs || missing="$missing $t(src/mcp.rs)"
 done
 [ -z "$missing" ] || { echo "missing:$missing" >&2; exit 1; }

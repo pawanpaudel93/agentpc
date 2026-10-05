@@ -30,15 +30,16 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 | `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save the VM's disk and memory; go back to that state in seconds; or drop one checkpoint |
 | `delete_vm(name)` | Delete a VM with its disk and checkpoints |
 | `take_screenshot(name, save_to?)` | PNG screenshot; works even while booting or hung. `save_to` also writes it to a Mac path |
-| `run_command(name, command, timeout?, background?)` | Shell command: PowerShell on Windows, bash on Ubuntu and Arch. Returns `exit code: N` plus stdout and stderr, each trimmed to its first and last 10,000 characters. Foreground runs are killed at `timeout` (default 120 s) with partial output; `background: true` (servers, long jobs) returns a job id to poll with `get_job_status` |
-| `get_job_status(name, id, tail_lines?)` | Background job's state (running, exited with its code, stopped, or ended without an exit code) plus its log tail |
-| `stop_job(name, id)` | Stop a background job and everything it started; for an exited job, only what it left running |
+| `run_command(name, command, timeout?, background?)` | Shell command: PowerShell on Windows, bash on Ubuntu and Arch. Returns typed `structuredContent` (`state`, `exit_code`, `stdout`, `stderr`, `timed_out`, `termination_confirmed`, `effect_unknown`, `job_id`, ...) plus the readable `exit code: N` text; each stream is trimmed to its first and last 10,000 characters. At a foreground run's `timeout` (default 120 s) agentpc attempts to stop it and returns its partial output, and the reply says whether the stop was confirmed; `background: true` (servers, long jobs) returns a job id to poll with `get_job_status`. See "Running commands" |
+| `get_job_status(name, id, tail_lines?, wait_seconds?, cursor?)` | Job state (queued, running, exited with its code, stopped, ended without an exit code, or missing) plus its log, typed. `wait_seconds` (0 by default, at most 30) waits without ever stopping the job; `cursor` reads the log incrementally. Also takes a foreground run's `job_id`. See "Watching jobs" |
+| `stop_job(name, id)` | Stop a background job (or a foreground run's `job_id`) and everything it started; for an exited job, only what it left running |
 | `upload_file` / `download_file` | Copy files or folders between this Mac and a VM |
 | `forward_port(name, guest_port, host_port?, protocol?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). TCP (default) is an SSH tunnel: reaches a server on the guest's own `127.0.0.1`. `protocol: "udp"` is a QEMU host forward: the guest server must listen on `0.0.0.0`; not on offline VMs. Lasts until the VM stops |
 | `list_forwards(name)` / `delete_forward(name, host_port, protocol?)` | List a VM's forwards (with protocol) / stop one |
 | `read_vm_log(name, which, tail_lines?)` | Tail a VM's `qemu` or `serial` log when it won't boot or the desktop is unreachable |
-| `list_desktop_tools(name, tool?)` | Desktop-control tools in that VM with their required arguments and read-only marks, or one tool's full schema |
-| `use_desktop_tool(name, tool, arguments?)` | Call a GUI tool: click, type, launch apps, read the UI tree. A wrong name returns close matches |
+| `list_desktop_tools(name, tool?)` | Desktop-control tools in that VM with their required arguments and read-only marks, or one tool's full schema with its annotations |
+| `use_desktop_tool(name, tool, arguments?)` | Call a GUI tool: click, type, launch apps, read the UI tree. A wrong name returns close matches. Marked destructive |
+| `inspect_desktop(name, tool, arguments?)` | Read-only twin of `use_desktop_tool` (same arguments): runs a tool only if the VM's driver explicitly marks it read-only, and refuses anything else before dispatching it. See "Looking without acting" |
 
 ## How to work
 
@@ -49,8 +50,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 3. Before a risky or slow-to-redo step (an installer, a config change), `checkpoint_vm` so
    `restore_vm` can undo it in seconds instead of rebuilding from `reset_vm`. Port forwards
    (TCP and UDP) must be set up again after a restore.
-4. For GUI work, loop: look (`take_screenshot` or a UI-snapshot tool), act (`use_desktop_tool`), then
-   look again to verify.
+4. For GUI work, loop: look (`take_screenshot`, or `inspect_desktop` with a UI-snapshot tool), act
+   (`use_desktop_tool`), then look again to verify.
 5. Call `list_desktop_tools` once per VM to learn the exact tool names and required arguments.
    A call with wrong arguments returns that tool's argument list; a wrong tool name returns
    close matches ("did you mean ..."). The desktop driver is pinned per image so tools match
@@ -58,6 +59,84 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
    reconnect note (the VM or its driver restarted), earlier snapshot ids and browser sessions
    are gone: take a new snapshot and run `browser_prepare` again.
 6. When finished, `delete_vm` VMs you created, unless the user wants to keep them.
+
+## Running commands
+
+`run_command` returns `structuredContent` (its `outputSchema`, `schema_version` 1) and one text block
+holding the readable `exit code: N` / `--- stdout ---` / `--- stderr ---` text. The text is not a JSON
+copy, so a client that joins text blocks sees the same text as ever. Read the typed fields and trust
+`isError`:
+
+- `state`: `exited` (`exit_code` is its code), `timed_out`, `not_started` (it never ran),
+  `connection_lost` (SSH failed while it may have been running) or `started` (a background job).
+- `stdout`, `stderr`, `stdout_bytes`, `stderr_bytes`, `stdout_truncated`, `stderr_truncated`,
+  `output_truncated`; `timed_out`, `termination_confirmed`, `effect_unknown`, `recovery_action`, `error`;
+  `execution_id` (issued to each run; null only when the call failed before one was, such as an unknown or stopped VM), `job_id` (background jobs, and foreground runs whose fate is
+  uncertain) and `log_path`.
+- `isError` is true for any nonzero exit, any timeout (even when the command's own code is known to be
+  0), and any run that did not start or lost its connection. It is false only for exit 0 and a
+  background start. Foreground exit codes are the low 8 bits SSH reports (Windows `exit -1` reads 255).
+- At `timeout`, agentpc attempts to stop the command and what it started, and keeps the partial output.
+  `termination_confirmed: true` means it verified that none of the processes it identified is left: on
+  Linux the command's transient systemd user scope when the guest's user manager is available, the
+  processes marked with its execution id and their descendants (all that is checked without a user
+  manager, where a process that clears its environment and detaches can be missed), and its verified
+  root; on Windows its verified process tree (best effort: a process whose launcher had exited can be
+  missed). It is not a sandbox guarantee. System services (`systemctl`), other systemd units, and Windows
+  services, scheduled tasks and WMI-created processes are not covered. With
+  `termination_confirmed: false` or `effect_unknown: true` (`connection_lost` with `effect_unknown: true`
+  included) it may still be running: use `job_id` with `get_job_status` / `stop_job` and don't rerun it
+  before you know. A `connection_lost` with `effect_unknown: false` carries the VM's recorded `exit_code`
+  (it finished; its output may be incomplete) and a null `job_id`. `retry` in
+  `recovery_action` means it provably never ran; agentpc never retries a command itself.
+- After a timeout the reply usually follows within a few seconds, and at most about 50 seconds later
+  while agentpc finishes its bounded cleanup.
+- A command whose exit code the VM recorded but whose run had not ended by the timeout (a child it left
+  may have held its output, or it ended right at the deadline) returns that exit code with
+  `timed_out: true`, after cleanup verified that none of the processes agentpc identified remains: start
+  servers with `background: true`.
+- On Linux a foreground command is limited to 92 KiB (94,208 UTF-8 bytes) of text (base64 in one SSH
+  command line, and an environment string, each capped at 128 KiB by the kernel). agentpc checks it
+  before sending: a bigger one is `not_started` with no `execution_id` and no `recovery_action`. For a
+  bigger script, `upload_file` it and run the file.
+
+## Watching jobs
+
+`get_job_status` also returns typed `structuredContent` (`state`: `queued`, `running`, `exited`,
+`stopped`, `ended`, `not_started`, `missing`, `unknown`; `exit_code`, `kind`, `stop_reason`, `log_tail`
+or `output`, `has_more`, `next_cursor`, `cursor_reset`, `cursor_reset_reason`, `wait_timed_out`, `note`,
+`error_code`) next to its `STATE: ...` text.
+
+- `get_job_status {name, id}` answers at once with the last `tail_lines` (default 50) lines, at most
+  16 KiB, as before, plus a `next_cursor` at the end of what it read.
+- `wait_seconds` (0 to 30, default 0) waits for the job to leave `running`, or with a `cursor` for new
+  output, then returns the current state with `wait_timed_out: true` if nothing happened. A wait only
+  waits: it never stops the job. For longer waits call again with the last `next_cursor`.
+- `cursor` (a `next_cursor`, or `"start"`) reads the log from that point, at most 16 KiB a reply; the
+  next cursor advances by exactly the bytes returned, so reads neither repeat nor skip output (`has_more`
+  says call again). It is opaque. UTF-8 characters are never split across reads; invalid bytes become
+  U+FFFD with `invalid_utf8: true`; a byte-order mark is consumed unseen.
+- A cursor that no longer matches (VM reset or restored, guest rebooted, log replaced, shortened,
+  rewritten or removed) comes back with `cursor_reset: true` and a `cursor_reset_reason`, restarted at
+  the log's beginning: discard what you assumed. Detection is best effort (it can miss a guest clock
+  step, a Windows log recreated within NTFS tunneling, or a log rewritten with the same first 64 bytes).
+- `missing` means nothing has recorded itself under that id yet. That does not prove the command never
+  started: don't blindly retry. An unreachable VM is an error (`state: unknown`), never `ended`.
+- An exited job that left a child running still reports its own exit code. A foreground `job_id` has
+  status only (exited with its code, stopped at its timeout, or not started), no log to replay.
+
+## Looking without acting
+
+`inspect_desktop` takes `use_desktop_tool`'s arguments but is annotated read-only (not destructive,
+open-world: results can include web page text). It asks the VM's driver for the tool's annotations
+before each dispatch and runs only a tool the driver explicitly marks `readOnlyHint: true`
+(`list_desktop_tools` shows `[read-only]`); a tool marked otherwise, unmarked or unknown is refused
+before it is dispatched (looking up the annotations does ask the VM's driver). After a dropped call the driver is asked again on the new connection, and the
+call is re-sent only if the old connection had listed the tool read-only and the new one still does. The
+marking is the driver's own claim: a guard against mistakes, not against a mislabelling driver.
+Compact observation: `get_window_state` with `include_screenshot: false` returns the element tree
+without a screenshot, and its `query` argument narrows it (`list_desktop_tools` with `tool` shows the
+pinned driver's schema). Tools that act still go through `use_desktop_tool`.
 
 ## Windows (desktop tools from cua-driver)
 
@@ -136,7 +215,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   is `10.0.2.15`, so a service that advertises its address advertises the same one from each
   VM; peers elsewhere reach it only through a forward.
 - **Reboots.** A reboot (Windows Update, some installers) drops SSH. Call `start_vm` on the same
-  VM — it waits until the desktop is ready again — or just retry `run_command`.
+  VM — it waits until the desktop is ready again — then rerun the command. If its reply was
+  `connection_lost` with `effect_unknown: true`, check it first with `get_job_status` and its `job_id`.
 - **GUI installers** return immediately; run them silently and wait:
   `Start-Process installer.exe -ArgumentList '/S' -Wait -PassThru` (check `.ExitCode`).
 - **Windows Update is disabled** in the image, which breaks DISM/`Add-WindowsCapability` optional
@@ -167,8 +247,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
   and no access to the Mac, while `run_command`, files, desktop tools and `forward_port` work.
 - For a heavy build, `create_vm` accepts `memory_gb` and `cpus`; a non-default size boots
   cold (~25 s Windows, ~15 s Ubuntu and Arch) instead of resuming in seconds.
-- Output that needs more than 10,000 characters from each end: write it to a file in the VM
-  and `download_file` it.
+- Output that needs more than 10,000 characters from each end (`output_truncated`): write it to a
+  file in the VM and `download_file` it.
 - Don't create VMs you won't use. Each running VM uses 4 GB (Ubuntu, Arch) or 8 GB (Windows) of RAM.
 - The first `create_vm ubuntu` downloads the Ubuntu image (~1.2 GB). Another Ubuntu release
   (`version: "22.04"`, `"26.04"`, ...) is fetched or built the same way (~3 min). A dated

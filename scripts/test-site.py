@@ -2,6 +2,7 @@
 """Check static-site metadata, structured data, sitemap and local links."""
 
 import json
+import re
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -139,6 +140,20 @@ def check():
     require(sorted(urls) == sorted(ORIGIN + route for route in PAGES.values()), "sitemap must list every canonical once")
     require(f"Sitemap: {ORIGIN}/sitemap.xml" in (SITE / "robots.txt").read_text(), "robots.txt must advertise sitemap")
     require(".html" not in (SITE / "llms.txt").read_text(), "llms.txt must use canonical URLs")
+
+    # The tool count and list: the source's tools, AGENTS.md's table, the home page's number
+    # and the MCP page's tables must agree.
+    source = re.findall(r"^    #\[tool\(", (ROOT / "src" / "mcp.rs").read_text(), re.M)
+    table = (ROOT / "AGENTS.md").read_text().split("## Using the VMs", 1)[1].split("\n## ", 1)[0]
+    documented = {n for line in table.splitlines() if line.startswith("| `")
+                  for n in re.findall(r"`([a-z_]+)[`(]", line.split("|")[1])}
+    advertised = re.search(r"All (\d+) tools", (SITE / "index.html").read_text())
+    require(len(source) == len(documented), f"src/mcp.rs has {len(source)} tools, AGENTS.md lists {len(documented)}")
+    require(advertised is not None and int(advertised.group(1)) == len(documented),
+            f"index.html must say 'All {len(documented)} tools'")
+    mcp_page = (SITE / "mcp.html").read_text()
+    for tool in sorted(documented):
+        require(f'translate="no">{tool}</code>' in mcp_page, f"mcp.html must document {tool}")
     if errors:
         for error in errors:
             print(f"FAIL: {error}")

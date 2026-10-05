@@ -89,6 +89,7 @@
             <a href="#desktop">Desktop control</a>
             <a href="#workflow">Typical session</a>
             <a href="#jobs">Long jobs</a>
+            <a href="#results">Results and recovery</a>
             <a href="#lifecycle">Session lifecycle</a>
             <a href="#annotations">Approval prompts</a>
           </div>
@@ -246,19 +247,28 @@ tool_timeout_sec = 900</code></pre>
                 <tr>
                   <td><code translate="no">run_command</code></td>
                   <td>
-                    PowerShell on Windows, bash on Ubuntu and Arch, over SSH. Returns the exit code, stdout and
-                    stderr, each trimmed to its first and last 10,000 characters. A foreground run is
-                    killed at <code translate="no">timeout</code> (default 120 s) with partial output;
+                    PowerShell on Windows, bash on Ubuntu and Arch, over SSH. Returns typed
+                    <code translate="no">structuredContent</code> plus the readable exit code, stdout and
+                    stderr, each stream trimmed to its first and last 10,000 characters. A foreground run that
+                    reaches <code translate="no">timeout</code> (default 120 s) gets an attempt to stop it, and its partial output
+                    is kept; the reply says whether the stop was confirmed.
                     <code translate="no">background: true</code> returns a job id.
+                    <a href="#results">Results and recovery</a>.
                   </td>
                 </tr>
                 <tr>
                   <td><code translate="no">get_job_status</code></td>
-                  <td>A background job's state (running, exited with its code, stopped, or ended without an exit code) and the tail of its log (<code translate="no">tail_lines</code>, default 50).</td>
+                  <td>
+                    A job's state (queued, running, exited with its code, stopped, ended without an exit code, or
+                    missing) and its log, typed. By default the tail (<code translate="no">tail_lines</code>, default 50, at most 16 KiB);
+                    <code translate="no">wait_seconds</code> (0 to 30, default 0) waits without ever stopping the job;
+                    <code translate="no">cursor</code> reads the log incrementally. Also takes the
+                    <code translate="no">job_id</code> of a foreground run whose outcome was uncertain.
+                  </td>
                 </tr>
                 <tr>
                   <td><code translate="no">stop_job</code></td>
-                  <td>Stop a background job and everything it started: its systemd scope on Linux, which detached processes can't leave; its process tree on Windows. For a job that already exited, it stops only what the job left running.</td>
+                  <td>Stop a background job (or a foreground run's <code translate="no">job_id</code>) and everything it started: on Linux its systemd scope, which processes that detach stay in, when the guest has a user manager, else the processes marked with the job and their descendants; on Windows its process tree. For a job that already exited, it stops only what the job left running.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">upload_file</code> / <code translate="no">download_file</code></td>
@@ -293,11 +303,19 @@ tool_timeout_sec = 900</code></pre>
                 </tr>
                 <tr>
                   <td><code translate="no">list_desktop_tools</code></td>
-                  <td>The desktop-control tools inside a VM, with each one's required arguments and whether it's read-only, or one tool's full schema (a mistyped name returns close matches).</td>
+                  <td>The desktop-control tools inside a VM, with each one's required arguments and whether it's read-only, or one tool's full schema with its annotations (a mistyped name returns close matches).</td>
                 </tr>
                 <tr>
                   <td><code translate="no">use_desktop_tool</code></td>
-                  <td>Call one of them (<code translate="no">tool</code> plus <code translate="no">arguments</code>): click, type, launch apps, read the UI tree, and more. Wrong arguments or a wrong name return the tool's arguments or close matches. Gives up after 120 s.</td>
+                  <td>Call one of them (<code translate="no">tool</code> plus <code translate="no">arguments</code>): click, type, launch apps, read the UI tree, and more. Wrong arguments or a wrong name return the tool's arguments or close matches. Marked destructive. Gives up after 120 s.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">inspect_desktop</code></td>
+                  <td>
+                    The read-only twin of <code translate="no">use_desktop_tool</code>, with the same arguments. It runs a tool only if
+                    the VM's desktop driver explicitly marks it read-only, and refuses anything else before dispatching it.
+                    Marked read-only, so clients can auto-approve looking while still confirming acting.
+                  </td>
                 </tr>
                 <tr>
                   <td><code translate="no">read_vm_log</code></td>
@@ -312,7 +330,8 @@ tool_timeout_sec = 900</code></pre>
             <p>
               All three guests (Windows, Ubuntu, Arch) run <a href="https://github.com/trycua/cua">cua-driver</a> and are
               1280×800. Work in a loop: look (<code translate="no">take_screenshot</code> or a
-              snapshot tool), act (<code translate="no">use_desktop_tool</code>), then look again to
+              snapshot tool, through <code translate="no">inspect_desktop</code> when you only need to look),
+              act (<code translate="no">use_desktop_tool</code>), then look again to
               verify. Prefer <code translate="no">run_command</code> for anything a shell can do.
             </p>
             <table class="data-table">
@@ -421,7 +440,7 @@ delete_vm        { "name": "install-test" }</code></pre>
             <h2>Long jobs and servers</h2>
             <p>
               A foreground <code translate="no">run_command</code> ends when the command returns, and is
-              killed at its timeout. Start builds, servers and GUI apps with
+              given an attempted stop at its timeout. Start builds, servers and GUI apps with
               <code translate="no">background: true</code>, then poll:
             </p>
             <div class="code-panel">
@@ -431,9 +450,89 @@ stop_job        { "name": "ubuntu-1", "id": 1 }  <span class="comment"># when do
 forward_port    { "name": "ubuntu-1", "guest_port": 3000 }  <span class="comment"># → 127.0.0.1:&lt;port&gt; on the Mac</span></code></pre>
             </div>
             <p>
+              <code translate="no">get_job_status</code> without <code translate="no">wait_seconds</code> or
+              <code translate="no">cursor</code> answers at once, as it always has. To follow a job without polling
+              in a loop, wait and read from a cursor:
+            </p>
+            <div class="code-panel">
+              <pre><code translate="no">get_job_status  { "name": "ubuntu-1", "id": 1, "cursor": "start", "wait_seconds": 10 }  <span class="comment"># → output, next_cursor</span>
+get_job_status  { "name": "ubuntu-1", "id": 1, "cursor": "&lt;next_cursor&gt;", "wait_seconds": 30 }  <span class="comment"># new output only</span></code></pre>
+            </div>
+            <p>
               Reboots (some installers) drop SSH. Call <code translate="no">start_vm</code> on the same VM,
-              which waits until the desktop is ready again even if it's already running, or retry
-              <code translate="no">run_command</code>.
+              which waits until the desktop is ready again even if it's already running, then rerun the
+              command. If its reply was <code translate="no">connection_lost</code> with
+              <code translate="no">effect_unknown: true</code>, check what it did first with
+              <code translate="no">get_job_status</code> and its <code translate="no">job_id</code>.
+            </p>
+          </section>
+
+          <section class="doc-section" id="results">
+            <h2>Results and recovery</h2>
+            <p>
+              <code translate="no">run_command</code> and <code translate="no">get_job_status</code> declare an
+              <code translate="no">outputSchema</code> and return matching <code translate="no">structuredContent</code>
+              (<code translate="no">schema_version</code> 1) next to the readable text scripts have always parsed
+              (<code translate="no">exit code: N</code>, <code translate="no">STATE: …</code>). The text is a single block,
+              not a JSON copy, so a client that joins text blocks sees no extra output. Read the typed fields and
+              <code translate="no">isError</code>.
+            </p>
+            <h3>run_command</h3>
+            <table class="data-table">
+              <thead>
+                <tr><th>Field</th><th>Meaning</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code translate="no">state</code></td>
+                  <td><code translate="no">exited</code> (it ran to its end), <code translate="no">timed_out</code>, <code translate="no">not_started</code> (it never ran), <code translate="no">connection_lost</code> (SSH failed while it may have been running) or <code translate="no">started</code> (a background job).</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">exit_code</code>, <code translate="no">stdout</code>, <code translate="no">stderr</code></td>
+                  <td>The command's code and its separate streams, with <code translate="no">stdout_bytes</code> / <code translate="no">stderr_bytes</code> and truncation flags (<code translate="no">output_truncated</code>) saying whether part of a stream was left out. Foreground codes are the low 8 bits SSH reports: on Windows <code translate="no">exit -1</code> reads 255.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">timed_out</code>, <code translate="no">termination_confirmed</code>, <code translate="no">effect_unknown</code></td>
+                  <td>Whether the call reached its timeout; whether agentpc verified that none of the processes it identified is left (<code translate="no">null</code> when nothing needed stopping); and whether it is unknown if the command ran, finished or is still running.</td>
+                </tr>
+                <tr>
+                  <td><code translate="no">execution_id</code>, <code translate="no">job_id</code>, <code translate="no">recovery_action</code></td>
+                  <td>A run is issued an <code translate="no">execution_id</code> (<code translate="no">null</code> only when the call failed before one was, such as an unknown VM). <code translate="no">job_id</code> is the handle for <code translate="no">get_job_status</code> and <code translate="no">stop_job</code>: set for a background job and for a foreground run whose fate is uncertain. <code translate="no">recovery_action</code> says what to do next: <code translate="no">get_job_status</code>, <code translate="no">stop_job</code>, <code translate="no">start_vm</code>, <code translate="no">inspect_vm</code> or <code translate="no">retry</code> (only when the command provably never ran).</td>
+                </tr>
+              </tbody>
+            </table>
+            <p>
+              <code translate="no">isError</code> is true for every nonzero exit, every timeout (even when the command's own
+              exit code is known to be 0), and every run that didn't start or lost its connection. It is false only for exit 0 and a
+              background start. Commands are never retried automatically.
+            </p>
+            <h3>Timeouts</h3>
+            <ul>
+              <li>At <code translate="no">timeout</code>, agentpc attempts to stop the command and what it started, and keeps the partial stdout and stderr. The reply usually follows within a few seconds; the cleanup is bounded, about 50 seconds beyond the timeout at most.</li>
+              <li><code translate="no">termination_confirmed: true</code> means agentpc verified that none of the processes it identified is left. On Linux those are the command's transient systemd user scope when the guest's user manager is available, the processes marked with its execution id and their descendants (all that is checked without a user manager, where a process that clears its environment and detaches can be missed), and its verified root. On Windows it is the verified process tree, best effort: a process whose launcher had already exited can be missed. It is not a sandbox guarantee. System services, other systemd units, and Windows services, scheduled tasks and WMI-created processes are not covered.</li>
+              <li>With <code translate="no">termination_confirmed: false</code>, or <code translate="no">connection_lost</code> with <code translate="no">effect_unknown: true</code>, the command may still be running. (A <code translate="no">connection_lost</code> with <code translate="no">effect_unknown: false</code> carries the VM's recorded <code translate="no">exit_code</code> and no <code translate="no">job_id</code>: it finished, and only its output may be incomplete.) Use the <code translate="no">job_id</code> with <code translate="no">get_job_status</code> and <code translate="no">stop_job</code>, and don't rerun it before you know. A process is only signalled after its pid and start time are proven to be the command's.</li>
+              <li>A command whose exit code the VM recorded but whose run had not ended by the timeout (a child it left may have held its output, or it ended right at the deadline) returns that exit code with <code translate="no">timed_out: true</code>, after cleanup verified that none of the processes agentpc identified remains. Start servers with <code translate="no">background: true</code>.</li>
+              <li>A Linux foreground command is limited to 92 KiB (94,208 UTF-8 bytes) of text. agentpc checks that before sending anything: a bigger one comes back <code translate="no">not_started</code> with no <code translate="no">recovery_action</code>. For a bigger script, <code translate="no">upload_file</code> it and run the file.</li>
+            </ul>
+            <h3>get_job_status</h3>
+            <ul>
+              <li><code translate="no">state</code>: <code translate="no">queued</code>, <code translate="no">running</code>, <code translate="no">exited</code>, <code translate="no">stopped</code>, <code translate="no">ended</code>, <code translate="no">not_started</code>, <code translate="no">missing</code> or <code translate="no">unknown</code> (the VM couldn't be read: an error, never reported as <code translate="no">ended</code>). An exited job reports its own exit code even if it left a child running.</li>
+              <li><code translate="no">wait_seconds</code> (0 to 30, default 0) waits for the job to leave <code translate="no">running</code>, or with a <code translate="no">cursor</code> for new output. If nothing happens it returns the current state with <code translate="no">wait_timed_out: true</code>. A wait only waits and never stops the job. It can run about 2 seconds past the wait on a slow VM; to wait longer, call again with the last <code translate="no">next_cursor</code>.</li>
+              <li><code translate="no">cursor</code> (a <code translate="no">next_cursor</code>, or <code translate="no">"start"</code>) returns at most 16 KiB from that byte position and advances by exactly the bytes it returned, so output is neither repeated nor skipped (<code translate="no">has_more</code> says call again). UTF-8 characters are never split across reads, invalid bytes become U+FFFD (<code translate="no">invalid_utf8</code>), and a byte-order mark is consumed unseen.</li>
+              <li>A cursor that no longer matches (VM reset or restored, guest reboot, log replaced, shortened, rewritten or removed) comes back with <code translate="no">cursor_reset: true</code> and a <code translate="no">cursor_reset_reason</code>, restarted at the log's beginning: discard what you assumed. Detection is best effort; it can miss a guest clock step, a Windows log recreated within the file system's tunneling window, and a log rewritten with the same first 64 bytes.</li>
+              <li><code translate="no">missing</code> means nothing has recorded itself under that id yet. That doesn't prove the command never started, so don't blindly retry it.</li>
+              <li>A foreground <code translate="no">job_id</code> has status only (exited with its code, stopped at its timeout, or not started); its output went to the <code translate="no">run_command</code> reply, so there is no log to replay.</li>
+            </ul>
+            <h3>inspect_desktop</h3>
+            <p>
+              Before each dispatch, <code translate="no">inspect_desktop</code> asks the VM's driver for the tool's annotations and runs only a
+              tool it explicitly marks <code translate="no">readOnlyHint: true</code> (<code translate="no">list_desktop_tools</code> shows
+              <code translate="no">[read-only]</code>). A tool marked otherwise, unmarked or unknown is refused before it is dispatched, with nothing run (looking up the annotations does ask the VM's driver). After a dropped call the
+              driver is asked again on the new connection; the call is re-sent only if the old connection had listed the tool read-only
+              and the new one still does. The marking is the driver's own claim: a guard against mistakes, not a guarantee against a
+              mislabelling driver or guest. For compact observation, <code translate="no">get_window_state</code> with
+              <code translate="no">include_screenshot: false</code> returns the element tree without a screenshot, and its
+              <code translate="no">query</code> argument narrows what comes back. <code translate="no">use_desktop_tool</code> is unchanged.
             </p>
           </section>
 
@@ -452,7 +551,8 @@ forward_port    { "name": "ubuntu-1", "guest_port": 3000 }  <span class="comment
             <p>
               Every desktop action goes through <code translate="no">use_desktop_tool</code>, which is
               marked destructive, so clients that confirm tool calls ask before each click or
-              keystroke. To approve agentpc's tools up front:
+              keystroke. <code translate="no">inspect_desktop</code> is marked read-only and only runs tools the
+              driver marks read-only. To approve agentpc's tools up front:
             </p>
             <table class="data-table">
               <thead>
@@ -473,7 +573,8 @@ forward_port    { "name": "ubuntu-1", "guest_port": 3000 }  <span class="comment
             <p>
               Tools also carry MCP annotations, which some clients use to decide what to confirm:
               <code translate="no">list_vms</code>, <code translate="no">take_screenshot</code>,
-              <code translate="no">list_desktop_tools</code>, <code translate="no">get_job_status</code>,
+              <code translate="no">list_desktop_tools</code>, <code translate="no">inspect_desktop</code>,
+              <code translate="no">get_job_status</code>,
               <code translate="no">list_forwards</code> and <code translate="no">read_vm_log</code> are read-only.
               Tools that discard or overwrite state are marked destructive, including
               <code translate="no">download_file</code>, which writes to your Mac.

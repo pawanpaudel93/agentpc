@@ -10,6 +10,12 @@ The VMs are ARM64. x64 Windows apps run through Prism; x86_64 and i386 Linux pro
 
 Dated image tags (`…-YYYYMMDD`) select a published build and are download-only. An image push updates rolling tags but preserves existing dated tags; a refreshed rolling image can differ from its dated build. Publishers on different machines must serialize publication for a new date unless the registry enforces immutable tags.
 
+## Commands, jobs and looking
+
+`run_command` returns typed `structuredContent` (its `outputSchema`) next to the readable `exit code: N` text. Nonzero exits, timeouts and lost connections are tool errors. At a foreground run's `timeout` agentpc attempts to stop it and keeps its partial output; `termination_confirmed` says whether agentpc verified that none of the processes it identified is left (best effort on Windows; not a sandbox guarantee), and an unconfirmed stop, or a lost connection before the command's end was known (`connection_lost` with `effect_unknown: true`), sets `effect_unknown` and a `job_id` for `get_job_status` / `stop_job`. Commands are never retried automatically.
+
+`get_job_status` takes `wait_seconds` (0 to 30, default 0; a wait never stops the job) and `cursor` (a `next_cursor` or `"start"`; at most 16 KiB per reply, advancing by exactly the bytes returned, with an explicit `cursor_reset` when the log or VM changed). `inspect_desktop` is the read-only twin of `use_desktop_tool`: it runs only tools the VM's desktop driver explicitly marks read-only and refuses the rest before dispatching them. Full details: the MCP docs and AGENTS.md.
+
 ## Links
 
 - [Website](https://agentpc.pawanpaudel.com.np/)

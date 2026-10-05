@@ -182,15 +182,16 @@ pick the server up automatically.
 | `delete_checkpoint` | Delete one checkpoint by label; the VM is untouched |
 | `delete_vm` | Delete a VM with its disk and checkpoints |
 | `take_screenshot` | PNG screenshot from the hypervisor; `save_to` also writes it to a path on your Mac |
-| `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu and Arch); returns exit code, stdout and stderr. A foreground run is killed at `timeout` (default 120 s) with partial output; `background: true` returns a job id for `get_job_status` |
-| `get_job_status` | Check a background job by its id: running, exited (with its code), stopped, or ended without an exit code, plus the tail of its log |
-| `stop_job` | Stop a background job and everything it started (its systemd scope on Linux, which detached processes can't leave; its process tree on Windows). For a job that already exited, it stops only what the job left running |
+| `run_command` | Run a command (PowerShell on Windows, bash on Ubuntu and Arch); returns typed `structuredContent` plus the readable exit code, stdout and stderr (each stream trimmed to its first and last 10,000 characters). At a foreground run's `timeout` (default 120 s) agentpc attempts to stop it and keeps its partial output, and the reply says whether the stop was confirmed; `background: true` returns a job id for `get_job_status` |
+| `get_job_status` | Check a job by its id: queued, running, exited (with its code), stopped, ended without an exit code, or missing, plus its log. `wait_seconds` (0 to 30, default 0) waits without ever stopping the job; `cursor` reads the log incrementally. Also takes the `job_id` of a foreground run whose outcome was uncertain |
+| `stop_job` | Stop a background job (or a foreground run's `job_id`) and everything it started (on Linux its systemd scope, which processes that detach stay in, when the guest has a user manager, else the processes marked with the job and their descendants; on Windows its process tree). For a job that already exited, it stops only what the job left running |
 | `upload_file` / `download_file` | Copy files or folders between your Mac and a VM |
 | `forward_port` | Reach a server running in a VM from your Mac (TCP over an SSH tunnel, works even for servers bound to the guest's own `127.0.0.1`; or `protocol: "udp"` for a UDP server listening on `0.0.0.0`) |
 | `list_forwards` / `delete_forward` | List a VM's active port forwards / stop one by its host port (and optional protocol) |
 | `read_vm_log` | Read the tail of a VM's `qemu` or `serial` log, for when a VM won't boot or the desktop is unreachable |
-| `list_desktop_tools` | List the desktop-control tools inside a VM, with each one's required arguments and whether it's read-only; a wrong name returns close matches |
-| `use_desktop_tool` | Call one of them: click, type, launch apps, read the UI tree, … A call with wrong arguments or a wrong name returns the tool's arguments or close matches |
+| `list_desktop_tools` | List the desktop-control tools inside a VM, with each one's required arguments and whether it's read-only (or one tool's full schema, with its annotations); a wrong name returns close matches |
+| `use_desktop_tool` | Call one of them: click, type, launch apps, read the UI tree, … A call with wrong arguments or a wrong name returns the tool's arguments or close matches. Marked destructive |
+| `inspect_desktop` | The read-only twin of `use_desktop_tool`, with the same arguments: it runs a tool only if the VM's driver explicitly marks it read-only, and refuses anything else before dispatching it |
 
 If a desktop-tool reply starts with a reconnect note (the VM or its driver restarted), earlier
 snapshot ids and browser sessions are gone: take a new snapshot and run `browser_prepare` again.
@@ -202,10 +203,61 @@ next MCP server to start stops them; `list_vms` marks such VMs `owner_running: f
 bounded at about 45 s per VM (lock wait, ACPI shutdown, then a forced quit); a VM another
 session has taken over is left alone.
 
+#### Command results and job output
+
+`run_command` and `get_job_status` return `structuredContent` that matches the `outputSchema` they
+declare (`schema_version` 1), next to the readable text scripts have always parsed. The text is the
+legacy `exit code: N` / `STATE: ...` form in a single block, not a JSON copy, so clients that join text
+blocks see no extra output. Read the typed fields and `isError`; the full contract is in
+[AGENTS.md](AGENTS.md).
+
+- **`run_command`:** `state` is `exited`, `timed_out`, `not_started`, `connection_lost` or `started`. It
+  carries `exit_code`, `stdout`, `stderr` with byte counts and truncation flags, `termination_confirmed`,
+  `effect_unknown`, `recovery_action`, an `execution_id` (null only when the call failed before one was issued, such as an unknown VM) and, when you need a handle, a `job_id`.
+  Every nonzero exit, timeout, failed start or lost connection is a tool error, even a timed-out
+  command whose own exit code is known to be 0.
+- **Timeouts:** at `timeout`, agentpc attempts to stop the command and what it started and keeps the
+  partial stdout and stderr. `termination_confirmed: true` means it verified that none of the processes
+  it identified is left: on Linux the command's transient systemd user scope when the guest's user
+  manager is available, the processes marked with its execution id and their descendants (all that is
+  checked without a user manager), and its verified root; on Windows its verified process tree, best
+  effort. It is not a sandbox guarantee. System services, other systemd units and Windows services,
+  scheduled tasks and WMI-created processes are not covered. A command whose exit code the VM recorded
+  but whose run had not ended by the timeout (a child it left may have held its output, or it ended right
+  at the deadline) returns that exit code with `timed_out: true`, after cleanup verified that none of the
+  processes it identified remains. If it can't confirm the stop (`termination_confirmed: false`), or the
+  connection was lost before the command's end was known (`connection_lost` with `effect_unknown: true`),
+  `effect_unknown` is true and the `job_id` works with `get_job_status` and `stop_job`; a
+  `connection_lost` with `effect_unknown: false` carries the recorded `exit_code` and no `job_id`; commands are never retried automatically, and only `recovery_action: retry` means one
+  provably never ran. The reply follows a timeout within a few seconds usually, and about 50 seconds at
+  most.
+- **Foreground exit codes** are the low 8 bits SSH reports (Windows `exit -1` reads 255). A Linux
+  foreground command is limited to 92 KiB (94,208 UTF-8 bytes) of text, checked before anything is sent
+  (a bigger one is `not_started`, with no retry); for a bigger script, `upload_file` it and run the
+  file.
+- **`get_job_status`:** without `wait_seconds` or `cursor` it answers at once with the last `tail_lines`
+  lines (at most 16 KiB) and a `next_cursor`. With `wait_seconds` it waits for the job to leave `running`
+  (with a `cursor`, for new output) and returns the current state with `wait_timed_out: true` if
+  nothing happened; a wait never stops the job. A `cursor` (a `next_cursor`, or `"start"`) returns at most
+  16 KiB from that byte position and advances by exactly what it returned, so output is neither repeated
+  nor skipped; UTF-8 characters are never split. A cursor that no longer matches the log (VM reset or
+  restored, guest reboot, log replaced, shortened or rewritten) is reset and said so
+  (`cursor_reset`, `cursor_reset_reason`); that detection is best effort. `missing` means nothing has
+  recorded itself under the id yet, which doesn't prove it never started. An unreachable VM is an
+  error, never reported as `ended`.
+- **`inspect_desktop`** checks the driver's own `readOnlyHint` before each dispatch and refuses an
+  unmarked, unknown or not read-only tool before dispatching it, with nothing run (looking up the
+  annotations does ask the VM's driver). The marking is the driver's claim, a guard
+  against mistakes rather than a guarantee. Compact observation: `get_window_state` with
+  `include_screenshot: false` returns the element tree without a screenshot, and its `query` argument
+  narrows what comes back.
+
 ### Approval prompts
 
 Every desktop action goes through `use_desktop_tool`, which is marked destructive, so clients that
-confirm tool calls ask before each click or keystroke. To approve agentpc's tools up front:
+confirm tool calls ask before each click or keystroke. `inspect_desktop` is marked read-only and only
+runs tools the driver marks read-only, so clients can auto-approve looking while still confirming
+acting. To approve agentpc's tools up front:
 
 | Client | Setting |
 | --- | --- |
@@ -488,7 +540,8 @@ Mac's network (a VPN or proxy configured on the Mac applies to a VM's outbound t
 
 Rebooting a guest (a Windows Update install, some installers) drops the SSH connection. Call
 `start_vm` on the same VM — it waits until the desktop is ready again even when the VM is
-already running — or simply retry `run_command` once it's back.
+already running — then rerun the command. If its reply was `connection_lost` with
+`effect_unknown: true`, check what it did first with `get_job_status` and its `job_id`.
 
 ### Windows guest tips
 
@@ -615,7 +668,7 @@ To only reclaim disk space, `agentpc clean` deletes what can be downloaded again
   a VM with `--offline` (`offline: true` in `create_vm`) to cut both off, e.g. for untrusted
   software; SSH, the viewer and forwarded ports keep working.
 - The MCP tools carry annotations: `list_vms`, `take_screenshot`, `list_desktop_tools`,
-  `get_job_status`, `list_forwards` and `read_vm_log` are read-only, and tools that discard or overwrite state (including `download_file`, which writes
+  `inspect_desktop`, `get_job_status`, `list_forwards` and `read_vm_log` are read-only, and tools that discard or overwrite state (including `download_file`, which writes
   to your Mac) are marked destructive, so clients can auto-approve or confirm accordingly.
 - Treat VMs as throwaway sandboxes, not as a place for secrets.
 

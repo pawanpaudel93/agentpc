@@ -26,8 +26,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::execution::{self, Cancel, Captured, Probe, RecoveryAction, Reply, drain_ends};
+#[cfg(test)]
+use crate::execution::{CAPTURE_KEEP, clip};
 use crate::instance::{Image, Instance, Os};
-use crate::{ops, qemu};
+use crate::{jobs, ops, qemu};
 
 const INSTRUCTIONS: &str = "\
 Controls instant, resettable Windows, Ubuntu and Arch Linux ARM desktop VMs on this Mac. Treat
@@ -35,7 +38,7 @@ VMs as throwaway sandboxes. If list_vms shows an OS or image that create_vm's op
 list, your tool definitions predate an agentpc update: reconnect the agentpc MCP server.
 
 Flow: list_vms -> create_vm (or start_vm on one you created) -> take_screenshot -> list_desktop_tools ->
-use_desktop_tool(...) -> take_screenshot to verify. reset_vm returns an instance to a clean
+use_desktop_tool(...) (inspect_desktop(...) to only look) -> take_screenshot to verify. reset_vm returns an instance to a clean
 install; checkpoint_vm/restore_vm save and return to any point in seconds (disk and memory) --
 checkpoint before a risky or slow-to-redo step. run_command runs PowerShell on Windows and bash
 on Ubuntu and Arch; the guest login is agent/agent (SSH
@@ -73,6 +76,11 @@ element_index to click/type_text. On Ubuntu and Arch, keyboard/mouse input needs
 \"foreground\"; on Windows, typing into the focused field, scroll, drag and right-click often do.
 list_desktop_tools shows each tool's required arguments; a call with wrong arguments returns
 the tool's argument list, and a wrong tool name returns close matches (\"did you mean ...\").
+inspect_desktop takes the same arguments but is read-only: it runs a tool only if the VM's driver
+explicitly marks it read-only (list_desktop_tools shows [read-only]) and refuses anything else before
+dispatching it (looking up the marks does ask the VM's driver); the mark is the driver's own claim, a
+guard against mistakes. For a compact look,
+pass include_screenshot: false (and optionally query) to get_window_state: the element tree, no image.
 If a reply starts with a reconnect note (the VM or its driver restarted), snapshot ids and browser
 sessions are gone: take a new snapshot and run browser_prepare again.
 
@@ -102,8 +110,32 @@ Rules:
   a session that is gone; if it was yours (your session restarted), create_vm with its name and
   image takes it back.
 - Long jobs and servers: use run_command with background: true (it keeps running after the call
-  and returns a job id); poll it with get_job_status and end it with stop_job. Foreground run_command
-  times out (default 120 s).
+  and returns a job id); poll it with get_job_status and end it with stop_job. At a foreground
+  run_command's timeout (default 120 s) agentpc attempts to stop it and keeps its partial output.
+- run_command results: read structuredContent (state, exit_code, stdout, stderr, timed_out,
+  termination_confirmed, effect_unknown, execution_id, job_id, recovery_action) and isError; the text is
+  the readable form, not JSON. Every nonzero exit, timeout, failed start or lost connection is an error.
+  termination_confirmed: true means agentpc verified none of the processes it identified is left: on
+  Linux a systemd user scope when the guest has a user manager, else the marked processes and their
+  descendants, plus the verified root; on Windows the verified process tree, best effort. It is not a
+  sandbox guarantee: system services, other systemd units and Windows services, tasks and WMI-created
+  processes are not covered. A command whose exit code the VM recorded but whose run had not ended by the
+  timeout returns that exit code with timed_out true once that cleanup is verified. If
+  termination_confirmed is false, or the state is connection_lost with effect_unknown true, the command
+  may still be running: use job_id with get_job_status / stop_job and don't rerun it before you know.
+  connection_lost with effect_unknown false means the VM recorded its exit_code (it finished; output may
+  be incomplete) and job_id is null. Commands are never retried for you; only
+  recovery_action \"retry\" means it provably never ran. After a timeout the reply can take up to about 50
+  s longer while agentpc finishes and verifies its cleanup. A Linux foreground command is limited to
+  92 KiB (94,208 UTF-8 bytes) of text, checked before anything is sent: upload_file a bigger script and
+  run it.
+- Watching a job: get_job_status {name, id} answers at once with the log tail and a next_cursor.
+  wait_seconds (0 to 30, default 0) waits for the job to leave running (with a cursor: for new output)
+  and never stops it; wait_timed_out says the wait ran out. Pass cursor (a next_cursor, or \"start\") to
+  read new output only: at most 16 KiB a reply, advancing by exactly what it returned, UTF-8 safe;
+  has_more says call again. If cursor_reset is true (VM reset, reboot, log replaced or rewritten;
+  detection is best effort) discard what you assumed: output restarts at the log's beginning. missing
+  means nothing has recorded itself under that id yet, not that it never started: don't blindly retry.
 - Reach a server in the VM from the Mac with forward_port (works even for servers bound to the
   guest's own 127.0.0.1); it returns a 127.0.0.1:<port> address and lasts until the VM stops.
   For a UDP server pass protocol: \"udp\"; it must listen on 0.0.0.0 (on Windows, also allow
@@ -112,8 +144,8 @@ Rules:
   delete_forward manage them. From inside the guest, 10.0.2.2 reaches this Mac.
 - Don't start a Windows image build yourself -- if no Windows image exists, ask the user to
   build one (~12 min).
-- Output from run_command is trimmed to the first and last 10,000 characters per stream; write big
-  output to a file in the VM and download_file it.
+- Output from run_command is trimmed to the first and last 10,000 characters per stream
+  (output_truncated says so); write big output to a file in the VM and download_file it.
 - Don't put real credentials or secrets into a VM; VMs are reachable from anything on this Mac.
 ";
 
@@ -177,6 +209,9 @@ struct Gateway {
     /// Per VM, the desktop tools its driver marks read-only: only those are re-sent after a
     /// dropped connection.
     read_only: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// Test seam: drivers `session` hands out, in order, instead of connecting over SSH.
+    #[cfg(test)]
+    dials: Arc<Mutex<std::collections::VecDeque<RunningService<RoleClient, ()>>>>,
 }
 
 impl Gateway {
@@ -193,6 +228,8 @@ impl Gateway {
             connected: Default::default(),
             reconnected: Default::default(),
             read_only: Default::default(),
+            #[cfg(test)]
+            dials: Default::default(),
             exe: std::env::current_exe()
                 .ok()
                 .and_then(|p| exe_id(&p).map(|id| (p, id))),
@@ -366,7 +403,8 @@ struct CheckpointArgs {
 struct ExecArgs {
     name: String,
     command: String,
-    /// Seconds to wait for the command (default 120). Ignored with `background`.
+    /// Seconds to wait for the command (default 120); at the timeout agentpc stops it, and what
+    /// it started, in the VM. Ignored with `background`.
     #[serde(default = "default_timeout")]
     timeout: u64,
     /// Start the command detached and return at once, for servers and long jobs: it keeps
@@ -460,17 +498,29 @@ struct RemoveForwardArgs {
 #[derive(Deserialize, JsonSchema)]
 struct JobArgs {
     name: String,
-    /// Job id returned by a `background: true` run_command.
+    /// Job id returned by run_command: a `background: true` job's, or the job_id of a
+    /// foreground run whose outcome was uncertain.
     id: u64,
-    /// Lines of the log to return from the end (default 50).
+    /// Lines of the log to return from the end (default 50); at most 16 KiB come back. Ignored
+    /// when `cursor` is given.
     #[serde(default = "default_tail")]
     tail_lines: usize,
+    /// Seconds to wait (default 0, maximum 30) for the job to finish or, with a `cursor`, for
+    /// new output. The job is never stopped; when the wait runs out the current state comes
+    /// back with `wait_timed_out: true`.
+    #[serde(default)]
+    #[schemars(range(min = 0, max = 30))]
+    wait_seconds: u64,
+    /// A `next_cursor` from an earlier reply about this job, or "start": returns the log from
+    /// that position instead of its tail (at most 16 KiB per reply), with the next cursor.
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct StopJobArgs {
     name: String,
-    /// Job id returned by a `background: true` run_command.
+    /// Job id returned by run_command: a `background: true` job's, or the job_id of a
+    /// foreground run whose outcome was uncertain.
     id: u64,
 }
 
@@ -827,12 +877,20 @@ impl Gateway {
         description = "Run a shell command in the instance over SSH: PowerShell on windows, bash on ubuntu and arch.\n\
                           Returns the exit code, stdout and stderr; each stream is trimmed to its first and\n\
                           last 10,000 characters (write big output to a file and download_file it).\n\
-                          Foreground runs are killed at `timeout` seconds (default 120) with their partial\n\
-                          output returned; for servers or anything slow, pass background: true -- it keeps\n\
-                          running after the call, returns a job id, and you poll it with get_job_status and end\n\
-                          it with stop_job. A GUI\n\
+                          At `timeout` seconds (default 120) agentpc attempts to stop a foreground run, with what\n\
+                          it started in the VM (best effort on Windows, where a process whose launcher has\n\
+                          already exited can be missed), and returns its partial output; if the stop can't be\n\
+                          confirmed (or the connection fails before its end is known), the reply says so and gives a job_id for\n\
+                          get_job_status / stop_job. Commands are never retried. A Linux foreground command is\n\
+                          limited to 92 KiB (94,208 UTF-8 bytes) of text, checked before sending (upload_file a bigger script and run it). For servers\n\
+                          or anything slow,\n\
+                          pass background: true -- it keeps running after the call, returns a job id, and you\n\
+                          poll it with get_job_status and end it with stop_job. Structured content carries the\n\
+                          same outcome as typed fields (state, exit_code, timed_out, termination_confirmed,\n\
+                          effect_unknown, job_id, ...). A GUI\n\
                           installer run in the foreground should be waited on (e.g. PowerShell\n\
                           `Start-Process -Wait -PassThru`) or it returns before the install finishes.",
+        output_schema = execution::output_schema(),
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -841,9 +899,11 @@ impl Gateway {
     )]
     async fn run_command(&self, Parameters(a): Parameters<ExecArgs>) -> CallToolResult {
         if a.background {
-            return text(exec_background(&a.name, &a.command).await);
+            return exec_background(&a.name, &a.command).await.into_result();
         }
-        text(exec(&a.name, &a.command, a.timeout, true).await)
+        run_tracked(&a.name, &a.command, a.timeout)
+            .await
+            .into_result()
     }
 
     #[tool(
@@ -914,7 +974,7 @@ impl Gateway {
     #[tool(
         title = "List desktop tools",
         description = "List the desktop-control tools available in an instance (name + summary), or the full\n\
-                          input schema of one tool when `tool` is given. Call them with `use_desktop_tool`. A wrong tool\n\
+                          input schema of one tool when `tool` is given. Act with `use_desktop_tool`; look with `inspect_desktop` ([read-only] ones only). A wrong tool\n\
                           name returns close matches.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
@@ -968,9 +1028,12 @@ impl Gateway {
                     }
                 );
             };
-            Ok(serde_json::to_string_pretty(
-                &json!({"name": t.name, "description": t.description, "input_schema": t.input_schema}),
-            )?)
+            Ok(serde_json::to_string_pretty(&json!({
+                "name": t.name,
+                "description": t.description,
+                "annotations": t.annotations,
+                "input_schema": t.input_schema,
+            }))?)
         };
         text(r.await)
     }
@@ -979,7 +1042,8 @@ impl Gateway {
         title = "Use desktop tool",
         description = "Call a desktop-control tool inside an instance (see list_desktop_tools for names and schemas).\n\
                           Screenshots and other content are returned as-is. A wrong tool name returns close\n\
-                          matches; wrong arguments return the tool's argument list.",
+                          matches; wrong arguments return the tool's argument list. This is the route for tools that\n\
+                          act (click, type, launch); to only look, prefer inspect_desktop.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -987,107 +1051,61 @@ impl Gateway {
         )
     )]
     async fn use_desktop_tool(&self, Parameters(a): Parameters<DesktopArgs>) -> CallToolResult {
-        let params = CallToolRequestParams::new(a.tool.clone())
-            .with_arguments(a.arguments.unwrap_or_default());
-        let retry = self.read_only_tool(&a.name, &a.tool).await;
-        let r = self
-            .with_session(&a.name, &a.tool, retry, |c: Client| {
-                let params = params.clone();
-                async move { c.call_tool(params).await }
-            })
-            .await;
-        let failure = match r {
-            Ok(res) if res.is_error == Some(true) => {
-                let msg: Vec<&str> = res
-                    .content
-                    .iter()
-                    .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
-                    .collect();
-                let msg = msg.join(" ");
-                if msg.is_empty() {
-                    format!("{} failed", a.tool)
-                } else {
-                    msg
-                }
-            }
-            Ok(res) => {
-                // Inner servers (cua-driver's browser tools) put ids like tab_id only in
-                // structured content, and many clients show only text, so mirror it as text.
-                let mut content = res.content;
-                if let Some(sc) = &res.structured_content {
-                    let json = serde_json::to_string_pretty(sc).unwrap_or_default();
-                    if !content
-                        .iter()
-                        .any(|c| c.as_text().is_some_and(|t| t.text.contains(&json)))
-                    {
-                        content.push(ContentBlock::text(json));
-                    }
-                }
-                let mut out = CallToolResult::success(content);
-                out.structured_content = res.structured_content;
-                return self.noted(&a.name, out);
-            }
-            Err(e) => format!("{e:#}"),
-        };
-        // A wrong guess at a tool's name or arguments is the usual failure: answer it with the
-        // right names or the arguments, so the next call can be right without another lookup.
-        // (cua-driver reports an unknown name as a permission error, so check names here.)
-        let tools = self
-            .with_session(&a.name, "list_tools", true, |c: Client| async move {
-                c.list_all_tools().await
-            })
-            .await
-            .ok();
-        let hint = match tools
-            .as_deref()
-            .map(|ts| (ts, ts.iter().find(|t| t.name == a.tool)))
-        {
-            Some((ts, None)) => {
-                let names: Vec<&str> = ts.iter().map(|t| t.name.as_ref()).collect();
-                let near = similar(&a.tool, &names);
-                format!(
-                    "\n\nThere is no desktop tool named \"{}\" in {}{}; list_desktop_tools lists them.",
-                    a.tool,
-                    a.name,
-                    if near.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" (did you mean {}?)", near.join(", "))
-                    }
-                )
-            }
-            Some((_, Some(t))) if is_argument_error(&failure) => format!(
-                "\n\n{} arguments (* = required): {}\nFull schema: list_desktop_tools with tool=\"{}\".",
-                a.tool,
-                arguments(&t.input_schema),
-                a.tool
-            ),
-            _ => String::new(),
-        };
-        self.noted(
-            &a.name,
-            CallToolResult::error(vec![ContentBlock::text(failure + &hint)]),
+        self.desktop_call(a, DesktopRoute::Use).await
+    }
+
+    #[tool(
+        title = "Inspect desktop",
+        description = "Read-only twin of use_desktop_tool, with the same arguments (name, tool, arguments): runs a\n\
+                          desktop tool only if that VM's desktop driver explicitly marks it read-only (list_desktop_tools\n\
+                          shows [read-only]), e.g. get_window_state. Anything else,\n\
+                          including a tool with no read-only mark or an unknown name, is refused before it is dispatched, with\n\
+                          nothing run (looking up the marks does ask the driver); use use_desktop_tool for tools that act. The mark is the driver's own claim, checked\n\
+                          against the driver connected at the time of each attempt: a safeguard against mistakes, not a\n\
+                          guarantee against a driver or guest that mislabels a tool. Output and errors are the same as\n\
+                          use_desktop_tool's.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = true
         )
+    )]
+    async fn inspect_desktop(&self, Parameters(a): Parameters<DesktopArgs>) -> CallToolResult {
+        self.desktop_call(a, DesktopRoute::Inspect).await
     }
 
     #[tool(
         name = "get_job_status",
         title = "Get job status",
         description = "Check on a background job started by run_command (background: true), by the id it\n\
-                          returned: running, exited (with its code), stopped by stop_job, or ended without an\n\
-                          exit code (killed, or the VM restarted), plus the tail of its log.",
+                          returned: queued, running, exited (with its code), stopped, ended without an exit\n\
+                          code (killed, or the VM restarted), or missing (nothing has recorded itself under\n\
+                          that id; a lost launch may still arrive), plus its log. Also takes the job_id of a\n\
+                          foreground run_command whose outcome was uncertain (its output went to that reply, so\n\
+                          there is no log). The result is structured (state, exit_code, log_tail or output,\n\
+                          next_cursor, cursor_reset, wait_timed_out, output_truncated; an unreachable VM is an\n\
+                          error with state unknown, never 'ended'). Without cursor it returns the log's last\n\
+                          tail_lines lines and a next_cursor at the end of what it read. With cursor (a\n\
+                          next_cursor, or \"start\") it returns the log from there, at most 16 KiB, and the\n\
+                          cursor to continue from, so no output repeats or is lost; a cursor that no longer\n\
+                          matches the log (VM reset, reboot, log replaced or truncated) is reset, said so, and\n\
+                          reads from the log's start. wait_seconds (0 to 30, default 0) waits for the job to\n\
+                          finish (with a cursor: or for new output) without ever stopping it. Read-only.",
+        output_schema = jobs::output_schema(),
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn job_status(&self, Parameters(a): Parameters<JobArgs>) -> CallToolResult {
-        text(job_status(&a.name, a.id, a.tail_lines).await)
+        job_status(a).await
     }
 
     #[tool(
         name = "stop_job",
         title = "Stop job",
-        description = "Stop a background job started by run_command (background: true): the job and every\n\
-                          process it started (on Linux, its systemd scope, even processes that detached; on\n\
-                          Windows, its process tree).\n\
+        description = "Stop a background job started by run_command (background: true), or a foreground\n\
+                          run's job_id: the job and every\n\
+                          process it started (on Linux, its systemd scope when the guest has a user manager, which\n\
+                          processes that detached stay in, else the processes marked with the job and their\n\
+                          descendants; on Windows, its process tree).\n\
                           get_job_status then reports it as stopped. For a job that already exited, it\n\
                           stops only what the job left running (a server it started) and keeps its exit code.",
         annotations(
@@ -1190,6 +1208,152 @@ impl ServerHandler for Gateway {
 }
 
 impl Gateway {
+    /// Both desktop routes: `use_desktop_tool` sends the call as it is; `inspect_desktop` first
+    /// checks, on the connection each attempt uses, that the driver marks `tool` read-only, and
+    /// otherwise sends nothing. The reply (images, mirrored structured content, error hints,
+    /// reconnect note) is the same either way. Neither route falls back to the other.
+    async fn desktop_call(&self, a: DesktopArgs, route: DesktopRoute) -> CallToolResult {
+        let DesktopArgs {
+            name,
+            tool,
+            arguments: call_args,
+        } = a;
+        let params =
+            CallToolRequestParams::new(tool.clone()).with_arguments(call_args.unwrap_or_default());
+        let inspect = route == DesktopRoute::Inspect;
+        // `use_desktop_tool` may re-send after a dropped connection only a call that was
+        // read-only on the connection it was sent on and still is on the one it is re-sent
+        // to; both are checked at the attempt itself, on that attempt's connection, never
+        // taken from the per-VM cache. The cache only decides whether an attempt asks at all:
+        // a tool it does not know as read-only is sent once and never re-sent. An inspection
+        // is classified on every attempt, so it can always be retried.
+        let ask = !inspect && self.read_only_tool(&name, &tool).await;
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        let proven = std::sync::atomic::AtomicBool::new(false);
+        let r = self
+            .with_session_gated(
+                &name,
+                &tool,
+                // Nothing sent yet: re-sending is no repeat. Otherwise only on proof.
+                || {
+                    inspect
+                        || !sent.load(std::sync::atomic::Ordering::SeqCst)
+                        || proven.load(std::sync::atomic::Ordering::SeqCst)
+                },
+                |c: Client| {
+                    let params = params.clone();
+                    let (name, tool) = (name.clone(), tool.clone());
+                    let (sent, proven) = (&sent, &proven);
+                    async move {
+                        use std::sync::atomic::Ordering::SeqCst;
+                        let resend = sent.load(SeqCst);
+                        if inspect || ask || resend {
+                            let tools = c.list_all_tools().await?;
+                            let verdict = inspect_verdict(&tools, &name, &tool);
+                            if inspect {
+                                if let Err(refusal) = verdict {
+                                    return Ok(Dispatch::Refused(refusal));
+                                }
+                            } else if resend && verdict.is_err() {
+                                return Ok(Dispatch::Refused(Refusal {
+                                    message: format!(
+                                        "use_desktop_tool did not re-send \"{tool}\" in {name}: the \
+                                         connection dropped after it was sent, and the reconnected \
+                                         desktop driver does not explicitly mark it read-only, so whether \
+                                         the first send took effect is unknown. Look first (a new \
+                                         screenshot or get_window_state) before repeating it."
+                                    ),
+                                    unknown_tool: false,
+                                }));
+                            } else {
+                                proven.store(verdict.is_ok(), SeqCst);
+                            }
+                        }
+                        sent.store(true, SeqCst);
+                        c.call_tool(params).await.map(Dispatch::Done)
+                    }
+                },
+            )
+            .await;
+        let failure = match r {
+            Ok(Dispatch::Refused(refusal)) => {
+                if !refusal.unknown_tool {
+                    return self.noted(
+                        &name,
+                        CallToolResult::error(vec![ContentBlock::text(refusal.message)]),
+                    );
+                }
+                refusal.message
+            }
+            Ok(Dispatch::Done(res)) if res.is_error == Some(true) => {
+                let msg: Vec<&str> = res
+                    .content
+                    .iter()
+                    .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+                    .collect();
+                let msg = msg.join(" ");
+                if msg.is_empty() {
+                    format!("{tool} failed")
+                } else {
+                    msg
+                }
+            }
+            Ok(Dispatch::Done(res)) => {
+                // Inner servers (cua-driver's browser tools) put ids like tab_id only in
+                // structured content, and many clients show only text, so mirror it as text.
+                let mut content = res.content;
+                if let Some(sc) = &res.structured_content {
+                    let json = serde_json::to_string_pretty(sc).unwrap_or_default();
+                    if !content
+                        .iter()
+                        .any(|c| c.as_text().is_some_and(|t| t.text.contains(&json)))
+                    {
+                        content.push(ContentBlock::text(json));
+                    }
+                }
+                let mut out = CallToolResult::success(content);
+                out.structured_content = res.structured_content;
+                return self.noted(&name, out);
+            }
+            Err(e) => format!("{e:#}"),
+        };
+        // A wrong guess at a tool's name or arguments is the usual failure: answer it with the
+        // right names or the arguments, so the next call can be right without another lookup.
+        // (cua-driver reports an unknown name as a permission error, so check names here.)
+        let tools = self
+            .with_session(&name, "list_tools", true, |c: Client| async move {
+                c.list_all_tools().await
+            })
+            .await
+            .ok();
+        let hint = match tools
+            .as_deref()
+            .map(|ts| (ts, ts.iter().find(|t| t.name == tool)))
+        {
+            Some((ts, None)) => {
+                let names: Vec<&str> = ts.iter().map(|t| t.name.as_ref()).collect();
+                let near = similar(&tool, &names);
+                format!(
+                    "\n\nThere is no desktop tool named \"{tool}\" in {name}{}; list_desktop_tools lists them.",
+                    if near.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (did you mean {}?)", near.join(", "))
+                    }
+                )
+            }
+            Some((_, Some(t))) if is_argument_error(&failure) => format!(
+                "\n\n{tool} arguments (* = required): {}\nFull schema: list_desktop_tools with tool=\"{tool}\".",
+                arguments(&t.input_schema),
+            ),
+            _ => String::new(),
+        };
+        self.noted(
+            &name,
+            CallToolResult::error(vec![ContentBlock::text(failure + &hint)]),
+        )
+    }
+
     /// A lifecycle op invalidates the desktop session (guest restarted or gone).
     async fn lifecycle(
         &self,
@@ -1234,6 +1398,20 @@ impl Gateway {
         }
     }
 
+    #[cfg(not(test))]
+    async fn dial(&self, name: &str) -> Result<RunningService<RoleClient, ()>> {
+        connect(name).await
+    }
+
+    #[cfg(test)]
+    async fn dial(&self, name: &str) -> Result<RunningService<RoleClient, ()>> {
+        let fake = self.dials.lock().unwrap().pop_front();
+        match fake {
+            Some(c) => Ok(c),
+            None => connect(name).await,
+        }
+    }
+
     async fn session(&self, name: &str) -> Result<Client> {
         let slot = self
             .sessions
@@ -1246,8 +1424,11 @@ impl Gateway {
         if let Some(c) = slot.as_ref().filter(|c| !c.is_closed()) {
             return Ok(c.clone());
         }
-        let c = Arc::new(connect(name).await?);
+        let c = Arc::new(self.dial(name).await?);
         *slot = Some(c.clone());
+        // A new connection may be a restarted guest and driver: what the old one marked
+        // read-only says nothing about this one.
+        self.read_only.lock().unwrap().remove(name);
         if !self.connected.lock().unwrap().insert(name.to_string()) {
             self.reconnected.lock().unwrap().insert(name.to_string());
         }
@@ -1262,6 +1443,21 @@ impl Gateway {
         name: &str,
         what: &str,
         retry: bool,
+        f: impl Fn(Client) -> F,
+    ) -> Result<T>
+    where
+        F: Future<Output = Result<T, ServiceError>>,
+    {
+        self.with_session_gated(name, what, || retry, f).await
+    }
+
+    /// `with_session`, with the decision to re-send taken when a call fails rather than before
+    /// it, so it can rest on what the attempts themselves found out.
+    async fn with_session_gated<T, F>(
+        &self,
+        name: &str,
+        what: &str,
+        retry: impl Fn() -> bool,
         f: impl Fn(Client) -> F,
     ) -> Result<T>
     where
@@ -1286,7 +1482,7 @@ impl Gateway {
                 }
                 Ok(Err(e)) => {
                     self.drop_client(name, &used).await;
-                    if !retry {
+                    if !retry() {
                         return Err(unknown(format!(
                             "the connection to the desktop driver dropped ({e})"
                         )));
@@ -1297,7 +1493,7 @@ impl Gateway {
                 }
                 Err(_) => {
                     self.drop_client(name, &used).await;
-                    if !retry {
+                    if !retry() {
                         return Err(unknown(format!(
                             "no reply within {}s",
                             DESKTOP_CALL_TIMEOUT.as_secs()
@@ -1314,6 +1510,55 @@ impl Gateway {
         }
         unreachable!()
     }
+}
+
+/// Which desktop route a call came in by.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DesktopRoute {
+    /// `use_desktop_tool`: any tool, never re-sent after a drop unless read-only.
+    Use,
+    /// `inspect_desktop`: only tools the driver explicitly marks read-only.
+    Inspect,
+}
+
+/// What one desktop attempt came to: the driver's reply, or `inspect_desktop`'s refusal made
+/// before anything was sent.
+enum Dispatch {
+    Done(CallToolResult),
+    Refused(Refusal),
+}
+
+struct Refusal {
+    message: String,
+    /// The driver has no tool of that name (so the reply can suggest close names).
+    unknown_tool: bool,
+}
+
+/// Whether `inspect_desktop` may run `tool` given the active driver's tool list: only with an
+/// explicit `readOnlyHint: true`. A missing tool, annotations or hint all fail closed.
+fn inspect_verdict(tools: &[rmcp::model::Tool], vm: &str, tool: &str) -> Result<(), Refusal> {
+    let Some(t) = tools.iter().find(|t| t.name == tool) else {
+        return Err(Refusal {
+            message: format!(
+                "inspect_desktop did not run \"{tool}\" in {vm}: the desktop driver has no such \
+                 tool. Nothing was sent to the VM."
+            ),
+            unknown_tool: true,
+        });
+    };
+    let mark = match t.annotations.as_ref().and_then(|a| a.read_only_hint) {
+        Some(true) => return Ok(()),
+        Some(false) => "marks it as not read-only",
+        None => "does not say whether it is read-only",
+    };
+    Err(Refusal {
+        message: format!(
+            "inspect_desktop did not run \"{tool}\" in {vm}: the desktop driver {mark}, and \
+             inspect_desktop runs only tools it explicitly marks read-only. Nothing was sent to \
+             the VM. If the tool is meant to act, call it with use_desktop_tool."
+        ),
+        unknown_tool: false,
+    })
 }
 
 async fn connect(name: &str) -> Result<RunningService<RoleClient, ()>> {
@@ -1381,12 +1626,16 @@ exit 0"#,
     }
 }
 
-/// Characters kept from each end of a long stdout or stderr.
-const OUTPUT_KEEP: usize = 10_000;
-
 /// A single desktop-control tool call may take a while (typing, waits) but must not hang forever.
-const DESKTOP_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+const DESKTOP_CALL_TIMEOUT: Duration = if cfg!(test) {
+    // Short, so a test driver that never answers exercises the reconnect path quickly.
+    Duration::from_millis(1500)
+} else {
+    Duration::from_secs(120)
+};
 
+/// Low-level command for agentpc's own scripts (job status, stop, probes): the plain SSH
+/// session, untracked, killed at `timeout`. User commands go through `run_tracked`.
 async fn exec(name: &str, command: &str, timeout: u64, desktop_env: bool) -> Result<String> {
     let inst = load(name)?;
     if !inst.running() {
@@ -1399,8 +1648,44 @@ async fn exec(name: &str, command: &str, timeout: u64, desktop_env: bool) -> Res
         (true, false) => command.to_string(),
         (false, _) => ops::windows_command(command),
     };
+    let raw = ssh_raw(&inst, &command, timeout).await?;
+    let text = raw.text(timeout);
+    if raw.timed_out || raw.code != Some(0) {
+        bail!("{text}");
+    }
+    Ok(text)
+}
+
+/// What one plain SSH command did.
+struct Raw {
+    /// ssh's exit code (255 when it couldn't connect; the command's own otherwise); None
+    /// when it timed out or died of a signal.
+    code: Option<i32>,
+    timed_out: bool,
+    stdout: Captured,
+    stderr: Captured,
+}
+
+impl Raw {
+    /// The reply text `exec` has always given: `exit code: N` (or the timeout), then the
+    /// output sections.
+    fn text(&self, timeout: u64) -> String {
+        let head = if self.timed_out {
+            format!(
+                "timed out after {timeout}s. The SSH session was closed, but the command may still \
+                 be running in the VM (find it with ps or Get-Process). Use background: true for \
+                 long jobs.\n(partial output below)"
+            )
+        } else {
+            format!("exit code: {}", self.code.unwrap_or(-1))
+        };
+        head + &execution::sections(&self.stdout.text(), &self.stderr.text())
+    }
+}
+
+async fn ssh_raw(inst: &Instance, remote: &str, timeout: u64) -> Result<Raw> {
     let mut child = tokio::process::Command::new("ssh")
-        .args(ops::ssh_args(&inst, &command))
+        .args(ops::ssh_args(inst, remote))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1419,41 +1704,119 @@ async fn exec(name: &str, command: &str, timeout: u64, desktop_env: bool) -> Res
     }
     let stdout = read_out.await.unwrap_or_default();
     let stderr = read_err.await.unwrap_or_default();
-    // ssh exits 255 when it can't connect; the command's own code otherwise.
     let code = match &status {
-        Ok(Ok(s)) => s.code().unwrap_or(-1),
-        _ => -1,
+        Ok(Ok(s)) => s.code(),
+        _ => None,
     };
-    let head = if timed_out {
-        format!(
-            "timed out after {timeout}s. The SSH session was closed, but the command may still \
-             be running in the VM (find it with ps or Get-Process). Use background: true for \
-             long jobs.\n(partial output below)"
-        )
-    } else {
-        format!("exit code: {code}")
+    Ok(Raw {
+        code,
+        timed_out,
+        stdout,
+        stderr,
+    })
+}
+
+/// Run a user's foreground command, tracked (see `execution`): recorded in the VM before it
+/// starts, stopped there at its timeout, and judged without guessing from text.
+async fn run_tracked(name: &str, command: &str, timeout: u64) -> Reply {
+    let inst = match load(name) {
+        Ok(inst) => inst,
+        Err(e) => return Reply::not_started(format!("{e:#}"), None),
     };
-    let mut text = head;
-    for (label, out) in [("stdout", &stdout), ("stderr", &stderr)] {
-        let s = out.text();
-        if !s.is_empty() {
-            text += &format!("\n--- {label} ---\n{s}");
+    // Too big to send: refused before any id is issued or anything reaches the VM.
+    if matches!(inst.os, Os::Ubuntu | Os::Arch)
+        && let Some(refused) = execution::linux_foreground_too_large(command)
+    {
+        return refused;
+    }
+    if !inst.running() {
+        return Reply::not_started(
+            format!("VM {name} is not running; start_vm first"),
+            Some(RecoveryAction::StartVm),
+        );
+    }
+    let id = job_id();
+    let remote = match inst.os {
+        Os::Ubuntu | Os::Arch => execution::linux_foreground(id, command, ops::LINUX_SESSION_ENV),
+        Os::Windows => execution::windows_foreground(id, command),
+    };
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.args(ops::ssh_args(&inst, &remote));
+    let limits = execution::Limits::DEFAULT;
+    let facts = execution::run_foreground(
+        cmd,
+        id,
+        Duration::from_secs(timeout),
+        limits,
+        || cancel_execution(&inst, id, limits.cancel),
+        || probe_execution(&inst, id, limits.probe),
+    )
+    .await;
+    match facts {
+        Ok(f) => execution::conclude(f, id, name, timeout),
+        Err(e) => Reply::spawn_failed(id, format!("run ssh: {e}")),
+    }
+}
+
+/// Stop a timed-out foreground execution with `stop_job`'s script in cancel mode; its exit
+/// code (not its text) says what it found.
+async fn cancel_execution(inst: &Instance, id: u64, deadline: Duration) -> Cancel {
+    let script = stop_job_script(inst.os, id, true);
+    let remote = match inst.os {
+        Os::Ubuntu | Os::Arch => script,
+        Os::Windows => ops::windows_command(&script),
+    };
+    let raw = match ssh_raw(inst, &remote, deadline.as_secs()).await {
+        Ok(raw) => raw,
+        Err(e) => return Cancel::Unconfirmed(format!("{e:#}")),
+    };
+    Cancel::from_stop(
+        raw.code,
+        raw.timed_out,
+        &format!("{}\n{}", raw.stdout.text(), raw.stderr.text()),
+        deadline.as_secs(),
+    )
+}
+
+/// After a failed connection: what the VM's records say (and make sure an execution that
+/// never recorded itself never starts).
+async fn probe_execution(inst: &Instance, id: u64, deadline: Duration) -> Probe {
+    let remote = match inst.os {
+        Os::Ubuntu | Os::Arch => execution::linux_probe(id),
+        Os::Windows => ops::windows_command(&execution::windows_probe(id)),
+    };
+    match ssh_raw(inst, &remote, deadline.as_secs()).await {
+        Err(e) => Probe::Failed(format!("{e:#}")),
+        Ok(raw) if raw.timed_out => {
+            Probe::Failed(format!("no answer within {}s", deadline.as_secs()))
         }
+        Ok(raw) if raw.code != Some(0) => Probe::Failed(match raw.code {
+            Some(c) => format!("ssh exited with code {c}"),
+            None => "ssh ended without an exit code".into(),
+        }),
+        Ok(raw) => Probe::parse(&raw.stdout.text()),
     }
-    if timed_out || code != 0 {
-        bail!("{text}");
-    }
-    Ok(text)
 }
 
 /// Start `command` detached from the SSH session, which would otherwise take it down when it
 /// ends. On Windows that means a scheduled task in the logged-in session (so GUI apps show).
 /// The command travels base64-encoded, so no quoting can break it.
-async fn exec_background(name: &str, command: &str) -> Result<String> {
+async fn exec_background(name: &str, command: &str) -> Reply {
     use base64::Engine;
-    let inst = load(name)?;
+    let refused = |text: String, recovery| {
+        let mut r = Reply::not_started(text, recovery);
+        r.outcome.background = true;
+        r
+    };
+    let inst = match load(name) {
+        Ok(inst) => inst,
+        Err(e) => return refused(format!("{e:#}"), None),
+    };
     if !inst.running() {
-        bail!("VM {name} is not running; start_vm first");
+        return refused(
+            format!("VM {name} is not running; start_vm first"),
+            Some(RecoveryAction::StartVm),
+        );
     }
     let id = job_id();
     // On Windows, as in the foreground: a failed last command (a cmdlet error sets no exit
@@ -1469,25 +1832,9 @@ async fn exec_background(name: &str, command: &str) -> Result<String> {
     };
     let b64 = base64::engine::general_purpose::STANDARD.encode(script);
     let script = match inst.os {
-        // Separate lines: `a && b &` would background the whole list, and that shell would
-        // hold the SSH session open. The wrapper records the exit code in <id>.exit so
-        // get_job_status can report it after the job ends. The job runs in its own systemd
-        // scope (a cgroup no process can leave, even one that clears its environment and
-        // detaches), so stop_job finds everything it started; AGENTPC_JOB, which every process
-        // it starts inherits, covers a guest without a user systemd.
-        Os::Ubuntu | Os::Arch => format!(
-            "d=~/agentpc-bg; mkdir -p $d && echo {b64} | base64 -d > $d/{id}.sh || exit 1\n\
-             run=; {env} systemctl --user show-environment >/dev/null 2>&1 && \
-             run='systemd-run --user --scope --quiet --unit=agentpc-job-{id} --'\n\
-             {env} AGENTPC_JOB={id} setsid nohup $run bash -c 'bash \"$0\"; echo $? > \"$1\"' \
-             $d/{id}.sh $d/{id}.exit > $d/{id}.log 2>&1 < /dev/null &\n\
-             echo $! > $d/{id}.pid\n\
-             echo \"started in the background (id {id}, pid $!). \
-             Poll it with get_job_status name={name} id={id}. \
-             Output: $HOME/agentpc-bg/{id}.log. Stop it with stop_job name={name} id={id}.\"",
-            env = ops::LINUX_SESSION_ENV
-        ),
-        Os::Windows => format!(
+        // See `execution::linux_background`.
+        Os::Ubuntu | Os::Arch => execution::linux_background(id, &b64, ops::LINUX_SESSION_ENV),
+        Os::Windows => ops::windows_command(&format!(
             r#"$d = "$env:USERPROFILE\agentpc-bg"; New-Item -ItemType Directory -Force $d | Out-Null
 $ps = "$d\{id}.ps1"; $log = "$d\{id}.log"; $exit = "$d\{id}.exit"; $task = 'agentpc-bg-{id}'
 # A BOM, or Windows PowerShell 5.1 reads the script as ANSI.
@@ -1498,53 +1845,133 @@ $p = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -Ru
 $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $task -Action $a -Principal $p -Settings $s -Force | Out-Null
 Start-ScheduledTask -TaskName $task
-"started in the background as scheduled task $task (id {id}). Poll it with get_job_status name={name} id={id}. Output: $log. Stop it with stop_job name={name} id={id}.""#
+$log"#
+        )),
+    };
+    let raw = match ssh_raw(&inst, &script, 60).await {
+        Ok(raw) => raw,
+        Err(e) => return execution::background_failed(id, format!("{e:#}"), false, name),
+    };
+    let failure = raw.text(60);
+    match raw.code {
+        Some(0) if !raw.timed_out => {}
+        // The connection failed or hung: the job may have started anyway.
+        Some(255) | None => return execution::background_failed(id, failure, true, name),
+        Some(_) => return execution::background_failed(id, failure, false, name),
+    }
+    let printed = raw.stdout.text();
+    let lines: Vec<&str> = printed.lines().map(str::trim).collect();
+    let hints = format!(
+        "Poll it with get_job_status name={name} id={id}. Output: {}. Stop it with stop_job \
+         name={name} id={id}.",
+        lines.last().copied().unwrap_or("?")
+    );
+    let (text, log) = match (inst.os, lines.as_slice()) {
+        (Os::Ubuntu | Os::Arch, [pid, log]) => (
+            format!("started in the background (id {id}, pid {pid}). {hints}"),
+            Some(log.to_string()),
+        ),
+        (Os::Windows, [log]) => (
+            format!(
+                "started in the background as scheduled task agentpc-bg-{id} (id {id}). {hints}"
+            ),
+            Some(log.to_string()),
+        ),
+        // Started (the launch succeeded), but it printed something else.
+        _ => (
+            format!("started in the background (id {id}). {hints}"),
+            None,
         ),
     };
-    let out = exec(name, &script, 60, false).await?;
-    Ok(out
-        .split_once("--- stdout ---\n")
-        .map_or(out.clone(), |(_, s)| s.trim().to_string()))
+    execution::background_started(id, text, log)
 }
 
-/// Report a background job's state from its log and exit-code file (see exec_background):
-/// exited with the code in <id>.exit, else running while its process lives, else stopped by
-/// stop_job or ended without an exit code; plus a log tail.
-async fn job_status(name: &str, id: u64, tail_lines: usize) -> Result<String> {
-    let inst = load(name)?;
-    if !inst.running() {
-        bail!("VM {name} is not running; start_vm first");
-    }
-    let script = match inst.os {
-        Os::Ubuntu | Os::Arch => format!(
-            "d=~/agentpc-bg\n\
-             if [ ! -f $d/{id}.log ]; then echo 'STATE: no such job'; exit 0; fi\n\
-             if [ -f $d/{id}.exit ]; then echo \"STATE: exited $(cat $d/{id}.exit)\"; \
-             elif p=$(cat $d/{id}.pid 2>/dev/null) && grep -qs {id}.sh /proc/$p/cmdline; \
-             then echo 'STATE: running'; \
-             elif [ -f $d/{id}.stopped ]; then echo 'STATE: stopped by stop_job'; \
-             else echo 'STATE: ended without an exit code (killed, or the VM restarted)'; fi\n\
-             echo '--- log tail ---'; tail -n {tail_lines} $d/{id}.log",
-        ),
-        Os::Windows => format!(
-            r#"$d = "$env:USERPROFILE\agentpc-bg"; $log = "$d\{id}.log"; $exit = "$d\{id}.exit"
-$t = Get-ScheduledTask -TaskName 'agentpc-bg-{id}' -ErrorAction SilentlyContinue
-if (-not (Test-Path $log) -and -not $t) {{ 'STATE: no such job'; exit 0 }}
-# Ended only once the task has run and is no longer running (just after Start-ScheduledTask
-# it can still read Ready, not yet having run). A disabled task is one stop_job cancelled.
-$ran = $t -and ($t | Get-ScheduledTaskInfo).LastRunTime.Year -gt 2000
-$live = $t -and $t.State -ne 'Disabled' -and ($t.State -in 'Running', 'Queued' -or -not $ran)
-if (Test-Path $exit) {{ "STATE: exited $((Get-Content $exit -Raw).Trim())" }}
-elseif ($live) {{ 'STATE: running' }}
-elseif (Test-Path "$d\{id}.stopped") {{ 'STATE: stopped by stop_job' }}
-else {{ 'STATE: ended without an exit code (stopped, or the VM restarted)' }}
-'--- log tail ---'; if (Test-Path $log) {{ Get-Content $log -Tail {tail_lines} }}"#
-        ),
+/// Report a job's state and log (see `jobs`): the guest's read-only status script is run over
+/// SSH, once or repeatedly within `wait_seconds`, and its machine-readable report is turned
+/// into the structured result and the readable text. A foreground execution's id (an <id>.fg
+/// record, see `execution`) reports its state the same way, without a log.
+async fn job_status(a: JobArgs) -> CallToolResult {
+    let fail = |code, message: String| jobs::JobStatus::failure(a.id, code, message).into_result();
+    let wait = match jobs::validate_wait(a.id, a.wait_seconds) {
+        Ok(w) => w,
+        Err(e) => return e.into_result(),
     };
-    let out = exec(name, &script, 30, false).await?;
-    Ok(out
-        .split_once("--- stdout ---\n")
-        .map_or_else(|| out.clone(), |(_, s)| s.trim().to_string()))
+    let resume = match a
+        .cursor
+        .as_deref()
+        .map(|c| jobs::parse_cursor(c, &a.name, a.id))
+    {
+        None => None,
+        Some(Ok(r)) => Some(r),
+        Some(Err(e)) => return fail(jobs::JobErrorCode::InvalidCursor, e),
+    };
+    let inst = match load(&a.name) {
+        Ok(inst) => inst,
+        Err(e) => return fail(jobs::JobErrorCode::NoSuchVm, format!("{e:#}")),
+    };
+    if !inst.running() {
+        return fail(
+            jobs::JobErrorCode::VmNotRunning,
+            format!("VM {} is not running; start_vm first", a.name),
+        );
+    }
+    let generation = jobs::vm_generation(&inst.dir, inst.slot);
+    let req = jobs::Request::new(&a.name, a.id, a.tail_lines, wait, resume, generation);
+    let inst = &inst;
+    jobs::observe(&req, jobs::Pacing::DEFAULT, |q, timeout| {
+        guest_status(inst, a.id, q.clone(), timeout)
+    })
+    .await
+    .into_result()
+}
+
+/// One status check: the read-only script over SSH, within `timeout`.
+async fn guest_status(
+    inst: &Instance,
+    id: u64,
+    query: jobs::Query,
+    timeout: Duration,
+) -> Result<jobs::GuestReport, jobs::Failure> {
+    let script = match inst.os {
+        Os::Ubuntu | Os::Arch => jobs::linux_script(id, &query),
+        Os::Windows => ops::windows_command(&jobs::windows_script(id, &query)),
+    };
+    let secs = timeout.as_secs_f64().ceil().max(1.0) as u64;
+    let raw = ssh_raw(inst, &script, secs)
+        .await
+        .map_err(|e| jobs::Failure::unreachable(&format!("{e:#}")))?;
+    let why = |what: &str| {
+        let stderr = raw.stderr.text();
+        let stderr = stderr.lines().next().unwrap_or("").trim();
+        if stderr.is_empty() {
+            what.to_string()
+        } else {
+            format!("{what}: {}", execution::clip(stderr, 200))
+        }
+    };
+    if raw.timed_out {
+        return Err(jobs::Failure::timeout(&format!(
+            "no answer within {secs} s"
+        )));
+    }
+    match raw.code {
+        Some(0) => {}
+        Some(255) | None => {
+            return Err(jobs::Failure::unreachable(&why(
+                "ssh could not reach the VM",
+            )));
+        }
+        Some(c) => {
+            return Err(jobs::Failure::bad_reply(&why(&format!(
+                "the status script exited {c}"
+            ))));
+        }
+    }
+    let bytes = raw
+        .stdout
+        .whole()
+        .ok_or_else(|| jobs::Failure::bad_reply("the report was larger than expected"))?;
+    jobs::parse_report(&bytes).map_err(|e| jobs::Failure::bad_reply(&e))
 }
 
 /// Stop a background job and everything it started (see exec_background), and mark it stopped
@@ -1555,126 +1982,24 @@ async fn stop_job(name: &str, id: u64) -> Result<String> {
     if !inst.running() {
         bail!("VM {name} is not running; start_vm first");
     }
-    let out = exec(name, &stop_job_script(inst.os, id), 60, false).await?;
+    let out = exec(name, &stop_job_script(inst.os, id, false), 60, false).await?;
     Ok(out
         .split_once("--- stdout ---\n")
         .map_or_else(|| out.clone(), |(_, s)| s.trim().to_string()))
 }
 
-fn stop_job_script(os: Os, id: u64) -> String {
+/// The stop script (see `execution::linux_stop_script`), for stop_job or (`cancel`) for a
+/// foreground execution at its timeout. Exit codes: 0 when none of the job's identified
+/// processes is left (stopped, already exited, or not running), 1 when some would not stop,
+/// 3 for no such job, and in cancel mode 4 when the execution never recorded itself: the
+/// `<id>.cancel` written first means it now never starts.
+fn stop_job_script(os: Os, id: u64, cancel: bool) -> String {
     match os {
-        // The job's processes: everything in its systemd scope (agentpc-job-<id>.scope, a
-        // cgroup only the job's processes are in), its whole session while its wrapper
-        // (checked by command line, so a reused pid is never taken for it) still runs, and
-        // every process carrying its
-        // AGENTPC_JOB marker plus their descendants (sudo resets the environment, so what
-        // sudo starts is found as a child). A session id alone is not trusted once the
-        // wrapper is gone: after a reboot or pid reuse it can name someone else's session.
-        // Each round rescans, so a pid that exits and is reused is never signalled; .stopped
-        // is written only once nothing is left. root (sudo) reads every environment and can
-        // signal what the job started as root.
-        Os::Ubuntu | Os::Arch => format!(
-            r#"d=~/agentpc-bg
-[ -f $d/{id}.log ] || {{ echo 'no such job {id}'; exit 3; }}
-S=; sudo -n true 2>/dev/null && S='sudo -n'
-p=$(cat $d/{id}.pid 2>/dev/null); case $p in ''|*[!0-9]*) p= ;; esac
-cg=$(find /sys/fs/cgroup/user.slice -maxdepth 6 -type d -name agentpc-job-{id}.scope 2>/dev/null | head -n 1)
-members() {{
-  {{
-    [ -n "$cg" ] && find "$cg" -name cgroup.procs -exec cat {{}} + 2>/dev/null
-    if [ -n "$p" ] && grep -qs {id}.sh /proc/$p/cmdline; then pgrep -s "$p"; fi
-    marked=$($S grep -lsxz 'AGENTPC_JOB={id}' /proc/[0-9]*/environ 2>/dev/null | sed 's|^/proc/||; s|/environ$||')
-    if [ -n "$marked" ]; then
-      ps -eo pid=,ppid= | awk -v seed="$(echo $marked)" '
-        BEGIN {{ n = split(seed, a, " "); for (i = 1; i <= n; i++) s[a[i]] = 1 }}
-        {{ pid[NR] = $1; pp[$1] = $2 }}
-        END {{ do {{ c = 0; for (i in pid) {{ q = pid[i]; if (!(q in s) && (pp[q] in s)) {{ s[q] = 1; c = 1 }} }} }} while (c)
-              for (q in s) print q }}'
-    fi
-  }} | grep -vx -e '' -e "$$" | sort -un
-}}
-# A process's start time (field 22 of /proc/<pid>/stat, counted after its "(comm)").
-st() {{ sed 's/.*) //' /proc/$1/stat 2>/dev/null | awk '{{ print $20 }}'; }}
-first=$(for q in $(members); do echo "$q:$(st $q)"; done)
-# The first scan's processes stay targets while they live (pid and start time unchanged),
-# even once the wrapper is gone: one that ignores TERM still gets KILL.
-targets() {{
-  {{ members; for e in $first; do q=${{e%%:*}}; [ "$(st $q)" = "${{e#*:}}" ] && echo "$q"; done; }} | sort -un
-}}
-n=$(echo "$first" | grep -c .)
-if [ "$n" -eq 0 ]; then
-  if [ -f $d/{id}.exit ]; then echo "job {id} already exited with code $(cat $d/{id}.exit)"; else echo "job {id} is not running"; fi
-  exit 0
-fi
-$S kill -TERM $(targets) 2>/dev/null
-i=0; while [ -n "$(targets)" ] && [ $i -lt 25 ]; do sleep 0.2; i=$((i + 1)); done
-for r in 1 2 3; do
-  left=$(targets); [ -z "$left" ] && break
-  $S kill -KILL $left 2>/dev/null
-  [ -n "$cg" ] && [ -e "$cg/cgroup.kill" ] && $S sh -c 'echo 1 > "$1"' sh "$cg/cgroup.kill" 2>/dev/null
-  sleep 0.3
-done
-if [ -n "$(targets)" ]; then echo "job {id}: some of its processes would not stop"; exit 1; fi
-if [ -f $d/{id}.exit ]; then echo "job {id} had exited with code $(cat $d/{id}.exit); stopped $n process(es) it left running"
-else touch $d/{id}.stopped; echo "stopped job {id} ($n process(es))"; fi"#
-        ),
-        // The job is a scheduled task whose PowerShell runs <id>.ps1 and records its pid and
-        // creation time in <id>.pid. The task is disabled first, so a job not yet started
-        // never starts. A process counts as the job's only if created after its parent, and,
-        // when the parent is gone and Windows has given its pid to another process, before
-        // that one: a reused parent id never pulls in unrelated processes. Rounds rescan until
-        // nothing is left; .stopped is written only then, and only for a job without an exit
-        // code (one that already exited keeps it, and only what it left running is stopped).
-        Os::Windows => format!(
-            r#"$d = "$env:USERPROFILE\agentpc-bg"; $task = 'agentpc-bg-{id}'
-$t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
-if (-not (Test-Path "$d\{id}.log") -and -not $t) {{ "no such job {id}"; exit 3 }}
-if ($t) {{ Disable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue | Out-Null }}
-$known = @{{}}
-$rec = "$((Get-Content "$d\{id}.pid" -ErrorAction SilentlyContinue))".Trim() -split ' '
-if ($rec.Count -eq 2 -and $rec[0] -match '^\d+$' -and $rec[1] -match '^\d+$') {{ $known[[uint32]$rec[0]] = [int64]$rec[1] }}
-# Creation times compared to within 1 us: the job records its own to 100 ns, WMI to 1 us.
-function Same($a, $b) {{ [math]::Abs($a - $b) -lt 10 }}
-function Live {{
-  $all = @(Get-CimInstance Win32_Process)
-  $holder = @{{}}
-  foreach ($r in $all) {{ $holder[$r.ProcessId] = $r.CreationDate.ToFileTimeUtc() }}
-  foreach ($r in $all) {{ if ($r.CommandLine -like "*\{id}.ps1*" -and -not $known.ContainsKey($r.ProcessId)) {{ $known[$r.ProcessId] = $holder[$r.ProcessId] }} }}
-  do {{
-    $added = $false
-    foreach ($c in $all) {{
-      $q = $c.ParentProcessId; $born = $holder[$c.ProcessId]
-      if ($known.ContainsKey($c.ProcessId) -or -not $known.ContainsKey($q) -or $born -lt $known[$q]) {{ continue }}
-      if ($holder.ContainsKey($q) -and -not (Same $holder[$q] $known[$q]) -and $born -ge $holder[$q]) {{ continue }}
-      $known[$c.ProcessId] = $born; $added = $true
-    }}
-  }} while ($added)
-  @($all | Where-Object {{ $known.ContainsKey($_.ProcessId) -and (Same $known[$_.ProcessId] $holder[$_.ProcessId]) }})
-}}
-$stopped = @{{}}
-for ($i = 0; $i -lt 10; $i++) {{
-  $live = Live
-  if (-not $live.Count) {{ break }}
-  foreach ($q in $live) {{ $stopped[$q.ProcessId] = 1; Stop-Process -Id $q.ProcessId -Force -ErrorAction SilentlyContinue }}
-  if ($i -eq 0) {{ Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue }}
-  Start-Sleep -Milliseconds 300
-}}
-$left = Live
-if ($left.Count) {{ "job {id}: $($left.Count) of its processes would not stop"; exit 1 }}
-$n = $stopped.Count
-if (Test-Path "$d\{id}.exit") {{
-  $code = (Get-Content "$d\{id}.exit" -Raw).Trim()
-  if ($n) {{ "job {id} had exited with code $code; stopped $n process(es) it left running" }} else {{ "job {id} already exited with code $code" }}
-  exit 0
-}}
-if (-not $n -and $t -and ($t | Get-ScheduledTaskInfo).LastRunTime.Year -gt 2000) {{ "job {id} is not running"; exit 0 }}
-New-Item -ItemType File -Force "$d\{id}.stopped" | Out-Null
-if ($n) {{ "stopped job {id} ($n process(es))" }} else {{ "stopped job {id} before it started" }}"#
-        ),
+        Os::Ubuntu | Os::Arch => execution::linux_stop_script(id, cancel),
+        Os::Windows => execution::windows_stop_script(id, cancel),
     }
 }
 
-/// Keep the first and last `keep` characters of `s`, noting how much was cut.
 /// A background job's id, unique in the VM: two jobs sharing one would share their script,
 /// log and exit files. The time in milliseconds, times 1024, plus the low bits of this
 /// process's id (another MCP server may start one in the same millisecond); within this
@@ -1704,79 +2029,6 @@ fn job_id() -> u64 {
             Err(seen) => last = seen,
         }
     }
-}
-
-/// What a command printed on one stream: only its first and last bytes are kept while
-/// reading, so a command that prints gigabytes can't exhaust this server's memory.
-#[derive(Default)]
-struct Captured {
-    head: Vec<u8>,
-    tail: std::collections::VecDeque<u8>,
-    total: usize,
-}
-
-/// Bytes kept from each end of a stream: enough for OUTPUT_KEEP characters of any UTF-8.
-const CAPTURE_KEEP: usize = 4 * OUTPUT_KEEP;
-
-async fn drain_ends<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> Captured {
-    use tokio::io::AsyncReadExt;
-    let mut c = Captured::default();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = match r.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        c.push(&buf[..n]);
-    }
-    c
-}
-
-impl Captured {
-    fn push(&mut self, mut chunk: &[u8]) {
-        self.total += chunk.len();
-        if self.head.len() < CAPTURE_KEEP {
-            let take = (CAPTURE_KEEP - self.head.len()).min(chunk.len());
-            self.head.extend_from_slice(&chunk[..take]);
-            chunk = &chunk[take..];
-        }
-        self.tail.extend(chunk);
-        let over = self.tail.len().saturating_sub(CAPTURE_KEEP);
-        self.tail.drain(..over);
-    }
-
-    /// The output for a reply: whole if it is short, else its two ends.
-    fn text(&self) -> String {
-        let tail: Vec<u8> = self.tail.iter().copied().collect();
-        if self.total == self.head.len() + tail.len() {
-            let mut all = self.head.clone();
-            all.extend_from_slice(&tail);
-            return clip(String::from_utf8_lossy(&all).trim_end(), OUTPUT_KEEP);
-        }
-        let head = String::from_utf8_lossy(&self.head);
-        let tail = String::from_utf8_lossy(&tail);
-        let head: String = head.chars().take(OUTPUT_KEEP).collect();
-        let n = tail.chars().count();
-        let tail: String = tail.chars().skip(n.saturating_sub(OUTPUT_KEEP)).collect();
-        format!(
-            "{head}\n[... middle omitted: {} bytes of output in all ...]\n{}",
-            self.total,
-            tail.trim_end()
-        )
-    }
-}
-
-fn clip(s: &str, keep: usize) -> String {
-    let n = s.chars().count();
-    if n <= 2 * keep {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(keep).collect();
-    let tail: String = s.chars().skip(n - keep).collect();
-    format!(
-        "{head}\n[... {} characters omitted ...]\n{tail}",
-        n - 2 * keep
-    )
 }
 
 fn load(name: &str) -> Result<Instance> {
@@ -1957,6 +2209,26 @@ fn reply(r: Result<Vec<ContentBlock>>) -> CallToolResult {
 
 #[cfg(test)]
 mod tests {
+    /// The largest Linux foreground command agentpc accepts still fits the kernel's 128 KiB
+    /// cap on one argument or environment string (MAX_ARG_STRLEN, counting its NUL) as the
+    /// whole wrapper SSH runs, with the real session environment and the longest id.
+    #[test]
+    fn the_largest_accepted_linux_payload_fits_one_argument() {
+        use crate::execution::{LINUX_FOREGROUND_MAX_BYTES, linux_foreground};
+        const MAX_ARG_STRLEN: usize = 128 * 1024;
+        let payload = "é".repeat(LINUX_FOREGROUND_MAX_BYTES / 2);
+        assert_eq!(payload.len(), LINUX_FOREGROUND_MAX_BYTES);
+        let wrapper = linux_foreground(u64::MAX, &payload, crate::ops::LINUX_SESSION_ENV);
+        let margin = MAX_ARG_STRLEN - (wrapper.len() + 1);
+        assert!(
+            wrapper.len() < MAX_ARG_STRLEN && margin >= 1024,
+            "wrapper {} bytes",
+            wrapper.len()
+        );
+        // The payload's own copies: `AGENTPC_CMD=<payload>` and bash's `-c` argument.
+        assert!("AGENTPC_CMD=".len() + payload.len() + 1 < MAX_ARG_STRLEN);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn ownership_claim_does_not_block_the_async_executor() {
         use std::time::Duration;
@@ -2013,6 +2285,214 @@ mod tests {
                 .unwrap()
                 .contains(&serde_json::json!("open_in_browser"))
         );
+    }
+
+    /// tools/list declares run_command's output schema (the typed outcome, root type object),
+    /// and only run_command's: other tools' results carry no structured content to match one.
+    #[test]
+    fn run_command_declares_its_output_schema() {
+        let tools = super::Gateway::tool_router().list_all();
+        let run = tools.iter().find(|t| t.name == "run_command").unwrap();
+        let schema = run.output_schema.as_ref().expect("an output schema");
+        assert_eq!(schema["type"], "object");
+        for field in [
+            "state",
+            "exit_code",
+            "timed_out",
+            "termination_confirmed",
+            "job_id",
+        ] {
+            assert!(schema["properties"].get(field).is_some(), "{field}");
+        }
+        // Review finding 4: what Windows can stop is best effort, and the tool says so.
+        assert!(
+            run.description
+                .as_deref()
+                .unwrap()
+                .contains("best effort on Windows"),
+            "{:?}",
+            run.description
+        );
+        for t in tools
+            .iter()
+            .filter(|t| !["run_command", "get_job_status"].contains(&&*t.name))
+        {
+            assert!(t.output_schema.is_none(), "{}", t.name);
+        }
+        // The job tools accept a foreground execution's job_id too.
+        for name in ["get_job_status", "stop_job"] {
+            let t = tools.iter().find(|t| t.name == name).unwrap();
+            assert!(
+                t.description.as_deref().unwrap().contains("job_id"),
+                "{name}"
+            );
+        }
+    }
+
+    /// Stop and status scripts know foreground records, check identity by proof before
+    /// trusting a recorded pid, and cancel mode stops a not-yet-started execution for good.
+    #[test]
+    fn job_scripts_handle_foreground_records() {
+        use crate::instance::Os;
+        let stop = super::stop_job_script(Os::Ubuntu, 42, false);
+        assert!(stop.contains("[ -f $d/42.log ] || [ -f $d/42.fg ]"));
+        assert!(stop.contains("if own; then echo \"$p\"; pgrep -s \"$p\"; fi"));
+        assert!(stop.contains("$d/42.proof"));
+        assert!(!stop.contains("never started"));
+        assert!(stop.contains("echo stop_job > $d/42.stopped"));
+        let cancel = super::stop_job_script(Os::Ubuntu, 42, true);
+        let tomb = cancel.find(": > $d/42.cancel").unwrap();
+        let check = cancel
+            .find("[ -f $d/42.pid ] || { echo 'job 42 never started'; exit 4; }")
+            .unwrap();
+        assert!(tomb < check);
+        assert!(cancel.contains("echo timeout > $d/42.stopped"));
+        let win = super::stop_job_script(Os::Windows, 42, true);
+        let tomb = win.find("42.cancel").unwrap();
+        let check = win.find("never started\"; exit 4").unwrap();
+        assert!(tomb < check);
+        assert!(win.contains("Set-Content -Encoding ascii \"$d\\42.stopped\" 'timeout'"));
+        // get_job_status's scripts know foreground records, and say when one stopped at its
+        // timeout (the `stop` word is the one stop_job and the cancel mode write).
+        let q = crate::jobs::Query {
+            mode: crate::jobs::Mode::Tail,
+            cap: crate::jobs::REPLY_BYTES,
+        };
+        for st in [
+            crate::jobs::linux_script(42, &q),
+            crate::jobs::windows_script(42, &q),
+        ] {
+            assert!(
+                st.contains("42.fg") && st.contains("foreground") && st.contains("timeout"),
+                "{st}"
+            );
+        }
+    }
+
+    #[test]
+    fn job_args_keep_the_old_shape_and_add_wait_and_cursor() {
+        let a: super::JobArgs = serde_json::from_str(r#"{"name":"vm","id":7}"#).unwrap();
+        assert_eq!(a.wait_seconds, 0);
+        assert!(a.cursor.is_none());
+        assert_eq!(a.tail_lines, 50);
+        let a: super::JobArgs = serde_json::from_str(
+            r#"{"name":"vm","id":7,"tail_lines":5,"wait_seconds":30,"cursor":"start"}"#,
+        )
+        .unwrap();
+        assert_eq!((a.tail_lines, a.wait_seconds), (5, 30));
+        assert_eq!(a.cursor.as_deref(), Some("start"));
+        // Negative or fractional waits are not integers: the protocol refuses them.
+        assert!(
+            serde_json::from_str::<super::JobArgs>(r#"{"name":"vm","id":7,"wait_seconds":-1}"#)
+                .is_err()
+        );
+    }
+
+    /// tools/list: get_job_status stays read-only and declares its structured result (success
+    /// and error alike, one schema), and its input schema gained exactly the two options.
+    #[test]
+    fn get_job_status_declares_read_only_and_its_schemas() {
+        let tools = super::Gateway::tool_router().list_all();
+        let t = tools.iter().find(|t| t.name == "get_job_status").unwrap();
+        let ann = t.annotations.as_ref().unwrap();
+        assert_eq!(ann.read_only_hint, Some(true));
+        assert!(!ann.destructive_hint.unwrap_or(false));
+        let out = t.output_schema.as_ref().expect("an output schema");
+        assert_eq!(out["type"], "object");
+        for f in [
+            "state",
+            "exit_code",
+            "log_tail",
+            "output",
+            "next_cursor",
+            "cursor_reset",
+            "wait_timed_out",
+            "output_truncated",
+            "error",
+            "error_code",
+        ] {
+            assert!(out["properties"].get(f).is_some(), "{f}");
+        }
+        let input = &t.input_schema;
+        for f in ["name", "id", "tail_lines", "wait_seconds", "cursor"] {
+            assert!(input["properties"].get(f).is_some(), "{f}");
+        }
+        let required = super::required(input);
+        assert_eq!(required, ["name", "id"], "the new options are optional");
+        // The schema declares the wait bound; the handler still enforces it (a client that
+        // does not validate must get the structured error).
+        let w = &input["properties"]["wait_seconds"];
+        assert_eq!(w["maximum"], crate::jobs::MAX_WAIT_SECONDS, "{w}");
+        assert_eq!(w["minimum"], 0, "{w}");
+        let d = t.description.as_deref().unwrap();
+        assert!(
+            d.contains("wait_seconds")
+                && d.contains("without ever stopping it")
+                && d.contains("Read-only"),
+            "{d}"
+        );
+        // stop_job stays a mutation.
+        let stop = tools.iter().find(|t| t.name == "stop_job").unwrap();
+        assert_eq!(
+            stop.annotations.as_ref().unwrap().read_only_hint,
+            Some(false)
+        );
+    }
+
+    /// get_job_status's path (the handler, `job_status` and `guest_status`) is a read: it
+    /// never calls the probe that tombstones an unstarted execution, the cancellation, or
+    /// the stop script.
+    #[test]
+    fn get_job_status_never_reaches_the_mutating_probe_or_cancel() {
+        let src = include_str!("mcp.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        let start = prod.find("async fn job_status(a: JobArgs)").unwrap();
+        let end = start + prod[start..].find("/// Stop a background job").unwrap();
+        let path = &prod[start..end];
+        assert!(path.contains("guest_status"), "the slice is the right one");
+        for name in [
+            "probe_execution",
+            "cancel_execution",
+            "stop_job",
+            "run_tracked",
+            "linux_probe",
+            "windows_probe",
+            "stop_job_script",
+            ".cancel",
+        ] {
+            assert!(!path.contains(name), "{name} in get_job_status's path");
+        }
+    }
+
+    /// The tool itself, through its handler, with no VM: a wait above 30 and a bad cursor are
+    /// structured errors that need no SSH, and the schema's fields are all there.
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_job_status_refuses_bad_arguments_with_structured_errors() {
+        let call = |wait: u64, cursor: Option<&str>| {
+            super::job_status(super::JobArgs {
+                name: "no-such-vm-for-jobs-test".into(),
+                id: 9,
+                tail_lines: 5,
+                wait_seconds: wait,
+                cursor: cursor.map(str::to_string),
+            })
+        };
+        let r = call(31, None).await;
+        assert_eq!(r.is_error, Some(true));
+        let v = r.structured_content.unwrap();
+        assert_eq!(v["error_code"], "invalid_wait_seconds");
+        assert_eq!(v["state"], "unknown");
+        assert_eq!(v["job_id"], 9);
+        let r = call(0, Some("garbage")).await;
+        assert_eq!(
+            r.structured_content.unwrap()["error_code"],
+            "invalid_cursor"
+        );
+        // Valid arguments for a VM that does not exist: its own error, and still structured.
+        let r = call(0, Some("start")).await;
+        assert_eq!(r.structured_content.unwrap()["error_code"], "no_such_vm");
+        let r = call(30, None).await;
+        assert_eq!(r.structured_content.unwrap()["error_code"], "no_such_vm");
     }
 
     #[test]
@@ -2135,5 +2615,408 @@ mod tests {
         );
         assert_eq!(super::similar("clik", &names), ["click"]);
         assert!(super::similar("screenshot", &names).is_empty());
+    }
+
+    // ---- inspect_desktop: dispatch tests against a fake desktop driver -------------------
+
+    use rmcp::handler::server::wrapper::Parameters;
+    use rmcp::model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
+    };
+    use rmcp::service::RequestContext;
+    use rmcp::{RoleServer, ServerHandler, ServiceExt};
+    use std::sync::{Arc, Mutex};
+
+    /// A stand-in for cua-driver, served over an in-memory pipe: it lists `tools`, records the
+    /// name of every call that reaches it, and answers by tool name (or never, with `hang`).
+    struct Fake {
+        tools: Vec<Tool>,
+        calls: Arc<Mutex<Vec<String>>>,
+        hang: bool,
+    }
+
+    impl ServerHandler for Fake {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn list_tools(
+            &self,
+            _: Option<PaginatedRequestParams>,
+            _: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, rmcp::ErrorData> {
+            Ok(ListToolsResult::with_all_items(self.tools.clone()))
+        }
+
+        async fn call_tool(
+            &self,
+            req: CallToolRequestParams,
+            _: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, rmcp::ErrorData> {
+            self.calls.lock().unwrap().push(req.name.to_string());
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            let r = match req.name.as_ref() {
+                "get_window_state" => {
+                    let mut r = CallToolResult::success(vec![
+                        ContentBlock::text("window tree"),
+                        ContentBlock::image("iVBORw0KGgo=", "image/png"),
+                    ]);
+                    r.structured_content = Some(serde_json::json!({"snapshot_id": "s1"}));
+                    r
+                }
+                "needs_pid" => CallToolResult::error(vec![ContentBlock::text(
+                    "Missing required parameter: pid",
+                )]),
+                other => CallToolResult::success(vec![ContentBlock::text(format!("ran {other}"))]),
+            };
+            Ok(r.into())
+        }
+    }
+
+    fn tool(name: &'static str, read_only: Option<bool>, annotated: bool) -> Tool {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"pid": {"type": "integer"}},
+            "required": ["pid"]
+        });
+        let schema = schema.as_object().unwrap().clone();
+        let t = Tool::new(name, "a fake driver tool", schema);
+        if !annotated {
+            return t;
+        }
+        let mut a = ToolAnnotations::new().destructive(false);
+        a.read_only_hint = read_only;
+        t.annotate(a)
+    }
+
+    /// The driver's tools: `get_window_state` and `needs_pid` read-only, `click` not,
+    /// `type_text` with no annotations at all, `odd` annotated but silent on read-only.
+    fn driver_tools(window_state_read_only: bool) -> Vec<Tool> {
+        vec![
+            tool("get_window_state", Some(window_state_read_only), true),
+            tool("needs_pid", Some(true), true),
+            tool("click", Some(false), true),
+            tool("type_text", None, false),
+            tool("odd", None, true),
+        ]
+    }
+
+    async fn fake(
+        tools: Vec<Tool>,
+        calls: &Arc<Mutex<Vec<String>>>,
+        hang: bool,
+    ) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+        let (server_io, client_io) = tokio::io::duplex(1 << 16);
+        let driver = Fake {
+            tools,
+            calls: calls.clone(),
+            hang,
+        };
+        tokio::spawn(async move {
+            if let Ok(running) = driver.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        ().serve(client_io).await.unwrap()
+    }
+
+    /// A gateway whose next desktop connections are these fake drivers, in order.
+    async fn gateway_with(
+        drivers: Vec<(Vec<Tool>, bool)>,
+        calls: &Arc<Mutex<Vec<String>>>,
+    ) -> super::Gateway {
+        let gateway = super::Gateway::new();
+        for (tools, hang) in drivers {
+            let c = fake(tools, calls, hang).await;
+            gateway.dials.lock().unwrap().push_back(c);
+        }
+        gateway
+    }
+
+    fn desktop(tool: &str, arguments: serde_json::Value) -> super::DesktopArgs {
+        super::DesktopArgs {
+            name: "fake-vm".into(),
+            tool: tool.into(),
+            arguments: arguments.as_object().cloned(),
+        }
+    }
+
+    fn texts(r: &CallToolResult) -> String {
+        r.content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn inspect_runs_an_explicitly_read_only_tool_and_matches_use_desktop_tool() {
+        let calls = Arc::default();
+        let gw = gateway_with(vec![(driver_tools(true), false)], &calls).await;
+        let args = serde_json::json!({"pid": 7});
+        let inspected = gw
+            .inspect_desktop(Parameters(desktop("get_window_state", args.clone())))
+            .await;
+        let used = gw
+            .use_desktop_tool(Parameters(desktop("get_window_state", args)))
+            .await;
+        assert_eq!(inspected.is_error, Some(false));
+        // Both routes: the image survives, the structured content is kept and mirrored as text.
+        assert!(inspected.content.iter().any(|c| c.as_image().is_some()));
+        assert_eq!(
+            inspected.structured_content,
+            Some(serde_json::json!({"snapshot_id": "s1"}))
+        );
+        assert!(texts(&inspected).contains("\"snapshot_id\": \"s1\""));
+        assert_eq!(
+            serde_json::to_value(&inspected).unwrap(),
+            serde_json::to_value(&used).unwrap(),
+            "the two routes answer identically"
+        );
+        assert_eq!(*calls.lock().unwrap(), ["get_window_state"; 2]);
+    }
+
+    #[tokio::test]
+    async fn inspect_refuses_everything_but_explicit_read_only_before_dispatch() {
+        let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+        let gw = gateway_with(vec![(driver_tools(true), false)], &calls).await;
+        // Valid arguments throughout: the refusal is about classification, not the arguments.
+        for (name, why) in [
+            ("click", "marks it as not read-only"),
+            ("type_text", "does not say whether it is read-only"),
+            ("odd", "does not say whether it is read-only"),
+            ("launch_app", "has no such tool"),
+        ] {
+            let r = gw
+                .inspect_desktop(Parameters(desktop(name, serde_json::json!({"pid": 1}))))
+                .await;
+            assert_eq!(r.is_error, Some(true), "{name}");
+            let msg = texts(&r);
+            assert!(msg.contains(why), "{name}: {msg}");
+            assert!(msg.contains("Nothing was sent to the VM"), "{name}: {msg}");
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "{name} reached the driver"
+            );
+        }
+        // A near-miss for an unknown name still gets the close-name hint.
+        let r = gw
+            .inspect_desktop(Parameters(desktop("clik", serde_json::json!({}))))
+            .await;
+        assert!(texts(&r).contains("did you mean click?"), "{}", texts(&r));
+        assert!(calls.lock().unwrap().is_empty());
+        // No fallback: the mutation route is a separate, explicit call.
+        let r = gw
+            .use_desktop_tool(Parameters(desktop("click", serde_json::json!({"pid": 1}))))
+            .await;
+        assert_eq!(r.is_error, Some(false));
+        assert_eq!(*calls.lock().unwrap(), ["click"]);
+    }
+
+    #[tokio::test]
+    async fn inspect_keeps_the_error_and_argument_hints_of_use_desktop_tool() {
+        let calls = Arc::default();
+        let gw = gateway_with(vec![(driver_tools(true), false)], &calls).await;
+        let a = gw
+            .inspect_desktop(Parameters(desktop("needs_pid", serde_json::json!({}))))
+            .await;
+        let b = gw
+            .use_desktop_tool(Parameters(desktop("needs_pid", serde_json::json!({}))))
+            .await;
+        assert_eq!(a.is_error, Some(true));
+        let msg = texts(&a);
+        assert!(msg.contains("Missing required parameter: pid"), "{msg}");
+        assert!(msg.contains("needs_pid arguments (* = required)"), "{msg}");
+        assert_eq!(
+            serde_json::to_value(&a).unwrap(),
+            serde_json::to_value(&b).unwrap()
+        );
+    }
+
+    /// The first driver says the tool is read-only but never answers; the retry after the
+    /// timeout lands on a reconnected driver that says it is not. The retry must be refused
+    /// on the new driver's word, and nothing may reach it.
+    #[tokio::test]
+    async fn reconnect_reclassifies_before_the_retry_and_denies_a_changed_tool() {
+        let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+        let gw = gateway_with(
+            vec![(driver_tools(true), true), (driver_tools(false), false)],
+            &calls,
+        )
+        .await;
+        let r = gw
+            .inspect_desktop(Parameters(desktop(
+                "get_window_state",
+                serde_json::json!({"pid": 1}),
+            )))
+            .await;
+        assert_eq!(r.is_error, Some(true));
+        let msg = texts(&r);
+        assert!(msg.contains("marks it as not read-only"), "{msg}");
+        assert!(msg.contains("reconnected to the desktop driver"), "{msg}");
+        // Only the first (read-only at the time) attempt was ever sent; the second driver
+        // never saw the call.
+        assert_eq!(*calls.lock().unwrap(), ["get_window_state"]);
+        assert!(gw.dials.lock().unwrap().is_empty());
+    }
+
+    /// The same drop with an unchanged driver: the retry is allowed (it is read-only on the
+    /// new connection too) and answers normally.
+    #[tokio::test]
+    async fn reconnect_retries_an_inspection_the_new_driver_still_marks_read_only() {
+        let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+        let gw = gateway_with(
+            vec![(driver_tools(true), true), (driver_tools(true), false)],
+            &calls,
+        )
+        .await;
+        let r = gw
+            .inspect_desktop(Parameters(desktop(
+                "get_window_state",
+                serde_json::json!({"pid": 1}),
+            )))
+            .await;
+        assert_eq!(r.is_error, Some(false), "{}", texts(&r));
+        assert_eq!(*calls.lock().unwrap(), ["get_window_state"; 2]);
+    }
+
+    #[tokio::test]
+    async fn a_new_connection_forgets_the_cached_read_only_marks() {
+        let calls = Arc::default();
+        let gw = gateway_with(vec![(driver_tools(true), false)], &calls).await;
+        gw.read_only
+            .lock()
+            .unwrap()
+            .insert("fake-vm".into(), ["click".to_string()].into());
+        gw.session("fake-vm").await.unwrap();
+        assert!(gw.read_only.lock().unwrap().get("fake-vm").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_full_schema_reply_carries_the_tools_annotations() {
+        let calls = Arc::default();
+        let gw = gateway_with(vec![(driver_tools(true), false)], &calls).await;
+        for (name, expected) in [("get_window_state", true), ("click", false)] {
+            let r = gw
+                .list_desktop_tools(Parameters(super::ToolsArgs {
+                    name: "fake-vm".into(),
+                    tool: Some(name.into()),
+                }))
+                .await;
+            let v: serde_json::Value = serde_json::from_str(&texts(&r)).unwrap();
+            assert_eq!(v["annotations"]["readOnlyHint"], expected, "{v}");
+            assert!(v["input_schema"].is_object());
+        }
+    }
+
+    #[test]
+    fn tools_list_declares_inspect_desktop_read_only_and_use_desktop_tool_destructive() {
+        let tools = super::Gateway::tool_router().list_all();
+        let inspect = tools.iter().find(|t| t.name == "inspect_desktop").unwrap();
+        let used = tools.iter().find(|t| t.name == "use_desktop_tool").unwrap();
+        let a = inspect.annotations.as_ref().unwrap();
+        assert_eq!(a.read_only_hint, Some(true));
+        assert_eq!(a.destructive_hint, Some(false));
+        assert_eq!(a.open_world_hint, Some(true));
+        let u = used.annotations.as_ref().unwrap();
+        assert_eq!(u.read_only_hint, Some(false));
+        assert_eq!(u.destructive_hint, Some(true));
+        assert_eq!(u.open_world_hint, Some(true));
+        // Same input shape: identical schemas, with name and tool required.
+        assert_eq!(inspect.input_schema, used.input_schema);
+        assert_eq!(super::required(&inspect.input_schema), ["name", "tool"]);
+        assert!(inspect.output_schema.is_none());
+        let d = inspect.description.as_deref().unwrap();
+        assert!(d.contains("explicitly marks it read-only"), "{d}");
+        assert!(d.contains("not a\ngu") || d.contains("guarantee"), "{d}");
+    }
+
+    // ---- use_desktop_tool: a dropped call is re-sent only on proof ----------------------
+
+    /// The first driver marks the tool read-only and never answers; the one it reconnects to
+    /// marks it not read-only. The call was sent once and must not be sent again.
+    #[tokio::test]
+    async fn use_does_not_resend_a_call_the_reconnected_driver_no_longer_marks_read_only() {
+        let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+        let gw = gateway_with(
+            vec![(driver_tools(true), true), (driver_tools(false), false)],
+            &calls,
+        )
+        .await;
+        let r = gw
+            .use_desktop_tool(Parameters(desktop(
+                "get_window_state",
+                serde_json::json!({"pid": 1}),
+            )))
+            .await;
+        assert_eq!(r.is_error, Some(true));
+        let msg = texts(&r);
+        assert!(msg.contains("did not re-send"), "{msg}");
+        assert_eq!(*calls.lock().unwrap(), ["get_window_state"], "sent once");
+    }
+
+    /// A stale cache that calls a mutator read-only does not authorize a re-send: the driver
+    /// the call was actually sent on says it is not.
+    #[tokio::test]
+    async fn use_does_not_resend_a_mutator_even_if_the_cache_says_read_only() {
+        let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+        let gw = gateway_with(
+            vec![(driver_tools(true), true), (driver_tools(true), false)],
+            &calls,
+        )
+        .await;
+        gw.session("fake-vm").await.unwrap();
+        gw.read_only
+            .lock()
+            .unwrap()
+            .insert("fake-vm".into(), ["click".to_string()].into());
+        let r = gw
+            .use_desktop_tool(Parameters(desktop("click", serde_json::json!({"pid": 1}))))
+            .await;
+        assert_eq!(r.is_error, Some(true));
+        let msg = texts(&r);
+        assert!(msg.contains("whether it took effect is unknown"), "{msg}");
+        assert_eq!(*calls.lock().unwrap(), ["click"], "sent once");
+        // (The error hint's own tool listing reconnects; the call itself was not repeated.)
+    }
+
+    /// With the cache empty or false for a mutator, the same: one send, no retry.
+    #[tokio::test]
+    async fn use_sends_a_mutation_once_and_does_not_retry_after_a_drop() {
+        let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+        let gw = gateway_with(
+            vec![(driver_tools(true), true), (driver_tools(true), false)],
+            &calls,
+        )
+        .await;
+        let r = gw
+            .use_desktop_tool(Parameters(desktop("click", serde_json::json!({"pid": 1}))))
+            .await;
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(*calls.lock().unwrap(), ["click"]);
+    }
+
+    /// Ordinary behaviour kept: a read-only call lost to a drop is re-sent when the new driver
+    /// still marks it read-only.
+    #[tokio::test]
+    async fn use_still_resends_a_read_only_call_when_the_new_driver_agrees() {
+        let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+        let gw = gateway_with(
+            vec![(driver_tools(true), true), (driver_tools(true), false)],
+            &calls,
+        )
+        .await;
+        let r = gw
+            .use_desktop_tool(Parameters(desktop(
+                "get_window_state",
+                serde_json::json!({"pid": 1}),
+            )))
+            .await;
+        assert_eq!(r.is_error, Some(false), "{}", texts(&r));
+        assert!(r.content.iter().any(|c| c.as_image().is_some()));
+        assert_eq!(*calls.lock().unwrap(), ["get_window_state"; 2]);
     }
 }

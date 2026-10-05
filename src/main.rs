@@ -1,7 +1,9 @@
 //! agentpc: instant, resettable Windows, Ubuntu and Arch Linux ARM desktop VMs for AI agents on Apple Silicon Macs.
 
+mod execution;
 mod image;
 mod instance;
+mod jobs;
 mod mcp;
 mod ops;
 mod qemu;
