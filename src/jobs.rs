@@ -18,7 +18,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-use crate::execution::{linux_own, windows_own};
+use crate::execution::{linux_own, linux_own_by, windows_own, windows_own_by};
 
 /// Layout version of [`JobStatus`]; bumped only for incompatible changes.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -51,6 +51,10 @@ pub const ATTEMPT_CEILING: Duration = Duration::from_secs(30);
 /// Shown instead of a log for a foreground execution. No quotes: it is plain text only.
 pub const FOREGROUND_NOTE: &str =
     "(a foreground run_command: its output went to the reply of that call, so there is no log)";
+
+/// Said of a job whose exit record is not a valid exit code.
+const UNKNOWN_NOTE: &str = "A record of this job is not valid (an exit record that is not an \
+     exit code), so its state is unknown, not ended. Treat it as unresolved.";
 
 /// Pacing of a status call: tests use short ones.
 #[derive(Clone, Copy, Debug)]
@@ -89,17 +93,21 @@ pub enum JobState {
     Running,
     /// Ran to its end; `exit_code` is its code.
     Exited,
-    /// Stopped by `stop_job` or at a foreground command's timeout (`stop_reason`).
+    /// Stopped by `stop_job`, at a foreground command's timeout, or when its run_command
+    /// request was cancelled (`stop_reason`).
     Stopped,
     /// Gone without an exit code: killed, or the VM restarted.
     Ended,
     /// A foreground execution whose command never started and now never will: a
-    /// cancellation (its timeout, stop_job, or the check after a lost connection) was
-    /// recorded before it did. Without that record a foreground launch is `queued`.
+    /// cancellation (its timeout, its request's cancellation, stop_job, or the check after a
+    /// lost connection) was recorded before it did. Without that record a foreground launch
+    /// is `queued`.
     NotStarted,
     /// Nothing in the VM has recorded itself under this id (yet).
     Missing,
-    /// The state could not be read; see `error`.
+    /// The state could not be read (see `error`), or a record exists that is not valid (an exit
+    /// record that is not an exit code: then `note` says so and the job is not guessed to have
+    /// ended).
     #[default]
     Unknown,
 }
@@ -129,6 +137,9 @@ pub enum StopReason {
     Timeout,
     /// Stopped by stop_job.
     StopJob,
+    /// A foreground command stopped because its run_command request was cancelled (the
+    /// client cancelled it or disconnected, or the MCP server shut down).
+    RequestCancelled,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,7 +206,8 @@ pub enum JobErrorCode {
 pub struct JobStatus {
     /// Layout version of this object (currently 1).
     pub schema_version: u32,
-    /// The job's state; see the variants. `unknown` only together with `error`.
+    /// The job's state; see the variants. `unknown` together with `error` (the state could
+    /// not be read) or with a `note` (an invalid exit record).
     pub state: JobState,
     /// The id asked about.
     pub job_id: u64,
@@ -321,25 +333,34 @@ pub fn validate_wait(job_id: u64, wait_seconds: u64) -> Result<Duration, Box<Job
     Ok(Duration::from_secs(wait_seconds))
 }
 
-/// The text a client without structured content reads: the legacy `STATE:` line and log tail
-/// (or, for a cursor read, the new output), then one line per fact worth knowing.
-pub fn render_text(s: &JobStatus) -> String {
-    if let Some(e) = &s.error {
-        return e.clone();
-    }
-    let label = match s.state {
+/// The words for a state, shared by get_job_status's text and list_jobs's.
+fn state_label(state: JobState, exit_code: Option<i64>, stop: Option<StopReason>) -> String {
+    match state {
         JobState::Queued => "queued (launched, not running yet)".to_string(),
         JobState::Running => "running".to_string(),
-        JobState::Exited => format!("exited {}", s.exit_code.unwrap_or(-1)),
-        JobState::Stopped => match s.stop_reason {
+        JobState::Exited => format!("exited {}", exit_code.unwrap_or(-1)),
+        JobState::Stopped => match stop {
             Some(StopReason::Timeout) => "stopped at its run_command timeout".to_string(),
+            Some(StopReason::RequestCancelled) => {
+                "stopped when its run_command request was cancelled or its MCP session ended"
+                    .to_string()
+            }
             _ => "stopped by stop_job".to_string(),
         },
         JobState::Ended => "ended without an exit code (killed, or the VM restarted)".to_string(),
         JobState::NotStarted => "not started".to_string(),
         JobState::Missing => "no such job".to_string(),
         JobState::Unknown => "unknown".to_string(),
-    };
+    }
+}
+
+/// The text a client without structured content reads: the legacy `STATE:` line and log tail
+/// (or, for a cursor read, the new output), then one line per fact worth knowing.
+pub fn render_text(s: &JobStatus) -> String {
+    if let Some(e) = &s.error {
+        return e.clone();
+    }
+    let label = state_label(s.state, s.exit_code, s.stop_reason);
     let mut out = format!("STATE: {label}");
     if s.kind == Some(JobKind::Foreground) {
         out.push('\n');
@@ -387,7 +408,7 @@ pub fn render_text(s: &JobStatus) -> String {
         ));
     }
     if let Some(n) = &s.note
-        && s.kind != Some(JobKind::Foreground)
+        && (s.kind != Some(JobKind::Foreground) || s.state == JobState::Unknown)
     {
         facts.push(n.clone());
     }
@@ -712,6 +733,7 @@ pub fn parse_report(out: &[u8]) -> Result<GuestReport, String> {
                     "ended" => JobState::Ended,
                     "not_started" => JobState::NotStarted,
                     "missing" => JobState::Missing,
+                    "unknown" => JobState::Unknown,
                     other => return Err(format!("unknown state '{other}'")),
                 })
             }
@@ -728,6 +750,7 @@ pub fn parse_report(out: &[u8]) -> Result<GuestReport, String> {
             "stop" => {
                 r.stop = Some(match val {
                     "timeout" => StopReason::Timeout,
+                    "request_cancelled" => StopReason::RequestCancelled,
                     _ => StopReason::StopJob,
                 })
             }
@@ -875,11 +898,16 @@ pub fn assemble(req: &Request, rep: &GuestReport) -> JobStatus {
     s.exit_code = rep.exit_code;
     s.stop_reason = rep.stop;
     let cursor_mode = req.resume.is_some();
+    if rep.state == JobState::Unknown {
+        s.note = Some(UNKNOWN_NOTE.to_string());
+    }
     if rep.kind == Some(JobKind::Foreground) {
         // The code run_command reports for this execution: the recorded one as an SSH client
         // sees it, its low 8 bits (a Windows `exit -1` or `exit 511` reads 255).
         s.exit_code = rep.exit_code.map(|c| c & 0xff);
-        s.note = Some(FOREGROUND_NOTE.trim_matches(['(', ')']).to_string());
+        if rep.state != JobState::Unknown {
+            s.note = Some(FOREGROUND_NOTE.trim_matches(['(', ')']).to_string());
+        }
         return s;
     }
     if rep.state == JobState::Missing {
@@ -918,7 +946,12 @@ pub fn assemble(req: &Request, rep: &GuestReport) -> JobStatus {
         // Queued, missing, or a log that cannot be read: no text, and a cursor that starts
         // at the beginning of whatever log appears.
         if rep.log == LogPresence::Unreadable {
-            s.note = Some("The job's log exists but could not be read just now.".to_string());
+            // Appended: an invalid exit record's explanation (state unknown, not ended) stays.
+            let unreadable = "The job's log exists but could not be read just now.";
+            s.note = Some(match s.note.take() {
+                Some(earlier) => format!("{earlier} {unreadable}"),
+                None => unreadable.to_string(),
+            });
         }
         if bound {
             s.cursor_reset = true;
@@ -978,6 +1011,8 @@ pub fn assemble(req: &Request, rep: &GuestReport) -> JobStatus {
 pub struct Failure {
     pub code: JobErrorCode,
     pub message: String,
+    /// What went wrong, without the surrounding advice (for callers with their own).
+    pub detail: String,
     /// The check ran out of time (as opposed to failing outright): an earlier good snapshot
     /// of a wait stays the answer.
     pub timed_out: bool,
@@ -991,6 +1026,7 @@ impl Failure {
                 "Could not read the job's state: the VM did not answer ({detail}). Its state is \
                  unknown, not ended. Check list_vms, then call get_job_status again."
             ),
+            detail: detail.to_string(),
             timed_out: false,
         }
     }
@@ -1010,6 +1046,7 @@ impl Failure {
                 "The VM answered, but not with a job status this server understands ({detail}). \
                  The job's state is unknown; call get_job_status again."
             ),
+            detail: detail.to_string(),
             timed_out: false,
         }
     }
@@ -1019,6 +1056,7 @@ impl Failure {
 /// cursor) there is output or a reset to report.
 fn settled(s: &JobStatus, cursor_mode: bool) -> bool {
     s.state.terminal()
+        || s.state == JobState::Unknown
         || s.error.is_some()
         || (cursor_mode && (s.output_bytes > 0 || s.cursor_reset))
 }
@@ -1151,6 +1189,34 @@ impl Default for LinuxPaths {
     }
 }
 
+/// Validates `$x` (the text of an exit record, whitespace removed) as an exit code: ASCII digits
+/// only, an optional leading minus, at most ten digits and no more than 4294967295 in value.
+/// Anything else (`-`, `1-2`, a huge or non-ASCII number) is dropped and sets `xbad=1`, so the
+/// job reports `unknown` instead of an exit code nobody wrote.
+const LINUX_XCHECK: &str = r#"xbad=0
+if [ -n "$x" ]; then
+  y=${x#-}
+  case $y in
+    ''|*[!0123456789]*) x=; xbad=1 ;;
+    *) if [ ${#y} -gt 10 ] || { [ ${#y} -eq 10 ] && [ "$y" -gt 4294967295 ]; }; then x=; xbad=1; fi ;;
+  esac
+fi"#;
+
+/// The state decision of a Linux job, shared by get_job_status and list_jobs so the two never
+/// disagree. Reads the variables `d`, `fg`, `p`, `x` and the function `own`, and writes only
+/// `emit` lines.
+const LINUX_STATE: &str = r#"if [ "$xbad" = 1 ]; then emit state unknown
+elif [ -n "$x" ]; then emit state exited; emit exit "$x"
+elif own; then emit state running
+elif [ -f $d/__ID__.stopped ]; then
+  emit state stopped
+  if grep -qs request_cancelled $d/__ID__.stopped; then emit stop request_cancelled
+  elif grep -qs timeout $d/__ID__.stopped; then emit stop timeout; else emit stop stop_job; fi
+elif [ -z "$p" ]; then
+  if [ $fg = 1 ] && [ -e $d/__ID__.cancel ]; then emit state not_started; else emit state queued; fi
+elif [ $fg = 1 ] && [ ! -f $d/__ID__.proof ] && ps -p "$p" >/dev/null 2>&1; then emit state queued
+else emit state ended; fi"#;
+
 const LINUX_HEAD: &str = r#"d=~/agentpc-bg
 emit() { printf 'AGENTPC_JOB %s\n' "$*"; }
 have=0
@@ -1161,18 +1227,10 @@ if [ $fg = 1 ]; then emit kind foreground; else emit kind background; fi
 p=$(cat $d/__ID__.pid 2>/dev/null); case $p in ''|*[!0-9]*) p= ;; esac
 __OWN__
 x=; [ -f $d/__ID__.exit ] && x=$(tr -d ' \r\n\t' < $d/__ID__.exit 2>/dev/null)
-case $x in ''|*[!0-9-]*) x= ;; esac
+__XCHECK__
 boot=$(cat __BOOT__ 2>/dev/null)
 emit boot "$boot"
-if [ -n "$x" ]; then emit state exited; emit exit "$x"
-elif own; then emit state running
-elif [ -f $d/__ID__.stopped ]; then
-  emit state stopped
-  if grep -qs timeout $d/__ID__.stopped; then emit stop timeout; else emit stop stop_job; fi
-elif [ -z "$p" ]; then
-  if [ $fg = 1 ] && [ -e $d/__ID__.cancel ]; then emit state not_started; else emit state queued; fi
-elif [ $fg = 1 ] && [ ! -f $d/__ID__.proof ] && ps -p "$p" >/dev/null 2>&1; then emit state queued
-else emit state ended; fi
+__STATE__
 if [ $fg = 1 ]; then emit log none; emit end ok; exit 0; fi
 f=$d/__ID__.log
 if [ -f "$f" ] && [ -r "$f" ] && exec 3< "$f"; then
@@ -1233,6 +1291,11 @@ pub fn linux_script_with(id: u64, q: &Query, paths: &LinuxPaths) -> String {
         LINUX_HEAD,
         &[
             ("__OWN__", &linux_own(id)),
+            ("__XCHECK__", LINUX_XCHECK),
+            (
+                "__STATE__",
+                &fill(LINUX_STATE, &[("__ID__", &id.to_string())]),
+            ),
             ("__BOOT__", &token_path(&paths.boot_id)),
             ("__FD__", &token_path(&paths.fd)),
             ("__CAP__", &cap),
@@ -1277,6 +1340,23 @@ fn token_path(p: &str) -> String {
     }
 }
 
+/// Windows's counterpart of `LINUX_XCHECK` (`[0-9]`, not `\d`, which matches other scripts'
+/// digits too).
+const WINDOWS_XCHECK: &str = r#"$xbad = $false
+if ($x -ne '') { if (-not (($x -cmatch '^-?[0-9]{1,10}$') -and ([math]::Abs([int64]$x) -le 4294967295))) { $x = ''; $xbad = $true } }"#;
+
+/// The state decision of a Windows job, shared by get_job_status and list_jobs. Reads `$d`,
+/// `$fg`, `$x`, `$t`, `$tstate`, `$ran`, `$log` and the function `Own`, and writes only `Emit`
+/// lines.
+const WINDOWS_STATE: &str = r#"if ($xbad) { Emit state unknown }
+elseif ($x -ne '') { Emit state exited; Emit exit $x }
+elseif ($fg -and (Own)) { Emit state running }
+elseif ((-not $fg) -and $t -and $tstate -ne 'Disabled' -and ($tstate -eq 'Running' -or $tstate -eq 'Queued' -or -not $ran)) { if ($tstate -eq 'Running' -or [IO.File]::Exists($log)) { Emit state running } else { Emit state queued } }
+elseif ([IO.File]::Exists("$d\__ID__.stopped")) { Emit state stopped; $why = ''; try { $why = [IO.File]::ReadAllText("$d\__ID__.stopped") } catch { }; if ($why -match 'request_cancelled') { Emit stop request_cancelled } elseif ($why -match 'timeout') { Emit stop timeout } else { Emit stop stop_job } }
+elseif ($fg -and -not [IO.File]::Exists("$d\__ID__.pid")) { if ([IO.File]::Exists("$d\__ID__.cancel")) { Emit state not_started } else { Emit state queued } }
+elseif ($fg -and "$(try { [IO.File]::ReadAllText("$d\__ID__.pid") } catch { })".Trim() -notmatch '^\d+ \d+$') { Emit state queued }
+else { Emit state ended }"#;
+
 const WINDOWS_HEAD: &str = r#"$d = "$env:USERPROFILE\agentpc-bg"
 function Emit($k, $v) { "AGENTPC_JOB $k $v" }
 $log = "$d\__ID__.log"; $exitp = "$d\__ID__.exit"
@@ -1291,18 +1371,12 @@ try { $tc = [Environment]::TickCount; if ($tc -lt 0) { $tc += 4294967296 }; $boo
 Emit boot $boot
 $x = ''
 if ([IO.File]::Exists($exitp)) { try { $x = [IO.File]::ReadAllText($exitp).Trim() } catch { } }
-if ($x -notmatch '^-?\d+$') { $x = '' }
+__XCHECK__
 $ran = $false
 if ($t) { try { $ran = (($t | Get-ScheduledTaskInfo).LastRunTime.Year -gt 2000) } catch { } }
 $tstate = ''
 if ($t) { $tstate = "$($t.State)" }
-if ($x -ne '') { Emit state exited; Emit exit $x }
-elseif ($fg -and (Own)) { Emit state running }
-elseif ((-not $fg) -and $t -and $tstate -ne 'Disabled' -and ($tstate -eq 'Running' -or $tstate -eq 'Queued' -or -not $ran)) { if ($tstate -eq 'Running' -or [IO.File]::Exists($log)) { Emit state running } else { Emit state queued } }
-elseif ([IO.File]::Exists("$d\__ID__.stopped")) { Emit state stopped; $why = ''; try { $why = [IO.File]::ReadAllText("$d\__ID__.stopped") } catch { }; if ($why -match 'timeout') { Emit stop timeout } else { Emit stop stop_job } }
-elseif ($fg -and -not [IO.File]::Exists("$d\__ID__.pid")) { if ([IO.File]::Exists("$d\__ID__.cancel")) { Emit state not_started } else { Emit state queued } }
-elseif ($fg -and "$(try { [IO.File]::ReadAllText("$d\__ID__.pid") } catch { })".Trim() -notmatch '^\d+ \d+$') { Emit state queued }
-else { Emit state ended }
+__STATE__
 if ($fg) { Emit log none; Emit end ok; exit 0 }
 if (-not [IO.File]::Exists($log)) { Emit log absent; Emit end ok; exit 0 }
 function ReadAt($fs, [int64]$pos, [int]$n) {
@@ -1367,8 +1441,1138 @@ pub fn windows_script(id: u64, q: &Query) -> String {
         WINDOWS_HEAD,
         &[
             ("__OWN__", &windows_own(id)),
+            ("__XCHECK__", WINDOWS_XCHECK),
+            (
+                "__STATE__",
+                &fill(WINDOWS_STATE, &[("__ID__", &id.to_string())]),
+            ),
             ("__ID__", &id.to_string()),
             ("__SECTION__", &section),
+        ],
+    )
+}
+
+// =============================================================================================
+// list_jobs: metadata-only, paginated job discovery
+//
+// One read-only guest script per OS lists the job records of a VM, newest id first, one page at
+// a time, in a single call. Per job it looks at which known record files exist (by name and
+// type only), reads the few facts that decide the job's state (a pid, an exit code, a stop
+// word: all of them validated numbers or agentpc's own words) with the same rules and the same
+// process proof as get_job_status (the state decision is shared text), and takes two file
+// modification times. It never opens a launch script (`.sh`, `.ps1`) or a log, never reads a
+// command, an environment or any output, and never writes: no tombstone, no probe.
+//
+// Pages continue by keyset, not by offset: a cursor holds the VM's generation, the newest id
+// the traversal began with (its high-water mark) and the last id shown, and the next page is the
+// ids below that. A job created after the traversal began has a newer id and never joins it, so
+// nothing already shown moves; a job deleted before it is reached simply does not appear. The
+// listing is best effort, not an immutable history: records age out.
+
+/// Jobs per page when `limit` is omitted.
+pub const LIST_DEFAULT_LIMIT: u64 = 20;
+
+/// The most jobs one page carries.
+pub const LIST_MAX_LIMIT: u64 = 100;
+
+/// The most directory entries one listing retains. The guest keeps only the first this many
+/// names the file system returns (it does not promise to read no more of the directory than
+/// that; the query's deadline bounds the time). A VM with more entries is listed from those,
+/// and the reply says it may leave jobs out.
+pub const LIST_SCAN_MAX: usize = 20_000;
+
+/// How long the guest script may work on one page before it stops with a cursor to continue
+/// (it always reports at least one job when there is one).
+pub const LIST_GUEST_BUDGET_SECS: u64 = 20;
+
+/// The longest the whole query (the SSH round trip) may take.
+pub const LIST_ATTEMPT: Duration = Duration::from_secs(25);
+
+/// How long past that the query may take to report its own timeout before it is abandoned.
+pub const LIST_GRACE: Duration = Duration::from_millis(500);
+
+/// Ids are decimal numbers of at most this many digits (agentpc's are 16): longer names are not
+/// ours, and shorter arithmetic in the guest's shell stays exact.
+const ID_MAX_DIGITS: usize = 18;
+
+const LIST_HISTORY_NOTE: &str = "Best effort, not an immutable history: records can be added, \
+     aged out or deleted between pages. Newest job id first; a page continues below the last id \
+     shown, and jobs created after the first page are not part of that traversal.";
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+pub enum ListedKind {
+    /// A foreground run_command execution (its output went to that reply: no log).
+    Foreground,
+    /// A `background: true` job (with a log).
+    Background,
+    /// The records do not show which.
+    Unknown,
+}
+
+impl ListedKind {
+    fn name(self) -> &'static str {
+        match self {
+            ListedKind::Foreground => "foreground",
+            ListedKind::Background => "background",
+            ListedKind::Unknown => "unknown kind",
+        }
+    }
+}
+
+/// A kind of record a job leaves in the VM, by what it is, never by path.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+pub enum RecordKind {
+    /// The launch script of a background job (Linux). Never read.
+    Sh,
+    /// The launch script of a background job (Windows). Never read.
+    Ps1,
+    /// The job's log. Never read by list_jobs.
+    Log,
+    /// Marks a foreground execution.
+    Fg,
+    /// The recorded process of the job.
+    Pid,
+    /// The boot and start time that identify that process (Linux).
+    Proof,
+    /// The recorded exit code.
+    Exit,
+    /// Why a stopped job stopped.
+    Stopped,
+    /// A cancellation tombstone: its command never starts once it exists.
+    Cancel,
+    /// The job's Windows scheduled task.
+    Task,
+}
+
+impl RecordKind {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "sh" => RecordKind::Sh,
+            "ps1" => RecordKind::Ps1,
+            "log" => RecordKind::Log,
+            "fg" => RecordKind::Fg,
+            "pid" => RecordKind::Pid,
+            "proof" => RecordKind::Proof,
+            "exit" => RecordKind::Exit,
+            "stopped" => RecordKind::Stopped,
+            "cancel" => RecordKind::Cancel,
+            "task" => RecordKind::Task,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            RecordKind::Sh => "sh",
+            RecordKind::Ps1 => "ps1",
+            RecordKind::Log => "log",
+            RecordKind::Fg => "fg",
+            RecordKind::Pid => "pid",
+            RecordKind::Proof => "proof",
+            RecordKind::Exit => "exit",
+            RecordKind::Stopped => "stopped",
+            RecordKind::Cancel => "cancel",
+            RecordKind::Task => "task",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[schemars(inline)]
+pub enum ListErrorCode {
+    /// `limit` is not between 1 and 100.
+    InvalidLimit,
+    /// The cursor is malformed, or belongs to another VM.
+    InvalidCursor,
+    /// The cursor is from before the VM was reset, restored or recreated; its records may differ now.
+    CursorStale,
+    NoSuchVm,
+    VmNotRunning,
+    /// The VM did not answer (SSH failed or timed out): nothing is known about its jobs.
+    GuestUnreachable,
+    /// The VM answered, but not with a listing this server understands.
+    BadGuestReply,
+    /// The VM's job directory exists but cannot be read.
+    GuestUnreadable,
+    /// The request was cancelled; only the listing was abandoned, no job was touched.
+    RequestCancelled,
+}
+
+/// One job in a listing: identity and state only. It carries no command, environment, output
+/// or path.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct JobSummary {
+    /// The id get_job_status and stop_job take.
+    pub job_id: u64,
+    /// `foreground`, `background`, or `unknown` when the records do not show which.
+    pub kind: ListedKind,
+    /// The state, decided by the same rules as get_job_status (`missing`: only incidental
+    /// records exist; `unknown`: a record could not be read).
+    pub state: JobState,
+    /// The exit code when `state` is `exited` (a foreground one is run_command's: the low 8
+    /// bits); null otherwise.
+    pub exit_code: Option<i64>,
+    /// Why a `stopped` job stopped; null otherwise.
+    pub stop_reason: Option<StopReason>,
+    /// Whether the job has a log file that can be read (call get_job_status for its text).
+    pub log_available: bool,
+    /// Which records exist for the job, each kind once.
+    pub records: Vec<RecordKind>,
+    /// UTC time the job was recorded: the modification time of its foreground marker or launch
+    /// script (a file-system time, never derived from the id). Null when no such file exists.
+    pub recorded_at: Option<String>,
+    /// UTC time the job finished: the modification time of its exit or stop record, for an
+    /// `exited` or `stopped` job. Null otherwise.
+    pub finished_at: Option<String>,
+    /// What to be careful about for an unresolved, incomplete or unreadable record.
+    pub note: Option<String>,
+}
+
+/// What list_jobs reports, as its structured content. The same object describes every answer
+/// and every failure; a failure has `error` set (and is a tool error) and no jobs.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct JobList {
+    /// Layout version of this object (currently 1).
+    pub schema_version: u32,
+    /// The page, newest id first.
+    pub jobs: Vec<JobSummary>,
+    /// The page size in effect (0 for a failure before one was set).
+    pub limit: u32,
+    /// Whether older jobs remain below this page.
+    pub has_more: bool,
+    /// Whether this page continued an earlier one (a `cursor` was given): an empty one then
+    /// means no further jobs, not an empty VM.
+    pub continuation: bool,
+    /// Pass this as `cursor` (with the same `name`) for the next page; null on the last page.
+    /// Metadata, not a credential.
+    pub next_cursor: Option<String>,
+    /// The VM's clock when it listed, in UTC, to read the timestamps against.
+    pub listed_at: Option<String>,
+    /// Whether the directory holds more entries than one listing retains, so jobs may be left
+    /// out.
+    pub scan_truncated: bool,
+    /// How to read the listing (it is not an immutable history), and what a truncated scan
+    /// means.
+    pub note: Option<String>,
+    /// Why the call failed (null on success), with what to do about it.
+    pub error: Option<String>,
+    /// The kind of failure.
+    pub error_code: Option<ListErrorCode>,
+}
+
+impl JobList {
+    fn base() -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            jobs: Vec::new(),
+            limit: 0,
+            has_more: false,
+            continuation: false,
+            next_cursor: None,
+            listed_at: None,
+            scan_truncated: false,
+            note: None,
+            error: None,
+            error_code: None,
+        }
+    }
+
+    /// The call failed: no jobs, and the reason.
+    pub fn failure(code: ListErrorCode, message: String) -> Self {
+        let mut l = Self::base();
+        l.error = Some(message);
+        l.error_code = Some(code);
+        l
+    }
+
+    /// The readable text plus the structured listing. The text is the only content block (no
+    /// JSON mirror).
+    pub fn into_list_result(self) -> CallToolResult {
+        let error = self.error.is_some();
+        let text = render_list_text(&self);
+        let structured = serde_json::to_value(&self).expect("listing serializes");
+        let mut r = if error {
+            CallToolResult::error(vec![ContentBlock::text(text)])
+        } else {
+            CallToolResult::success(vec![ContentBlock::text(text)])
+        };
+        r.structured_content = Some(structured);
+        r
+    }
+}
+
+/// The output schema list_jobs declares.
+pub fn list_output_schema() -> Arc<rmcp::model::JsonObject> {
+    rmcp::handler::server::tool::schema_for_output::<JobList>()
+}
+
+/// `limit` as the page size, or the error that says the bounds.
+pub fn validate_limit(limit: Option<u64>) -> Result<usize, Box<JobList>> {
+    match limit {
+        None => Ok(LIST_DEFAULT_LIMIT as usize),
+        Some(n) if (1..=LIST_MAX_LIMIT).contains(&n) => Ok(n as usize),
+        Some(n) => Err(Box::new(JobList::failure(
+            ListErrorCode::InvalidLimit,
+            format!(
+                "limit must be between 1 and {LIST_MAX_LIMIT} (got {n}). Omit it for \
+                 {LIST_DEFAULT_LIMIT}; use next_cursor to read further pages."
+            ),
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// List cursors
+
+/// A position in a listing: the VM (name and generation), the newest id the traversal began
+/// with, and the last id shown. Metadata, not a capability: a forged one can only list jobs of
+/// the VM it names, below the id it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListCursor {
+    pub vm: String,
+    pub generation: String,
+    /// The newest id of the traversal's first page.
+    pub high_water: u64,
+    /// The last (oldest) id of the page this cursor follows; the next page is below it.
+    pub last: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListWire {
+    v: u8,
+    vm: String,
+    g: String,
+    h: u64,
+    l: u64,
+}
+
+/// Ids are bounded so the guest's integer arithmetic is exact.
+const MAX_ID: u64 = 999_999_999_999_999_999;
+
+impl ListCursor {
+    /// The cursor string: base64url (no padding) of a small JSON object.
+    pub fn encode(&self) -> String {
+        let wire = ListWire {
+            v: WIRE_VERSION,
+            vm: self.vm.clone(),
+            g: self.generation.clone(),
+            h: self.high_water,
+            l: self.last,
+        };
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&wire).expect("cursor serializes"))
+    }
+}
+
+/// Decode and check a list_jobs `cursor` for VM `vm`. Nothing here touches the VM.
+pub fn parse_list_cursor(s: &str, vm: &str) -> Result<ListCursor, String> {
+    const HINT: &str = "Omit cursor to list from the newest job.";
+    if s.is_empty() || s.len() > CURSOR_MAX_CHARS {
+        return Err(format!(
+            "cursor must be a next_cursor value from list_jobs (1 to {CURSOR_MAX_CHARS} \
+             characters). {HINT}"
+        ));
+    }
+    let malformed = || format!("cursor is not one list_jobs issued (malformed). {HINT}");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .map_err(|_| malformed())?;
+    if raw.len() > CURSOR_MAX_CHARS {
+        return Err(malformed());
+    }
+    let w: ListWire = serde_json::from_slice(&raw).map_err(|_| malformed())?;
+    if w.v != WIRE_VERSION
+        || w.vm.is_empty()
+        || !token_ok(&w.vm)
+        || w.g.is_empty()
+        || !token_ok(&w.g)
+        || w.l == 0
+        || w.l > w.h
+        || w.h > MAX_ID
+    {
+        return Err(malformed());
+    }
+    if w.vm != vm {
+        return Err(format!(
+            "this cursor belongs to VM '{}', not '{vm}'. Use the next_cursor from a list_jobs \
+             reply about '{vm}', or omit cursor.",
+            w.vm
+        ));
+    }
+    Ok(ListCursor {
+        vm: w.vm,
+        generation: w.g,
+        high_water: w.h,
+        last: w.l,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Request and guest query
+
+/// One list_jobs call, validated.
+#[derive(Clone, Debug)]
+pub struct ListRequest {
+    pub name: String,
+    pub limit: usize,
+    pub cursor: Option<ListCursor>,
+    /// The VM's generation now (see `vm_generation`); set by `bind_generation`.
+    pub generation: String,
+    /// The most the whole query may take.
+    pub attempt: Duration,
+    /// How long past that it may take to report its own timeout.
+    pub grace: Duration,
+    /// The guest script's own time budget, in seconds.
+    pub budget_secs: u64,
+}
+
+impl ListRequest {
+    /// Check `limit` and `cursor` (no VM is consulted: a bad one is refused before any guest
+    /// work).
+    pub fn new(name: &str, limit: Option<u64>, cursor: Option<&str>) -> Result<Self, Box<JobList>> {
+        let limit = validate_limit(limit)?;
+        let cursor = match cursor.map(|c| parse_list_cursor(c, name)) {
+            None => None,
+            Some(Ok(c)) => Some(c),
+            Some(Err(e)) => {
+                return Err(Box::new(JobList::failure(ListErrorCode::InvalidCursor, e)));
+            }
+        };
+        Ok(Self {
+            name: name.to_string(),
+            limit,
+            cursor,
+            generation: String::new(),
+            attempt: LIST_ATTEMPT,
+            grace: LIST_GRACE,
+            budget_secs: LIST_GUEST_BUDGET_SECS,
+        })
+    }
+
+    /// Bind the request to the VM's current generation. A cursor from another one was made for
+    /// records that may differ now (a restore can keep some, a reset or recreation none): the
+    /// listing cannot safely continue from it, so it is refused, never silently restarted.
+    pub fn bind_generation(&mut self, current: &str) -> Result<(), Box<JobList>> {
+        if let Some(c) = &self.cursor
+            && c.generation != current
+        {
+            return Err(Box::new(JobList::failure(
+                ListErrorCode::CursorStale,
+                format!(
+                    "this cursor is from before VM '{}' was reset, restored or recreated: its \
+                     generation changed, so the job records may differ from the ones the \
+                     earlier pages listed (a restored checkpoint can keep some) and the \
+                     listing cannot safely continue from it. Call list_jobs without cursor \
+                     to list the VM as it is now.",
+                    self.name
+                ),
+            )));
+        }
+        self.generation = current.to_string();
+        Ok(())
+    }
+
+    pub fn query(&self) -> ListQuery {
+        ListQuery {
+            limit: self.limit,
+            high_water: self.cursor.as_ref().map_or(0, |c| c.high_water),
+            before: self.cursor.as_ref().map_or(0, |c| c.last),
+            scan_max: LIST_SCAN_MAX,
+            budget_secs: self.budget_secs,
+        }
+    }
+}
+
+/// What the guest script is given: numbers only.
+#[derive(Clone, Debug)]
+pub struct ListQuery {
+    /// The most jobs to report.
+    pub limit: usize,
+    /// Jobs newer than this are left out (0: no bound).
+    pub high_water: u64,
+    /// Only jobs older than this are listed (0: no bound).
+    pub before: u64,
+    /// The most directory entries to look at.
+    pub scan_max: usize,
+    /// Seconds after which the script stops adding jobs to the page.
+    pub budget_secs: u64,
+}
+
+// ---------------------------------------------------------------------------------------------
+// The guest report
+
+/// One job as the guest reported it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GuestEntry {
+    pub id: u64,
+    pub kind: ListedKind,
+    pub state: JobState,
+    pub exit_code: Option<i64>,
+    pub stop: Option<StopReason>,
+    pub log: LogPresence,
+    pub records: Vec<RecordKind>,
+    /// File modification times (Unix seconds), when the files exist.
+    pub recorded: Option<i64>,
+    pub finished: Option<i64>,
+}
+
+/// A listing page as the guest reported it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GuestList {
+    pub entries: Vec<GuestEntry>,
+    /// Whether older jobs may remain below the last entry.
+    pub more: bool,
+    /// The guest's clock (Unix seconds).
+    pub now: Option<i64>,
+    /// How many directory entries were looked at.
+    pub scanned: u64,
+    pub scan_truncated: bool,
+    /// The job directory exists but cannot be read.
+    pub unreadable: bool,
+}
+
+/// An exit code as the guests validate it: ASCII digits with an optional minus, at most ten
+/// digits, no more than 4294967295 in value.
+fn exit_code(s: &str) -> Option<i64> {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    if digits.is_empty() || digits.len() > 10 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: i64 = s.parse().ok()?;
+    (n.abs() <= 4_294_967_295).then_some(n)
+}
+
+fn id_ok(s: &str) -> Option<u64> {
+    let digits = !s.is_empty()
+        && s.len() <= ID_MAX_DIGITS
+        && !s.starts_with('0')
+        && s.bytes().all(|b| b.is_ascii_digit());
+    if digits { s.parse().ok() } else { None }
+}
+
+/// Parse a list script's output (`AGENTPC_LIST <key> <value>` lines), checked against the query
+/// it answered: complete (its `end` line arrived), at most `limit` jobs, strictly descending ids
+/// inside the cursor's window, and every value a validated number or word.
+pub fn parse_list_report(out: &[u8], q: &ListQuery) -> Result<GuestList, String> {
+    let text = String::from_utf8_lossy(out);
+    let mut rep = GuestList::default();
+    let (mut end, mut count, mut more) = (false, None, None);
+    let mut cur: Option<GuestEntry> = None;
+    let mut state_seen = false;
+    let mut exit_bad = false;
+    let mut last_id: Option<u64> = None;
+
+    fn finish(
+        cur: &mut Option<GuestEntry>,
+        state_seen: &mut bool,
+        exit_bad: &mut bool,
+        into: &mut Vec<GuestEntry>,
+    ) -> Result<(), String> {
+        if let Some(mut e) = cur.take() {
+            if !*state_seen {
+                return Err(format!("job {} has no state", e.id));
+            }
+            // An exit code that is invalid, or missing for an exited job, makes that one job
+            // unknown; it is never guessed to have ended.
+            if *exit_bad || (e.state == JobState::Exited && e.exit_code.is_none()) {
+                e.state = JobState::Unknown;
+                e.exit_code = None;
+                e.stop = None;
+            }
+            into.push(e);
+        }
+        *state_seen = false;
+        *exit_bad = false;
+        Ok(())
+    }
+
+    for line in text.lines() {
+        let Some(rest) = line.trim_end().strip_prefix("AGENTPC_LIST ") else {
+            continue;
+        };
+        let (key, val) = match rest.split_once(' ') {
+            Some((k, v)) => (k, v.trim()),
+            None => (rest.trim(), ""),
+        };
+        let num = |v: &str| v.parse::<u64>().map_err(|_| format!("bad {key} '{v}'"));
+        let time = |v: &str| -> Result<i64, String> {
+            let n = num(v)?;
+            if n > 253_402_300_799 {
+                return Err(format!("bad {key} '{v}'"));
+            }
+            Ok(n as i64)
+        };
+        match key {
+            "job" => {
+                finish(&mut cur, &mut state_seen, &mut exit_bad, &mut rep.entries)?;
+                let id = id_ok(val).ok_or_else(|| format!("bad job id '{val}'"))?;
+                if last_id.is_some_and(|l| id >= l)
+                    || (q.high_water != 0 && id > q.high_water)
+                    || (q.before != 0 && id >= q.before)
+                {
+                    return Err(format!("job {id} is out of order or outside the window"));
+                }
+                last_id = Some(id);
+                cur = Some(GuestEntry {
+                    id,
+                    kind: ListedKind::Unknown,
+                    state: JobState::Unknown,
+                    exit_code: None,
+                    stop: None,
+                    log: LogPresence::None,
+                    records: Vec::new(),
+                    recorded: None,
+                    finished: None,
+                });
+            }
+            "recs" | "kind" | "state" | "exit" | "stop" | "log" | "at" | "done" => {
+                let e = cur
+                    .as_mut()
+                    .ok_or_else(|| format!("'{key}' before any job"))?;
+                match key {
+                    "recs" => {
+                        for r in val.split(',').filter(|r| !r.is_empty()) {
+                            let k = RecordKind::parse(r)
+                                .ok_or_else(|| format!("unknown record '{r}'"))?;
+                            if e.records.contains(&k) {
+                                return Err(format!("record '{r}' twice"));
+                            }
+                            e.records.push(k);
+                        }
+                    }
+                    "kind" => {
+                        e.kind = match val {
+                            "foreground" => ListedKind::Foreground,
+                            "background" => ListedKind::Background,
+                            "unknown" => ListedKind::Unknown,
+                            other => return Err(format!("unknown kind '{other}'")),
+                        }
+                    }
+                    "state" => {
+                        state_seen = true;
+                        e.state = match val {
+                            "queued" => JobState::Queued,
+                            "running" => JobState::Running,
+                            "exited" => JobState::Exited,
+                            "stopped" => JobState::Stopped,
+                            "ended" => JobState::Ended,
+                            "not_started" => JobState::NotStarted,
+                            "missing" => JobState::Missing,
+                            "unknown" => JobState::Unknown,
+                            other => return Err(format!("unknown state '{other}'")),
+                        }
+                    }
+                    // A bad exit code degrades this job only (see `finish`): one malformed
+                    // record must not make the page unreadable and hide the older jobs.
+                    "exit" => match exit_code(val) {
+                        Some(c) => e.exit_code = Some(c),
+                        None => exit_bad = true,
+                    },
+                    "stop" => {
+                        e.stop = Some(match val {
+                            "timeout" => StopReason::Timeout,
+                            "request_cancelled" => StopReason::RequestCancelled,
+                            _ => StopReason::StopJob,
+                        })
+                    }
+                    "log" => {
+                        e.log = match val {
+                            "present" => LogPresence::Present,
+                            "absent" => LogPresence::Absent,
+                            "none" => LogPresence::None,
+                            "unreadable" => LogPresence::Unreadable,
+                            other => return Err(format!("unknown log '{other}'")),
+                        }
+                    }
+                    "at" => e.recorded = Some(time(val)?),
+                    _ => e.finished = Some(time(val)?),
+                }
+            }
+            "now" => rep.now = val.parse::<u64>().ok().map(|n| n as i64),
+            "count" => count = Some(num(val)?),
+            "more" => {
+                more = Some(match val {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(format!("bad more '{val}'")),
+                })
+            }
+            "scan" => {
+                let (n, t) = val.split_once(' ').unwrap_or((val, "0"));
+                rep.scanned = num(n)?;
+                rep.scan_truncated = t.trim() == "1";
+            }
+            "error" => {
+                if val == "unreadable" {
+                    rep.unreadable = true;
+                } else {
+                    return Err(format!("unknown error '{val}'"));
+                }
+            }
+            "end" => end = true,
+            _ => {}
+        }
+    }
+    finish(&mut cur, &mut state_seen, &mut exit_bad, &mut rep.entries)?;
+    if !end {
+        return Err("the listing was cut off before its end".to_string());
+    }
+    if rep.unreadable {
+        if !rep.entries.is_empty() {
+            return Err("an unreadable directory with jobs".to_string());
+        }
+        return Ok(rep);
+    }
+    if rep.entries.len() > q.limit {
+        return Err(format!(
+            "{} jobs for a limit of {}",
+            rep.entries.len(),
+            q.limit
+        ));
+    }
+    if count != Some(rep.entries.len() as u64) {
+        return Err("the job count does not match".to_string());
+    }
+    rep.more = more.ok_or("the listing does not say whether more remain")?;
+    Ok(rep)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Assembling the page
+
+/// `secs` since the Unix epoch as `YYYY-MM-DDTHH:MM:SSZ`, for years 1970 to 9999.
+pub fn rfc3339(secs: i64) -> Option<String> {
+    if !(0..=253_402_300_799).contains(&secs) {
+        return None;
+    }
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    ))
+}
+
+fn entry_note(e: &GuestEntry) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    match e.state {
+        JobState::Missing => {
+            let found: Vec<&str> = e.records.iter().map(|r| r.name()).collect();
+            parts.push(format!(
+                "Only incidental records exist ({}): nothing has recorded the job itself (yet). \
+                 That does not show that its command never started or will not start; treat it \
+                 as unresolved.",
+                found.join(", ")
+            ));
+        }
+        JobState::Queued => parts.push(
+            "Launched, or still recording itself. That does not show that its command has not \
+             started; treat it as unresolved until get_job_status reports a final state."
+                .to_string(),
+        ),
+        JobState::Unknown => parts.push(
+            "A record could not be read or is not valid (a permission or read error, or an exit \
+             record that is not an exit code), so its state is unknown, not ended; treat it as \
+             unresolved."
+                .to_string(),
+        ),
+        _ => {}
+    }
+    if e.kind == ListedKind::Unknown && e.state != JobState::Missing {
+        parts.push("Its records do not show whether it was a foreground or background job.".into());
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Turn a guest listing into the page for `req`.
+pub fn assemble_list(req: &ListRequest, rep: &GuestList) -> JobList {
+    if rep.unreadable {
+        return JobList::failure(
+            ListErrorCode::GuestUnreadable,
+            format!(
+                "The job records of VM '{}' could not be read (permission denied or a read \
+                 error), so its jobs are unknown, not absent. Check the VM, then call list_jobs \
+                 again.",
+                req.name
+            ),
+        );
+    }
+    let mut l = JobList::base();
+    l.limit = req.limit as u32;
+    l.continuation = req.cursor.is_some();
+    l.scan_truncated = rep.scan_truncated;
+    l.listed_at = rep.now.and_then(rfc3339);
+    for e in &rep.entries {
+        let foreground = e.kind == ListedKind::Foreground;
+        l.jobs.push(JobSummary {
+            job_id: e.id,
+            kind: e.kind,
+            state: e.state,
+            exit_code: match (e.state, e.exit_code) {
+                (JobState::Exited, Some(c)) if foreground => Some(c & 0xff),
+                (JobState::Exited, c) => c,
+                _ => None,
+            },
+            stop_reason: (e.state == JobState::Stopped).then_some(e.stop).flatten(),
+            log_available: e.log == LogPresence::Present,
+            records: e.records.clone(),
+            recorded_at: e.recorded.and_then(rfc3339),
+            finished_at: e.finished.and_then(rfc3339),
+            note: entry_note(e),
+        });
+    }
+    let mut note = LIST_HISTORY_NOTE.to_string();
+    if rep.scan_truncated {
+        note.push_str(&format!(
+            " The job directory holds more entries than one listing retains ({LIST_SCAN_MAX}), so \
+             this listing may leave out jobs."
+        ));
+    }
+    l.note = Some(note);
+    if rep.more {
+        let Some(last) = rep.entries.last() else {
+            return JobList::failure(
+                ListErrorCode::BadGuestReply,
+                "The VM listed no jobs but said more remain, so there is no position to continue \
+                 from. Call list_jobs again."
+                    .to_string(),
+            );
+        };
+        // The traversal's high-water mark is the first page's newest id.
+        let high_water = req
+            .cursor
+            .as_ref()
+            .map_or(rep.entries[0].id, |c| c.high_water);
+        l.has_more = true;
+        l.next_cursor = Some(
+            ListCursor {
+                vm: req.name.clone(),
+                generation: req.generation.clone(),
+                high_water,
+                last: last.id,
+            }
+            .encode(),
+        );
+    }
+    l
+}
+
+/// The readable form of a listing: one line per job, newest first, then what to do next. Not a
+/// copy of the structured content.
+pub fn render_list_text(l: &JobList) -> String {
+    if let Some(e) = &l.error {
+        return e.clone();
+    }
+    if l.jobs.is_empty() {
+        // An empty page must not read as a complete, empty VM when it is neither.
+        let mut out = match (l.continuation, l.scan_truncated) {
+            (true, true) => {
+                "No further jobs in the portion of the job directory this listing retained."
+            }
+            (true, false) => {
+                "No further jobs below the last one shown (records may have been deleted since)."
+            }
+            (false, true) => {
+                "No jobs found in the portion of the job directory this listing retained."
+            }
+            (false, false) => "No jobs recorded in this VM.",
+        }
+        .to_string();
+        if let Some(n) = &l.note {
+            out.push_str(&format!("\n\n{n}"));
+        }
+        return out;
+    }
+    let mut out = format!(
+        "{} job{} (newest first, limit {}){}",
+        l.jobs.len(),
+        if l.jobs.len() == 1 { "" } else { "s" },
+        l.limit,
+        l.listed_at
+            .as_ref()
+            .map_or(String::new(), |t| format!(", listed at {t}")),
+    );
+    for j in &l.jobs {
+        out.push_str(&format!(
+            "\n{}  {}  {}",
+            j.job_id,
+            j.kind.name(),
+            if j.state == JobState::Missing {
+                "unrecorded (incidental records only)".to_string()
+            } else {
+                state_label(j.state, j.exit_code, j.stop_reason)
+            }
+        ));
+        if j.log_available {
+            out.push_str("  log");
+        }
+        if let Some(t) = &j.recorded_at {
+            out.push_str(&format!("  recorded {t}"));
+        }
+        if let Some(t) = &j.finished_at {
+            out.push_str(&format!("  finished {t}"));
+        }
+        if let Some(n) = &j.note {
+            out.push_str(&format!("\n    {n}"));
+        }
+    }
+    if let Some(c) = &l.next_cursor {
+        out.push_str(&format!(
+            "\n\nMore jobs follow: call list_jobs again with cursor: {c}"
+        ));
+    }
+    if let Some(n) = &l.note {
+        out.push_str(&format!("\n\n{n}"));
+    }
+    out
+}
+
+/// Ask the guest (through `fetch`, once) for the page and assemble it, within the request's
+/// deadline. `cancelled` (the MCP request's cancellation) abandons only the query: the listing
+/// is dropped, with the SSH call it owns, and no job is touched; a request already cancelled
+/// asks the guest nothing.
+pub async fn list_observe<F, Fut, C>(req: &ListRequest, fetch: F, cancelled: C) -> JobList
+where
+    F: FnOnce(&ListQuery, Duration) -> Fut,
+    Fut: Future<Output = Result<GuestList, Failure>>,
+    C: Future<Output = ()>,
+{
+    use futures::FutureExt;
+    let abandoned = || {
+        JobList::failure(
+            ListErrorCode::RequestCancelled,
+            "The list_jobs request was cancelled; only the listing was abandoned. No job was \
+             touched."
+                .to_string(),
+        )
+    };
+    let mut cancelled = Box::pin(cancelled);
+    if cancelled.as_mut().now_or_never().is_some() {
+        return abandoned();
+    }
+    let query = req.query();
+    let run = tokio::time::timeout(req.attempt + req.grace, fetch(&query, req.attempt));
+    tokio::select! {
+        biased;
+        _ = &mut cancelled => abandoned(),
+        r = run => match r {
+            Ok(Ok(rep)) => assemble_list(req, &rep),
+            Ok(Err(f)) => {
+                let code = match f.code {
+                    JobErrorCode::BadGuestReply => ListErrorCode::BadGuestReply,
+                    _ => ListErrorCode::GuestUnreachable,
+                };
+                let message = match code {
+                    ListErrorCode::BadGuestReply => format!(
+                        "The VM answered, but not with a job listing this server understands \
+                         ({}). Its jobs are unknown; call list_jobs again.",
+                        f.detail
+                    ),
+                    _ => format!(
+                        "Could not list the jobs: the VM did not answer ({}). Their states are \
+                         unknown, not ended. Check list_vms, then call list_jobs again.",
+                        f.detail
+                    ),
+                };
+                JobList::failure(code, message)
+            }
+            Err(_) => JobList::failure(
+                ListErrorCode::GuestUnreachable,
+                format!(
+                    "Could not list the jobs: the VM did not answer within {:.0} s. Their states \
+                     are unknown, not ended. Check list_vms, then call list_jobs again.",
+                    req.attempt.as_secs_f64()
+                ),
+            ),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Guest scripts (read-only)
+
+const LINUX_LIST: &str = r#"d=~/agentpc-bg
+jst=
+emit() { printf 'AGENTPC_LIST %s\n' "$*"; case $1 in state) jst=$2 ;; esac; }
+emit now "$(date +%s 2>/dev/null)"
+if [ ! -e "$d" ]; then emit count 0; emit more 0; emit scan 0 0; emit end ok; exit 0; fi
+if [ ! -d "$d" ] || [ ! -r "$d" ] || [ ! -x "$d" ]; then emit error unreadable; emit end ok; exit 0; fi
+raw=$( { LC_ALL=C ls -fq "$d" 2>&1 1>&3 3>&- | sed 's|^|/AGENTPC_LSERR/ |'; } 3>&1 | head -n $((__SCAN__ + 1)) )
+case $raw in "/AGENTPC_LSERR/ "*|*$'\n'"/AGENTPC_LSERR/ "*) emit error unreadable; emit end ok; exit 0 ;; esac
+names=$raw
+scan=$(printf '%s\n' "$names" | wc -l | tr -d ' ')
+trunc=0; [ "$scan" -gt __SCAN__ ] && trunc=1
+ids=$(printf '%s\n' "$names" | head -n __SCAN__ | LC_ALL=C awk -F. 'NF == 2 && length($1) <= 18 && $1 ~ /^[1-9][0-9]*$/ && $2 ~ /^(sh|log|fg|pid|proof|exit|stopped|cancel)$/ { print $1 }' | LC_ALL=C sort -u -n -r)
+hi=__HI__; lt=__LT__; limit=__LIMIT__
+cnt=0; more=0; SECONDS=0
+__OWN__
+for id in $ids; do
+  [ $hi -ne 0 ] && [ $id -gt $hi ] && continue
+  [ $lt -ne 0 ] && [ $id -ge $lt ] && continue
+  recs=
+  for e in sh log fg pid proof exit stopped cancel; do [ -f $d/$id.$e ] && recs="$recs,$e"; done
+  [ -n "$recs" ] || continue
+  if [ $cnt -ge $limit ]; then more=1; break; fi
+  if [ $cnt -gt 0 ] && [ $SECONDS -ge __BUDGET__ ]; then more=1; break; fi
+  cnt=$((cnt + 1)); jst=
+  emit job $id
+  emit recs ${recs#,}
+  bad=0; for e in pid proof exit stopped; do [ -f $d/$id.$e ] && [ ! -r $d/$id.$e ] && bad=1; done
+  fg=0; [ -f $d/$id.fg ] && fg=1
+  p=; x=; xbad=0
+  if [ $bad = 0 ]; then
+    [ -f $d/$id.pid ] && { p=$(<$d/$id.pid); } 2>/dev/null
+    case $p in ''|*[!0-9]*) p= ;; esac
+    [ -f $d/$id.exit ] && { x=$(<$d/$id.exit); } 2>/dev/null
+    x=${x//[[:space:]]/}
+  fi
+__XCHECK__
+  have=0; for e in log fg pid exit stopped; do [ -f $d/$id.$e ] && have=1; done
+  if [ $fg = 1 ]; then emit kind foreground
+  elif [ -f $d/$id.log ] || [ -f $d/$id.sh ]; then emit kind background
+  else emit kind unknown; fi
+  if [ $have = 0 ]; then emit state missing
+  elif [ $bad = 1 ]; then emit state unknown
+  else
+__STATE__
+  fi
+  if [ $fg = 1 ]; then emit log none
+  elif [ -f $d/$id.log ] && [ -r $d/$id.log ]; then emit log present
+  elif [ -f $d/$id.log ]; then emit log unreadable
+  else emit log absent; fi
+  t=; for e in fg sh; do if [ -f $d/$id.$e ]; then t=$(stat -c %Y $d/$id.$e 2>/dev/null); break; fi; done
+  case $t in ''|*[!0-9]*) ;; *) emit at $t ;; esac
+  f=; case $jst in exited) f=exit ;; stopped) f=stopped ;; esac
+  if [ -n "$f" ]; then t=$(stat -c %Y $d/$id.$f 2>/dev/null); case $t in ''|*[!0-9]*) ;; *) emit done $t ;; esac; fi
+done
+emit count $cnt
+emit more $more
+emit scan $scan $trunc
+emit end ok"#;
+
+/// list_jobs's bash. It only reads: no file is created, changed or removed, and no launch
+/// script or log is opened.
+pub fn linux_list_script(q: &ListQuery) -> String {
+    fill(
+        LINUX_LIST,
+        &[
+            ("__OWN__", &linux_own_by("$id")),
+            ("__XCHECK__", LINUX_XCHECK),
+            ("__STATE__", &fill(LINUX_STATE, &[("__ID__", "$id")])),
+            ("__SCAN__", &q.scan_max.to_string()),
+            ("__HI__", &q.high_water.min(MAX_ID).to_string()),
+            ("__LT__", &q.before.min(MAX_ID).to_string()),
+            ("__LIMIT__", &q.limit.to_string()),
+            ("__BUDGET__", &q.budget_secs.to_string()),
+        ],
+    )
+}
+
+/// How the Windows list script finds the names of the files in the job directory: the body of
+/// a function that writes them, one per name, and nothing when the directory does not exist.
+/// (A seam for tests on systems where a backslash is not a path separator.)
+const WINDOWS_LIST_NAMES: &str = r#"  if (-not [IO.Directory]::Exists($d)) { return }
+  [IO.Directory]::EnumerateFiles($d) | ForEach-Object { [IO.Path]::GetFileName($_) }"#;
+
+const WINDOWS_LIST: &str = r#"$d = "$env:USERPROFILE\agentpc-bg"
+$script:jst = ''
+function Emit($k, $v) { if ($k -eq 'state') { $script:jst = $v }; "AGENTPC_LIST $k $v" }
+function ListNames {
+__NAMES__
+}
+try { Emit now ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) } catch { }
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$names = @()
+try { $names = @(ListNames | Select-Object -First (__SCAN__ + 1)) } catch { Emit error unreadable; Emit end ok; exit 0 }
+$scan = $names.Count; $trunc = 0; if ($scan -gt __SCAN__) { $trunc = 1 }
+$set = New-Object 'System.Collections.Generic.HashSet[string]'
+$rx = '^([1-9][0-9]{0,17})\.(ps1|log|fg|pid|exit|stopped|cancel)$'
+$k = 0
+foreach ($nm in $names) { $k++; if ($k -gt __SCAN__) { break }; $m = [regex]::Match([string]$nm, $rx); if ($m.Success) { [void]$set.Add($m.Groups[1].Value) } }
+$ids = @($set | Sort-Object { [int64]$_ } -Descending)
+$hi = [int64]__HI__; $lt = [int64]__LT__; $limit = __LIMIT__
+$cnt = 0; $more = 0
+__OWN__
+foreach ($id in $ids) {
+  $n = [int64]$id
+  if ($hi -ne 0 -and $n -gt $hi) { continue }
+  if ($lt -ne 0 -and $n -ge $lt) { continue }
+  $recs = @()
+  foreach ($e in 'ps1', 'log', 'fg', 'pid', 'exit', 'stopped', 'cancel') { if ([IO.File]::Exists("$d\$id.$e")) { $recs += $e } }
+  if ($recs.Count -eq 0) { continue }
+  if ($cnt -ge $limit) { $more = 1; break }
+  if ($cnt -gt 0 -and $sw.Elapsed.TotalSeconds -ge __BUDGET__) { $more = 1; break }
+  $cnt++; $script:jst = ''
+  $log = "$d\$id.log"
+  $fg = $recs -contains 'fg'
+  $x = ''; $bad = $false
+  if ($recs -contains 'exit') { try { $x = [IO.File]::ReadAllText("$d\$id.exit").Trim() } catch { $bad = $true } }
+__XCHECK__
+  $t = $null
+  if ((-not $fg) -and $x -eq '') { $t = Get-ScheduledTask -TaskName "agentpc-bg-$id" -ErrorAction SilentlyContinue }
+  if ($t) { $recs += 'task' }
+  Emit job $id
+  Emit recs ($recs -join ',')
+  $have = $fg -or [bool]$t -or ($recs -contains 'log') -or ($recs -contains 'exit') -or ($recs -contains 'stopped') -or ($recs -contains 'pid')
+  if ($fg) { Emit kind foreground } elseif (($recs -contains 'log') -or ($recs -contains 'ps1') -or $t) { Emit kind background } else { Emit kind unknown }
+  if (-not $have) { Emit state missing }
+  elseif ($bad) { Emit state unknown }
+  else {
+    $ran = $false
+    if ($t) { try { $ran = (($t | Get-ScheduledTaskInfo).LastRunTime.Year -gt 2000) } catch { } }
+    $tstate = ''
+    if ($t) { $tstate = "$($t.State)" }
+__STATE__
+  }
+  if ($fg) { Emit log none } elseif ($recs -contains 'log') { Emit log present } else { Emit log absent }
+  foreach ($e in 'fg', 'ps1') { if ($recs -contains $e) { try { Emit at ([DateTimeOffset]::new([IO.File]::GetLastWriteTimeUtc("$d\$id.$e")).ToUnixTimeSeconds()) } catch { }; break } }
+  $f = ''
+  if ($script:jst -eq 'exited') { $f = 'exit' } elseif ($script:jst -eq 'stopped') { $f = 'stopped' }
+  if ($f) { try { Emit done ([DateTimeOffset]::new([IO.File]::GetLastWriteTimeUtc("$d\$id.$f")).ToUnixTimeSeconds()) } catch { } }
+}
+Emit count $cnt
+Emit more $more
+Emit scan "$scan $trunc"
+Emit end ok"#;
+
+/// Windows's counterpart of `linux_list_script` (PowerShell 5.1 compatible).
+pub fn windows_list_script(q: &ListQuery) -> String {
+    windows_list_script_with(q, WINDOWS_LIST_NAMES)
+}
+
+/// `windows_list_script` with the lister of the job directory's file names replaced (see
+/// `WINDOWS_LIST_NAMES`).
+pub fn windows_list_script_with(q: &ListQuery, names: &str) -> String {
+    fill(
+        WINDOWS_LIST,
+        &[
+            ("__OWN__", &windows_own_by("$id")),
+            ("__XCHECK__", WINDOWS_XCHECK),
+            ("__STATE__", &fill(WINDOWS_STATE, &[("__ID__", "$id")])),
+            ("__NAMES__", names),
+            ("__SCAN__", &q.scan_max.to_string()),
+            ("__HI__", &q.high_water.min(MAX_ID).to_string()),
+            ("__LT__", &q.before.min(MAX_ID).to_string()),
+            ("__LIMIT__", &q.limit.to_string()),
+            ("__BUDGET__", &q.budget_secs.to_string()),
         ],
     )
 }
@@ -1863,6 +3067,28 @@ mod tests {
             label(base(JobState::Stopped, Some(StopReason::Timeout), None))
                 .starts_with("STATE: stopped at its run_command timeout")
         );
+        // A foreground command stopped because its run_command request was cancelled: its
+        // own reason, in the record and the text, never read as stop_job or a timeout.
+        let r = parse_report(
+            b"AGENTPC_JOB kind foreground\nAGENTPC_JOB state stopped\nAGENTPC_JOB stop request_cancelled\nAGENTPC_JOB end ok\n",
+        )
+        .unwrap();
+        assert_eq!(r.stop, Some(StopReason::RequestCancelled));
+        assert_eq!(
+            serde_json::to_value(StopReason::RequestCancelled).unwrap(),
+            "request_cancelled"
+        );
+        let said = label(base(
+            JobState::Stopped,
+            Some(StopReason::RequestCancelled),
+            None,
+        ));
+        assert!(
+            said.starts_with(
+                "STATE: stopped when its run_command request was cancelled or its MCP session ended"
+            ),
+            "{said}"
+        );
         assert!(
             label(base(JobState::Ended, None, None))
                 .starts_with("STATE: ended without an exit code (killed, or the VM restarted)")
@@ -2051,7 +3277,9 @@ mod tests {
         }
         // The only thing it takes from the execution module is the read-only liveness check.
         assert_eq!(prod.matches("crate::execution").count(), 1);
-        assert!(prod.contains("use crate::execution::{linux_own, windows_own};"));
+        assert!(prod.contains(
+            "use crate::execution::{linux_own, linux_own_by, windows_own, windows_own_by};"
+        ));
     }
 
     // ---- the guest scripts do not write -----------------------------------------------

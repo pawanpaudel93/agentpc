@@ -17,6 +17,14 @@ jobs, timeouts, file copies, port forwards, checkpoints, reset, and (in two more
 VMs) offline mode and a non-default size. Needs internet in the guest (example.com). Exits 1 if any check fails.
 Standard library only.
 
+Recovery and readiness checks (every OS, on a concurrent client that can leave requests in
+flight): a foreground run cancelled with notifications/cancelled is stopped and found again with
+list_jobs and get_job_status, a background job survives its start request's cancellation, a
+disconnected second session stops its foreground run, list_jobs pages and degrades gracefully, a
+list cursor goes stale across restore_vm, and wait_for_service sees late TCP and HTTP listeners,
+status mismatches, an unfollowed redirect, a closed port and the job-failure shortcut without
+stopping the server. The VM-free protocol checks cover the four typed tools' schemas and errors.
+
 Execution and observation checks (every OS): the declared tool schemas and annotations over
 the real protocol (no VM needed), structured run_command results (streams, exit codes, errors),
 foreground timeouts that stop the command's own processes and leave unrelated ones alone,
@@ -32,7 +40,6 @@ import hashlib
 import json
 import os
 import platform
-import queue
 import re
 import shutil
 import socket
@@ -43,6 +50,8 @@ import threading
 import time
 import traceback
 import urllib.request
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -80,21 +89,25 @@ sys.excepthook = safe_excepthook
 
 
 class Mcp:
-    def __init__(self, binary):
+    def __init__(self, binary, env=None):
         self.binary = binary
         self.proc = subprocess.Popen(
             [binary, "mcp"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env={**os.environ, **(env or {})},
         )
-        # A reader thread hands each line over a queue, so no reply sits unseen in a buffer
-        # (select() on a buffered pipe misses a second line already read into it).
-        self.lines = queue.Queue()
-        threading.Thread(target=self.read_lines, daemon=True).start()
+        # A reader thread matches each reply to its request by id and completes that request's
+        # future, so requests can overlap: one left in flight (to be cancelled, or abandoned)
+        # does not hold up the others, and no reply sits unseen in a buffer.
+        self.send_lock = threading.Lock()
+        self.pending = {}  # request id -> Future of the whole reply message
+        self.pending_lock = threading.Lock()
         self.next_id = 0
         self.calls = 0
         self.log = []  # (tool, seconds, result bytes) of every call(), for METRIC lines
+        threading.Thread(target=self.read_lines, daemon=True).start()
         self.request(
             "initialize",
             {
@@ -106,35 +119,73 @@ class Mcp:
         self.notify("notifications/initialized")
 
     def read_lines(self):
-        for line in self.proc.stdout:
-            self.lines.put(line)
-        self.lines.put(None)  # EOF
+        try:
+            for line in self.proc.stdout:
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if "method" in msg or "id" not in msg:  # a notification or a request from the server
+                    continue
+                with self.pending_lock:
+                    fut = self.pending.pop(msg["id"], None)
+                if fut is not None and not fut.done():
+                    fut.set_result(msg)
+        finally:  # EOF: nothing pending will ever be answered
+            with self.pending_lock:
+                orphaned, self.pending = list(self.pending.values()), {}
+            for fut in orphaned:
+                if not fut.done():
+                    fut.set_exception(RuntimeError("agentpc mcp exited"))
 
     def send(self, msg):
-        self.proc.stdin.write((json.dumps(msg) + "\n").encode())
-        self.proc.stdin.flush()
+        with self.send_lock:
+            self.proc.stdin.write((json.dumps(msg) + "\n").encode())
+            self.proc.stdin.flush()
 
-    def notify(self, method):
-        self.send({"jsonrpc": "2.0", "method": method})
+    def notify(self, method, params=None):
+        msg = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            msg["params"] = params
+        self.send(msg)
+
+    def start(self, method, params):
+        """Send a request without waiting: (its id, a Future of the reply). Pair it with
+        finish(), or with cancel() and forget() to abandon it."""
+        fut = Future()
+        with self.pending_lock:
+            self.next_id += 1
+            want = self.next_id
+            self.pending[want] = fut
+        self.send({"jsonrpc": "2.0", "id": want, "method": method, "params": params})
+        return want, fut
+
+    def finish(self, method, fut, timeout=None):
+        """The result of a start()ed request; raises RuntimeError for a JSON-RPC error or the
+        server's exit, TimeoutError past `timeout` (CALL_TIMEOUT by default)."""
+        try:
+            msg = fut.result(timeout=CALL_TIMEOUT if timeout is None else timeout)
+        except FutureTimeout:
+            raise TimeoutError(f"{method} took over {CALL_TIMEOUT if timeout is None else timeout}s") from None
+        if "error" in msg:
+            raise RuntimeError(f"{method}: {msg['error']}")
+        return msg["result"]
 
     def request(self, method, params):
-        self.next_id += 1
-        want = self.next_id
-        self.send({"jsonrpc": "2.0", "id": want, "method": method, "params": params})
-        deadline = time.time() + CALL_TIMEOUT
-        while time.time() < deadline:
-            try:
-                line = self.lines.get(timeout=max(0, deadline - time.time()))
-            except queue.Empty:
-                break
-            if line is None:
-                raise RuntimeError("agentpc mcp exited")
-            msg = json.loads(line)
-            if msg.get("id") == want:  # skip progress and other notifications
-                if "error" in msg:
-                    raise RuntimeError(f"{method}: {msg['error']}")
-                return msg["result"]
-        raise TimeoutError(f"{method} took over {CALL_TIMEOUT}s")
+        return self.finish(method, self.start(method, params)[1])
+
+    def cancel(self, request_id, reason="smoke cancellation"):
+        """Send notifications/cancelled for a request that is in flight."""
+        self.notify("notifications/cancelled", {"requestId": request_id, "reason": reason})
+
+    def forget(self, request_id):
+        """Stop waiting for a request: whatever the server sends for it is dropped."""
+        with self.pending_lock:
+            self.pending.pop(request_id, None)
+
+    def start_call(self, tool_name, /, **args):
+        """start() for tools/call: (request id, Future). Finish it with finish("tools/call", fut)."""
+        return self.start("tools/call", {"name": tool_name, "arguments": args})
 
     def call(self, tool_name, /, **args):
         """Call an agentpc tool; returns the whole result: content blocks, isError and
@@ -172,11 +223,21 @@ class Mcp:
         return ok, text
 
     def close(self):
-        self.proc.stdin.close()
+        """End the server's input, wait for it, kill it if it will not go, and reap it and
+        release both pipes either way."""
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
         try:
             self.proc.wait(timeout=60)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+            self.proc.wait()
+        try:  # the reader thread ends at EOF; then nothing else holds the pipe
+            self.proc.stdout.close()
+        except OSError:
+            pass
 
 
 class Report:
@@ -206,7 +267,8 @@ def brief(res):
     d = structured(res)
     keys = ("state", "exit_code", "timed_out", "termination_confirmed", "effect_unknown",
             "recovery_action", "error_code", "cursor_reset", "cursor_reset_reason",
-            "wait_timed_out", "has_more")
+            "wait_timed_out", "has_more", "request_cancelled", "scan_truncated", "http_outcome",
+            "http_status", "tcp", "attempts")
     out = {k: d[k] for k in keys if k in d}
     out["isError"] = bool(res.get("isError"))
     out["blocks"] = [c.get("type") for c in res.get("content", [])]
@@ -264,9 +326,9 @@ RUN_COMMAND_FIELDS = {
     "schema_version", "state", "execution_id", "job_id", "background", "exit_code", "stdout",
     "stderr", "stdout_bytes", "stderr_bytes", "stdout_truncated", "stderr_truncated",
     "output_truncated", "timed_out", "termination_confirmed", "effect_unknown",
-    "recovery_action", "log_path", "error",
+    "recovery_action", "log_path", "error", "request_cancelled",
 }
-RUN_COMMAND_STATES = {"exited", "timed_out", "not_started", "connection_lost", "started"}
+RUN_COMMAND_STATES = {"exited", "timed_out", "not_started", "connection_lost", "started", "cancelled"}
 JOB_STATUS_FIELDS = {
     "schema_version", "state", "job_id", "kind", "exit_code", "stop_reason", "log_available",
     "log_tail", "output", "output_bytes", "output_truncated", "invalid_utf8", "has_more",
@@ -274,6 +336,19 @@ JOB_STATUS_FIELDS = {
     "note", "error", "error_code",
 }
 JOB_STATES = {"queued", "running", "exited", "stopped", "ended", "not_started", "missing", "unknown"}
+LIST_JOBS_FIELDS = {
+    "schema_version", "jobs", "limit", "has_more", "continuation", "next_cursor", "listed_at",
+    "scan_truncated", "note", "error", "error_code",
+}
+WAIT_FIELDS = {
+    "schema_version", "state", "name", "protocol", "guest_port", "path", "expected_status",
+    "criterion", "criterion_met", "tcp", "http_outcome", "http_status", "attempts", "waited_ms",
+    "timeout_seconds", "timed_out", "cancelled", "job", "note", "error", "error_code",
+}
+WAIT_STATES = {"ready", "timed_out", "job_failed", "cancelled", "error"}
+TYPED_TOOLS = {"run_command", "get_job_status", "list_jobs", "wait_for_service"}
+MAX_LIST_LIMIT = 100
+MAX_WAIT_TIMEOUT = 120
 MAX_REPLY_BYTES = 16 * 1024  # most log bytes one get_job_status reply carries
 MAX_WAIT_SECONDS = 30
 # Most a foreground timeout may take beyond `timeout`: the cancellation, session and drain
@@ -332,8 +407,8 @@ def protocol_checks(binary, r):
         r.check("the server lists exactly the tools AGENTS.md documents", set(tools) == documented,
                 f"differ: {sorted(set(tools) ^ documented)}")
         declared = {n for n, t in tools.items() if t.get("outputSchema")}
-        r.check("only run_command and get_job_status declare an output schema",
-                declared == {"run_command", "get_job_status"}, str(sorted(declared)))
+        r.check("only run_command, get_job_status, list_jobs and wait_for_service declare an output schema",
+                declared == TYPED_TOOLS, str(sorted(declared)))
         for name, fields, states in (
             ("run_command", RUN_COMMAND_FIELDS, RUN_COMMAND_STATES),
             ("get_job_status", JOB_STATUS_FIELDS, JOB_STATES),
@@ -345,6 +420,17 @@ def protocol_checks(binary, r):
                     and "$ref" not in json.dumps(schema), f"missing: {sorted(fields - set(props))}")
             r.check(f"{name}: the output schema's states are the documented ones",
                     enum_values(props.get("state", {})) == states, str(sorted(enum_values(props.get("state", {})))))
+        for name, fields, states in (
+            ("list_jobs", LIST_JOBS_FIELDS, None),
+            ("wait_for_service", WAIT_FIELDS, WAIT_STATES),
+        ):
+            schema = tools[name].get("outputSchema") or {}
+            props = schema.get("properties", {})
+            r.check(f"{name}: the output schema is an object with the documented fields",
+                    schema.get("type") == "object" and fields <= set(props), f"missing: {sorted(fields - set(props))}")
+            if states is not None:
+                r.check(f"{name}: the output schema's states are the documented ones",
+                        enum_values(props.get("state", {})) == states, str(sorted(enum_values(props.get("state", {})))))
         job_in = tools["get_job_status"]["inputSchema"].get("properties", {})
         wait = job_in.get("wait_seconds", {})
         r.check("get_job_status input: wait_seconds is bounded 0..30, tail_lines and cursor remain",
@@ -366,6 +452,26 @@ def protocol_checks(binary, r):
         r.check("inspect_desktop takes exactly use_desktop_tool's arguments",
                 tools["inspect_desktop"]["inputSchema"] == tools["use_desktop_tool"]["inputSchema"])
         r.check("get_job_status is read-only", note("get_job_status").get("readOnlyHint") is True)
+        r.check("list_jobs and wait_for_service are read-only, not destructive, idempotent and closed-world",
+                all(note(n).get("readOnlyHint") is True and note(n).get("destructiveHint") is False
+                    and note(n).get("idempotentHint") is True and note(n).get("openWorldHint") is False
+                    for n in ("list_jobs", "wait_for_service")), str({n: note(n) for n in ("list_jobs", "wait_for_service")}))
+        list_in = tools["list_jobs"]["inputSchema"].get("properties", {})
+        wait_in = tools["wait_for_service"]["inputSchema"].get("properties", {})
+        r.check("list_jobs input: limit is bounded 1..100 (default 20); only name is required",
+                list_in.get("limit", {}).get("minimum") == 1 and list_in.get("limit", {}).get("maximum") == MAX_LIST_LIMIT
+                and list_in.get("limit", {}).get("default") == 20
+                and tools["list_jobs"]["inputSchema"].get("required") == ["name"], str(list_in.get("limit")))
+        r.check("wait_for_service input: port 1..65535, timeout_seconds 1..120 (default 30), no default for path or expected_status",
+                wait_in.get("guest_port", {}).get("minimum") == 1 and wait_in.get("guest_port", {}).get("maximum") == 65535
+                and wait_in.get("timeout_seconds", {}).get("maximum") == MAX_WAIT_TIMEOUT
+                and wait_in.get("timeout_seconds", {}).get("default") == 30
+                and "default" not in wait_in.get("path", {}) and "default" not in wait_in.get("expected_status", {})
+                and tools["wait_for_service"]["inputSchema"].get("required") == ["name", "guest_port"],
+                str(sorted(wait_in)))
+        r.check("run_command's description states cancellation and where to recover a cancelled run",
+                all(term in (tools["run_command"].get("description") or "")
+                    for term in ("cancelled", "request_cancelled", "list_jobs", "background")), "")
 
         ghost = f"smoke-absent-{os.getpid()}"
         res = m.call("run_command", name=ghost, command="echo never")
@@ -388,6 +494,35 @@ def protocol_checks(binary, r):
             r.check(f"get_job_status with {label}: structured error {code}",
                     res.get("isError") is True and d.get("error_code") == code
                     and d.get("state") == "unknown" and bool(d.get("error")), brief(res))
+        # list_jobs and wait_for_service refuse bad arguments before any VM work, with typed errors.
+        for label, code, args in (
+            ("limit 0", "invalid_limit", {"limit": 0}),
+            (f"limit {MAX_LIST_LIMIT + 1}", "invalid_limit", {"limit": MAX_LIST_LIMIT + 1}),
+            ("a malformed cursor", "invalid_cursor", {"cursor": "not-a-cursor"}),
+            ("the start cursor of get_job_status", "invalid_cursor", {"cursor": "start"}),
+            ("a valid request, then the missing VM", "no_such_vm", {}),
+        ):
+            res = m.call("list_jobs", name=ghost, **args)
+            d = structured(res)
+            r.check(f"list_jobs with {label}: structured error {code}, no jobs, one text block",
+                    res.get("isError") is True and d.get("error_code") == code and d.get("jobs") == []
+                    and len(res["content"]) == 1 and not text_of(res).lstrip().startswith("{"), brief(res))
+        for label, code, args in (
+            ("port 0", "invalid_port", {"guest_port": 0}),
+            ("port 65536", "invalid_port", {"guest_port": 65536}),
+            ("protocol udp", "invalid_protocol", {"guest_port": 80, "protocol": "udp"}),
+            ("timeout_seconds 121", "invalid_timeout", {"guest_port": 80, "timeout_seconds": MAX_WAIT_TIMEOUT + 1}),
+            ("a URL as the path", "invalid_path", {"guest_port": 80, "protocol": "http", "path": "//host/x"}),
+            ("expected_status 99", "invalid_status", {"guest_port": 80, "protocol": "http", "expected_status": 99}),
+            ("a path with tcp", "invalid_argument", {"guest_port": 80, "path": "/x"}),
+            ("a valid request, then the missing VM", "no_such_vm", {"guest_port": 80}),
+        ):
+            res = m.call("wait_for_service", name=ghost, **args)
+            d = structured(res)
+            r.check(f"wait_for_service with {label}: structured error {code}, nothing probed, one text block",
+                    res.get("isError") is True and d.get("error_code") == code and d.get("state") == "error"
+                    and d.get("attempts") == 0 and len(res["content"]) == 1
+                    and not text_of(res).lstrip().startswith("{"), brief(res))
     finally:
         m.close()
 
@@ -396,6 +531,7 @@ def observation(m, vm, r, windows=False):
     """Everything about running commands, watching jobs and observing the desktop on `vm`."""
     execution_checks(m, vm, r, windows)
     job_checks(m, vm, r, windows)
+    recovery_checks(m, vm, r, windows)
     inspect_checks(m, vm, r, windows)
 
 
@@ -642,6 +778,493 @@ def job_checks(m, vm, r, windows):
             and d.get("cursor_reset_reason") in ("log_shrunk", "log_rewritten", "log_replaced")
             and d.get("output") == "replacement", brief(res))
     metric("job workflow (start, cursor reads with waits, expiry, reset)", m, since)
+
+
+# ---- Recovery and readiness ------------------------------------------------------------------
+# Cancelled and dropped requests, finding jobs again, and waiting for a service, driven over the
+# real protocol with requests left in flight. Every payload here is a known synthetic command;
+# failures print brief() labels only, never a reply's text.
+
+READY_PORT = 18082
+CLOSED_PORT = 18083
+# A guest HTTP server for the readiness checks: 200 everywhere except /mismatch (503), /redirect
+# (302 to /target, whose requests it counts), and /slow (a reply after 8 s). Started as a
+# background job; Python 3 in the Linux guests, a raw listener in PowerShell on Windows.
+_PYTHON_HTTP = r"""import http.server, time
+from pathlib import Path
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/target':
+            p = Path.home() / 'ready-target-count'
+            p.write_text(str(int(p.read_text()) + 1 if p.exists() else 1))
+        if self.path == '/slow':
+            time.sleep(__SLOW__)
+        code = 503 if self.path == '/mismatch' else 302 if self.path == '/redirect' else 200
+        self.send_response(code)
+        if code == 302:
+            self.send_header('Location', '/target')
+        body = b'SYNTHETIC-RESPONSE-BODY-NOT-FOR-RESULT'
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+    def log_message(self, *args):
+        pass
+http.server.ThreadingHTTPServer(('127.0.0.1', __PORT__), H).serve_forever()"""
+# The same routes under perl's IO::Socket::INET (the idiom of the forward_port check below), for
+# guests without python3 (Arch). Single-threaded, so it must survive what the readiness probes do:
+# SIGPIPE is ignored (a cancelled /slow reply writes to a closed socket), and a connection that
+# sends nothing, an empty line or a partial line is skipped, not served and not fatal.
+_PERL_HTTP = r"""use IO::Socket::INET;
+$SIG{PIPE} = 'IGNORE';
+my $s = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => __PORT__, Listen => 16, ReuseAddr => 1)
+    or die "listen: $!";
+while (my $c = $s->accept) {
+    my $line = <$c>;
+    next unless defined $line && $line =~ m{^GET (\S+) };
+    my $path = $1;
+    while (my $h = <$c>) { last if $h =~ /^\r?\n$/ }
+    if ($path eq '/target') {
+        my $f = "$ENV{HOME}/ready-target-count";
+        my $n = 0;
+        if (open(my $in, '<', $f)) { $n = (<$in> // 0) + 0; close $in }
+        if (open(my $out, '>', $f)) { print $out $n + 1; close $out }
+    }
+    sleep __SLOW__ if $path eq '/slow';
+    my ($code, $reason, $extra) = (200, 'OK', '');
+    ($code, $reason) = (503, 'Unavailable') if $path eq '/mismatch';
+    ($code, $reason, $extra) = (302, 'Found', "Location: /target\r\n") if $path eq '/redirect';
+    my $body = 'SYNTHETIC-RESPONSE-BODY-NOT-FOR-RESULT';
+    print $c "HTTP/1.1 $code $reason\r\n${extra}Content-Length: " . length($body) . "\r\nConnection: close\r\n\r\n$body";
+}"""
+
+
+def linux_http_server(kind, port=READY_PORT, slow_seconds=8):
+    """The guest HTTP fixture as a shell command: 200 everywhere except /mismatch (503), /redirect
+    (302 to /target, whose visits it counts in ~/ready-target-count) and /slow (replies after
+    `slow_seconds`). `kind` is "python3" or "perl"; both listen on 127.0.0.1 only and return the
+    same synthetic, non-credential body."""
+    program, interpreter = (_PYTHON_HTTP, "python3 -u -") if kind == "python3" else (_PERL_HTTP, "perl -")
+    program = program.replace("__PORT__", str(port)).replace("__SLOW__", str(slow_seconds))
+    return f"exec {interpreter} <<'SERVER'\n{program}\nSERVER"
+
+
+def late_listener_command(kind, port, delay=4):
+    """A TCP listener on 127.0.0.1:port that binds only after `delay` seconds and holds it."""
+    if kind == "python3":
+        listen = ("python3 -c \"import socket,time; s=socket.socket(); "
+                  "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); "
+                  f"s.bind(('127.0.0.1', {port})); s.listen(); time.sleep(600)\"")
+    else:
+        listen = ("perl -MIO::Socket::INET -e '$s = IO::Socket::INET->new(LocalAddr => \"127.0.0.1\", "
+                  f"LocalPort => {port}, Listen => 5, ReuseAddr => 1) or die; sleep 600'")
+    return f"sleep {delay}; exec {listen}"
+
+
+WINDOWS_HTTP_SERVER = r"""$l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, %d); $l.Start()
+while ($true) {
+  $cl = $l.AcceptTcpClient(); $st = $cl.GetStream(); $st.ReadTimeout = 2000; $st.WriteTimeout = 2000
+  try {
+    $rd = [IO.StreamReader]::new($st); $line = $rd.ReadLine()
+    if (!$line) { continue }
+    $path = ($line -split ' ')[1]
+    while ($rd.ReadLine()) {}
+    if ($path -eq '/target') {
+      $f = "$env:USERPROFILE\ready-target-count"; $n = 0
+      if (Test-Path $f) { $n = [int][IO.File]::ReadAllText($f) }
+      [IO.File]::WriteAllText($f, [string]($n + 1))
+    }
+    if ($path -eq '/slow') { Start-Sleep 8 }
+    $code = 200; $reason = 'OK'; $extra = ''
+    if ($path -eq '/mismatch') { $code = 503; $reason = 'Unavailable' }
+    if ($path -eq '/redirect') { $code = 302; $reason = 'Found'; $extra = "Location: /target`r`n" }
+    $body = 'SYNTHETIC-RESPONSE-BODY-NOT-FOR-RESULT'
+    $bytes = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 $code $reason`r`n${extra}Content-Length: $($body.Length)`r`nConnection: close`r`n`r`n$body")
+    $st.Write($bytes, 0, $bytes.Length)
+  } catch {} finally { $cl.Close() }
+}""" % READY_PORT
+
+
+def guest(m, vm, command, **kw):
+    """run_command's typed result for `command`, as a dict (stdout etc.)."""
+    kw.setdefault("timeout", 30)
+    return structured(m.call("run_command", name=vm, command=command, **kw))
+
+
+def guest_out(m, vm, command, **kw):
+    return guest(m, vm, command, **kw).get("stdout", "").strip()
+
+
+def list_all_jobs(m, vm, limit=100, pages=50):
+    """Every job list_jobs returns, following next_cursor; None if a page is an error."""
+    jobs, cursor = [], None
+    for _ in range(pages):
+        args = {"limit": limit}
+        if cursor:
+            args["cursor"] = cursor
+        res = m.call("list_jobs", name=vm, **args)
+        d = structured(res)
+        if res.get("isError"):
+            return None
+        jobs += d.get("jobs", [])
+        cursor = d.get("next_cursor")
+        if not d.get("has_more") or not cursor:
+            return jobs
+    return jobs
+
+
+def job_state(m, vm, job):
+    return structured(m.call("get_job_status", name=vm, id=job)).get("state")
+
+
+def processes_present(m, vm, r, label, count_command, expected, seconds=40, every=1):
+    """Prove, boundedly, that `expected` processes exist (count_command prints their number) before
+    a stop is asked for: a marker file shows only that a payload began, not that it spawned them."""
+    ok = bool(poll(lambda: guest_out(m, vm, count_command) == str(expected), seconds, every))
+    r.check(f"{label}: {expected} process(es) exist before the stop", ok,
+            "the expected processes never appeared, so a later count of 0 would prove nothing")
+    return ok
+
+
+def processes_gone(m, vm, r, label, count_command, proven, seconds=30, every=1):
+    """After a stop: none are left. Without `proven` presence beforehand this is a failed check
+    (it never looks), because zero from the start is not evidence that anything was stopped."""
+    if not proven:
+        r.check(f"{label}: gone after the stop", False, "their existence was never proven, so this cannot pass")
+        return False
+    ok = bool(poll(lambda: guest_out(m, vm, count_command) == "0", seconds, every))
+    r.check(f"{label}: gone after the stop", ok)
+    return ok
+
+
+def survive_cancel_checks(m, vm, r, command, settle=2):
+    """A background start is detached: cancelling its (completed) request does not stop the job."""
+    rid, fut = m.start_call("run_command", name=vm, command=command, background=True)
+    started = m.finish("tools/call", fut)
+    bg = structured(started).get("job_id")
+    r.check("the background start returned a job id", bg is not None, brief(started))
+    m.cancel(rid)
+    time.sleep(settle)
+    if bg is None:
+        return
+    r.check("a background job survives the cancellation of its start request",
+            job_state(m, vm, bg) in ("queued", "running"))
+    ok, _ = m.tool("stop_job", name=vm, id=bg)
+    r.check("stop_job still ends that background job", ok)
+
+
+def cancellation_checks(m, vm, r, windows):
+    """A foreground run_command cancelled over the real protocol (notifications/cancelled) is
+    stopped in the VM, recoverable through list_jobs and get_job_status, and leaves unrelated
+    work alone; a background start survives its own request's cancellation; a client that
+    disconnects stops its foreground run (a second MCP session, so this one can observe)."""
+    since = len(m.log)
+    if windows:
+        guest(m, vm, "Invoke-CimMethod Win32_Process -MethodName Create -Arguments "
+                     "@{ CommandLine = 'ping.exe -n 8314 127.0.0.1' } | Out-Null")
+        payload = ("[IO.File]::WriteAllText(\"$env:USERPROFILE\\cancel-marker\", 'x'); "
+                   "Start-Process ping.exe -ArgumentList '-n 8311 127.0.0.1' -WindowStyle Hidden; Start-Sleep 900")
+        marker = "Test-Path \"$env:USERPROFILE\\cancel-marker\""
+        yes = "True"
+        count = lambda n: ("@(Get-CimInstance Win32_Process | Where-Object "
+                           f"{{ $_.CommandLine -like '*-n {n} *' }}).Count")
+        mine, unrelated, mine_expected = count(8311), count(8314), 1
+        bg_command = "ping.exe -n 8315 127.0.0.1"
+        payload2 = ("[IO.File]::WriteAllText(\"$env:USERPROFILE\\disconnect-marker\", 'x'); "
+                    "Start-Process ping.exe -ArgumentList '-n 8316 127.0.0.1' -WindowStyle Hidden; Start-Sleep 900")
+        marker2 = "Test-Path \"$env:USERPROFILE\\disconnect-marker\""
+        mine2 = count(8316)
+    else:
+        guest(m, vm, "sleep 8314", background=True)
+        payload = ("printf x > ~/cancel-marker; sleep 8311 & sudo -n sleep 8312 & "
+                   "env -i setsid sleep 8313 & wait")
+        marker = "test -f ~/cancel-marker && echo yes || echo no"
+        yes = "yes"
+        mine, unrelated, mine_expected = "pgrep -fx 'sleep 831[123]' | wc -l", "pgrep -fx 'sleep 8314' | wc -l", 3
+        bg_command = "sleep 8315"
+        payload2 = "printf x > ~/disconnect-marker; sleep 8316 & wait"
+        marker2 = "test -f ~/disconnect-marker && echo yes || echo no"
+        mine2 = "pgrep -fx 'sleep 8316' | wc -l"
+
+    rid, fut = m.start_call("run_command", name=vm, command=payload, timeout=120)
+    try:
+        r.check("a foreground payload is running before it is cancelled",
+                poll(lambda: guest_out(m, vm, marker) == yes, 40))
+        # The id a cancelling client never receives: found again by listing.
+        running = [j for j in (list_all_jobs(m, vm) or [])
+                   if j.get("kind") == "foreground" and j.get("state") == "running"]
+        r.check("list_jobs recovers the in-flight run: exactly one running foreground job",
+                len(running) == 1, f"{len(running)} running foreground jobs")
+        job = running[0]["job_id"] if len(running) == 1 else None
+        spawned = processes_present(m, vm, r, "the foreground payload's own processes", mine, mine_expected)
+        m.cancel(rid)
+        if job is not None:
+            def stopped():
+                d = structured(m.call("get_job_status", name=vm, id=job))
+                return d.get("state") == "stopped" and d.get("stop_reason") == "request_cancelled"
+            r.check("notifications/cancelled stops the run: get_job_status says stopped, request_cancelled",
+                    poll(stopped, 40, 1))
+            listed = [j for j in (list_all_jobs(m, vm) or []) if j.get("job_id") == job]
+            r.check("list_jobs reports the same stop for that job",
+                    len(listed) == 1 and listed[0].get("state") == "stopped"
+                    and listed[0].get("stop_reason") == "request_cancelled", f"{len(listed)} entries")
+        processes_gone(m, vm, r, "the cancelled run's own processes", mine, spawned)
+        r.check("a process the cancelled run did not start is still running", guest_out(m, vm, unrelated) == "1")
+    finally:
+        m.cancel(rid)  # harmless if already cancelled; ends the run if the checks above failed early
+        m.forget(rid)
+
+    survive_cancel_checks(m, vm, r, bg_command)
+
+    # A client that disconnects: its foreground run is stopped, the VM and unrelated work stay.
+    other = Mcp(m.binary, env={"AGENTPC_KEEP_RUNNING": "1"})
+    try:
+        rid2, _ = other.start_call("run_command", name=vm, command=payload2, timeout=120)
+        r.check("a second session's foreground payload is running before it disconnects",
+                poll(lambda: guest_out(m, vm, marker2) == yes, 40))
+        spawned2 = processes_present(m, vm, r, "the second session's payload processes", mine2, 1)
+        other.forget(rid2)
+    finally:
+        began = time.monotonic()
+        other.close()
+        closed = time.monotonic() - began
+    print(f"  METRIC  disconnected session closed in {closed:.2f}s")
+    processes_gone(m, vm, r, "the disconnected session's payload processes", mine2, spawned2)
+    r.check("a process the disconnected run did not start is still running", guest_out(m, vm, unrelated) == "1")
+    ok, out = m.tool("list_vms")
+    try:
+        state = next(v["state"] for v in json.loads(out[out.index("{"):]).get("instances", []) if v["name"] == vm)
+    except (ValueError, StopIteration):
+        state = None
+    r.check("the VM keeps running after the other session disconnected", state == "running", str(state))
+    guest(m, vm, "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*-n 8314 *' } | "
+                 "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" if windows else "pkill -fx 'sleep 8314'; true")
+    metric("cancellation workflow (cancel, recover, background, disconnect)", m, since)
+
+
+def listing_checks(m, vm, r, windows):
+    """list_jobs over the real protocol: pagination, metadata only, a damaged record, a file named
+    like the listing's error marker, bad arguments."""
+    since = len(m.log)
+    synthetic = "SYNTHETIC-NO-CREDENTIAL-CONTENT"
+    fg = guest(m, vm, "'completed'" if windows else "printf 'completed\\n'").get("execution_id")
+    bg = guest(m, vm, f"'{synthetic}'; exit 7" if windows else f"printf '{synthetic}\\n'; exit 7",
+               background=True).get("job_id")
+    live = guest(m, vm, "Start-Sleep 900" if windows else "sleep 900", background=True).get("job_id")
+    for _ in range(3):
+        guest(m, vm, "'tiny'" if windows else "printf tiny")
+    poll(lambda: job_state(m, vm, bg) == "exited", 40, 0.5)
+
+    res = m.call("list_jobs", name=vm, limit=2)
+    d = structured(res)
+    r.check("list_jobs: a bounded typed page with a continuation",
+            not res.get("isError") and len(d.get("jobs", [])) == 2 and d.get("has_more") is True
+            and bool(d.get("next_cursor")) and len(res["content"]) == 1, brief(res))
+    rows, cursor = list(d.get("jobs", [])), d.get("next_cursor")
+    newer = guest(m, vm, "'new-after-page'" if windows else "printf new-after-page").get("execution_id")
+    clean = True
+    for _ in range(60):
+        if not cursor:
+            break
+        res = m.call("list_jobs", name=vm, limit=2, cursor=cursor)
+        d = structured(res)
+        clean = clean and not res.get("isError")
+        rows += d.get("jobs", [])
+        cursor = d.get("next_cursor") if d.get("has_more") else None
+    ids = [j["job_id"] for j in rows]
+    r.check("following next_cursor never fails, lists newest first without repeats, and a job created meanwhile does not shift it",
+            clean and ids == sorted(set(ids), reverse=True) and newer not in ids, f"{len(ids)} jobs")
+    byid = {j["job_id"]: j for j in rows}
+    r.check("a foreground run, an exited background job and a live one are all listed",
+            fg in byid and bg in byid and live in byid)
+    entry = byid.get(bg, {})
+    r.check("the exited background job shows its code and a log without any of its output",
+            entry.get("exit_code") == 7 and entry.get("kind") == "background" and entry.get("log_available") is True
+            and synthetic not in json.dumps(rows))
+    r.check("the live background job is queued or running", byid.get(live, {}).get("state") in ("queued", "running"))
+
+    # A damaged exit record degrades that one entry; a file named like the error marker is harmless.
+    guest(m, vm, f"[IO.File]::WriteAllText(\"$env:USERPROFILE\\agentpc-bg\\{bg}.exit\", '1-2')" if windows
+          else f"printf '1-2' > ~/agentpc-bg/{bg}.exit")
+    guest(m, vm, "[IO.File]::WriteAllText(\"$env:USERPROFILE\\agentpc-bg\\AGENTPC_LSERR x\", 'x')" if windows
+          else "touch ~/agentpc-bg/'AGENTPC_LSERR x'")
+    res = m.call("list_jobs", name=vm, limit=MAX_LIST_LIMIT)
+    damaged = {j["job_id"]: j for j in structured(res).get("jobs", [])}
+    r.check("a damaged exit record makes one entry unknown, without hiding older jobs or failing the page",
+            not res.get("isError") and damaged.get(bg, {}).get("state") == "unknown"
+            and damaged.get(bg, {}).get("exit_code") is None and bool(damaged.get(bg, {}).get("note"))
+            and fg in damaged and live in damaged, brief(res))
+
+    for label, code, args in (("limit 0", "invalid_limit", {"limit": 0}),
+                              (f"limit {MAX_LIST_LIMIT + 1}", "invalid_limit", {"limit": MAX_LIST_LIMIT + 1}),
+                              ("a malformed cursor", "invalid_cursor", {"cursor": "bad-token"})):
+        res = m.call("list_jobs", name=vm, **args)
+        r.check(f"list_jobs with {label}: structured error {code}",
+                res.get("isError") is True and structured(res).get("error_code") == code, brief(res))
+    r.check("listing left the live job running", job_state(m, vm, live) in ("queued", "running"))
+    m.call("stop_job", name=vm, id=live)
+    metric("list_jobs workflow (pages, damaged record, bad arguments)", m, since)
+
+
+def stale_cursor_before(m, vm):
+    """A page cursor to take across a checkpoint restore (None if the VM has too few jobs)."""
+    res = m.call("list_jobs", name=vm, limit=1)
+    d = structured(res)
+    return d.get("next_cursor") if not res.get("isError") and d.get("has_more") else None
+
+
+def stale_cursor_after(m, vm, r, cursor):
+    """After restore_vm the VM's generation changed: the old cursor is refused, never restarted."""
+    if cursor is None:
+        r.check("a page cursor was available before the restore", False, "list_jobs returned no next_cursor")
+        return
+    res = m.call("list_jobs", name=vm, cursor=cursor)
+    d = structured(res)
+    r.check("a list_jobs cursor from before restore_vm is refused as cursor_stale, with no jobs",
+            res.get("isError") is True and d.get("error_code") == "cursor_stale" and d.get("jobs") == [], brief(res))
+    r.check("the stale-cursor message does not claim the jobs are gone",
+            "are gone" not in (d.get("error") or "") and "without cursor" in (d.get("error") or ""), brief(res))
+    res = m.call("list_jobs", name=vm, limit=2)
+    r.check("list_jobs without a cursor works again after the restore", not res.get("isError"), brief(res))
+
+
+SSH_PORT = 22  # the guest's own sshd listens on its loopback on every OS: a TCP target needing no fixture
+
+
+def readiness_wait(m, vm, **kw):
+    res = m.call("wait_for_service", name=vm, **kw)
+    return res, structured(res)
+
+
+def readiness_fixture_available(m, vm, windows):
+    """The interpreter the HTTP fixture runs under, or None: "powershell" on Windows; in a Linux
+    guest python3 where it has it, else perl with IO::Socket::INET (as the forward_port check does).
+    Nothing is installed or downloaded to make one available."""
+    if windows:
+        return "powershell"
+    found = guest_out(m, vm, "if command -v python3 >/dev/null 2>&1; then echo python3; "
+                             "elif perl -MIO::Socket::INET -e 1 >/dev/null 2>&1; then echo perl; else echo none; fi")
+    return found if found in ("python3", "perl") else None
+
+
+def readiness_tcp_checks(m, vm, r, windows):
+    """TCP readiness against the guest's own sshd, which needs no fixture, plus the closed-port and
+    job shortcuts."""
+    sleeper = guest(m, vm, "Start-Sleep 900" if windows else "sleep 900", background=True).get("job_id")
+    r.check("a background job to wait alongside started", sleeper is not None)
+    res, d = readiness_wait(m, vm, guest_port=SSH_PORT, job_id=sleeper, timeout_seconds=30)
+    r.check("TCP readiness: the guest's own sshd on 127.0.0.1 is accepted, with the job observed alongside",
+            not res.get("isError") and d.get("state") == "ready" and d.get("tcp") == "accepted"
+            and d.get("criterion_met") is True and len(res["content"]) == 1, brief(res))
+    res, d = readiness_wait(m, vm, guest_port=CLOSED_PORT, timeout_seconds=3)
+    r.check("a port nothing listens on times out honestly, never a guess",
+            res.get("isError") is True and d.get("state") == "timed_out" and d.get("tcp") in ("refused", "timed_out"),
+            brief(res))
+    r.check("that timeout did not stop the job", job_state(m, vm, sleeper) in ("queued", "running"))
+
+    failing = guest(m, vm, "exit 7", background=True).get("job_id")
+    poll(lambda: job_state(m, vm, failing) == "exited", 40, 0.5)
+    began = time.monotonic()
+    res, d = readiness_wait(m, vm, guest_port=CLOSED_PORT, job_id=failing, timeout_seconds=30)
+    r.check("a job proven failed ends the wait early as job_failed",
+            res.get("isError") is True and d.get("state") == "job_failed" and time.monotonic() - began < 20, brief(res))
+    done = guest(m, vm, "exit 0").get("execution_id")
+    res, d = readiness_wait(m, vm, guest_port=SSH_PORT, job_id=done, timeout_seconds=10)
+    r.check("a job that exited 0 is not failure: the listener is still ready",
+            not res.get("isError") and d.get("state") == "ready", brief(res))
+    res, d = readiness_wait(m, vm, guest_port=SSH_PORT, job_id=999999999, timeout_seconds=10)
+    r.check("a job id that was never recorded is not failure either",
+            not res.get("isError") and d.get("state") == "ready", brief(res))
+    if sleeper is not None:
+        ok, _ = m.tool("stop_job", name=vm, id=sleeper)
+        r.check("stop_job ends the waited-alongside job", ok)
+
+
+def readiness_http_checks(m, vm, r, windows, kind):
+    """A late TCP listener, HTTP statuses, an unfollowed redirect and a cancelled probe, against
+    fixtures started in the guest (see readiness_fixture_available)."""
+    wait = lambda **kw: readiness_wait(m, vm, **kw)
+
+    # Late readiness: a TCP listener that starts after the wait began.
+    late_port = READY_PORT + 2
+    late = (f"Start-Sleep 4; $l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, {late_port}); $l.Start(); Start-Sleep 600"
+            if windows else late_listener_command(kind, late_port))
+    late_job = guest(m, vm, late, background=True).get("job_id")
+    began = time.monotonic()
+    res, d = wait(guest_port=late_port, timeout_seconds=40)
+    took = time.monotonic() - began
+    r.check("a TCP listener that starts late is waited for: ready, accepted, after more than one attempt",
+            not res.get("isError") and d.get("state") == "ready" and d.get("tcp") == "accepted"
+            and d.get("criterion_met") is True and (d.get("attempts") or 0) >= 2 and took >= 3, f"{took:.1f}s {brief(res)}")
+    if late_job is not None:
+        m.call("stop_job", name=vm, id=late_job)
+
+    server = guest(m, vm, WINDOWS_HTTP_SERVER if windows else linux_http_server(kind), background=True).get("job_id")
+    try:
+        res, d = wait(guest_port=READY_PORT, protocol="http", job_id=server, timeout_seconds=40)
+        r.check("HTTP readiness: the expected status is observed; no response body, header or guest text is returned",
+                not res.get("isError") and d.get("state") == "ready" and d.get("http_status") == 200
+                and d.get("http_outcome") == "status_matched" and d.get("criterion_met") is True
+                and "SYNTHETIC-RESPONSE-BODY" not in json.dumps(res) and len(res["content"]) == 1, brief(res))
+        res, d = wait(guest_port=READY_PORT, protocol="http", path="/mismatch", expected_status=503, timeout_seconds=10)
+        r.check("an explicit alternate expected status is met", not res.get("isError") and d.get("http_status") == 503,
+                brief(res))
+        res, d = wait(guest_port=READY_PORT, protocol="http", path="/mismatch", timeout_seconds=3)
+        r.check("a status mismatch times out keeping the last observation",
+                res.get("isError") is True and d.get("state") == "timed_out" and d.get("timed_out") is True
+                and d.get("http_outcome") == "status_mismatched" and d.get("http_status") == 503, brief(res))
+        res, d = wait(guest_port=READY_PORT, protocol="http", path="/redirect", timeout_seconds=3)
+        r.check("a redirect is observed as redirect, not followed",
+                res.get("isError") is True and d.get("http_outcome") == "redirect" and d.get("http_status") == 302,
+                brief(res))
+        counted = guest_out(m, vm, "if (Test-Path \"$env:USERPROFILE\\ready-target-count\") "
+                                   "{ [IO.File]::ReadAllText(\"$env:USERPROFILE\\ready-target-count\") } else { '0' }"
+                            if windows else "if [ -f ~/ready-target-count ]; then cat ~/ready-target-count; else printf 0; fi")
+        r.check("the redirect target was never requested", counted == "0", counted[:20])
+        res, d = wait(guest_port=READY_PORT, protocol="http", path="/Unicode-é space", timeout_seconds=10)
+        r.check("a Unicode path with a space is escaped and answered", not res.get("isError") and d.get("http_status") == 200,
+                brief(res))
+        r.check("the waits did not stop the serving job", job_state(m, vm, server) in ("queued", "running"))
+
+        # Cancel a probe in flight (a slow reply), over the real protocol.
+        rid, _ = m.start_call("wait_for_service", name=vm, guest_port=READY_PORT, protocol="http",
+                              path="/slow", timeout_seconds=30)
+        time.sleep(1)
+        m.cancel(rid)
+        m.forget(rid)
+        res, d = wait(guest_port=READY_PORT, timeout_seconds=10)
+        r.check("after a cancelled wait the listener still answers", not res.get("isError") and d.get("state") == "ready",
+                brief(res))
+        r.check("a cancelled wait left the serving job running", job_state(m, vm, server) in ("queued", "running"))
+        res = m.call("list_forwards", name=vm)
+        r.check("readiness created no forward", not res.get("isError") and str(READY_PORT) not in text_of(res), brief(res))
+    finally:
+        if server is not None:
+            ok, _ = m.tool("stop_job", name=vm, id=server)
+            r.check("stop_job ends the serving job", ok)
+
+
+def readiness_checks(m, vm, r, windows):
+    """wait_for_service against real guest listeners. The TCP checks need only the guest's sshd. The
+    HTTP and late-listener checks need a fixture (python3 in a Linux guest); when it is missing that
+    is a FAILED check, so a green run can never be mistaken for readiness coverage. Nothing is
+    installed or downloaded to work around it."""
+    since = len(m.log)
+    readiness_tcp_checks(m, vm, r, windows)
+    kind = readiness_fixture_available(m, vm, windows)
+    r.check("readiness fixture available: HTTP and late-listener coverage needs python3 or perl in a Linux guest",
+            kind is not None, "this guest has neither python3 nor perl, so the HTTP readiness checks did not run")
+    if kind is not None:
+        readiness_http_checks(m, vm, r, windows, kind)
+    metric("readiness workflow (sshd TCP, job shortcuts, late listener, HTTP statuses, redirect, cancel)", m, since)
+
+
+def recovery_checks(m, vm, r, windows):
+    cancellation_checks(m, vm, r, windows)
+    listing_checks(m, vm, r, windows)
+    readiness_checks(m, vm, r, windows)
 
 
 def inspect_checks(m, vm, r, windows):
@@ -989,10 +1612,12 @@ def lifecycle(m, vm, r, guest):
         r.check("delete_forward removes the udp forward", ok and f"127.0.0.1:{port}" not in listing, f"{out[:150]} | {listing[:150]}")
 
     sh("echo before > ~/smoke-marker")
+    page_cursor = stale_cursor_before(m, vm)
     ok, out = m.tool("checkpoint_vm", name=vm, label="smoke")
     if r.check("checkpoint_vm", ok, out[:200]):
         sh("echo after > ~/smoke-marker")
         ok, out = m.tool("restore_vm", name=vm, label="smoke")
+        stale_cursor_after(m, vm, r, page_cursor)
         _, marker = sh("cat ~/smoke-marker")
         r.check("restore_vm returns to the checkpoint", ok and "before" in marker and "after" not in marker, f"{out[:150]} | {marker[:100]}")
         ok, out = m.tool("delete_checkpoint", name=vm, label="smoke")
@@ -1334,10 +1959,12 @@ def windows_lifecycle(m, vm, r):
         m.tool("delete_forward", name=vm, host_port=port, protocol="udp")
 
     ps("Set-Content $HOME\\smoke-marker before")
+    page_cursor = stale_cursor_before(m, vm)
     ok, out = m.tool("checkpoint_vm", name=vm, label="smoke")
     if r.check("windows: checkpoint_vm", ok, out[:200]):
         ps("Set-Content $HOME\\smoke-marker after")
         ok, out = m.tool("restore_vm", name=vm, label="smoke")
+        stale_cursor_after(m, vm, r, page_cursor)
         _, marker = ps("Get-Content $HOME\\smoke-marker")
         r.check("windows: restore_vm returns to the checkpoint", ok and "before" in marker and "after" not in marker, f"{out[:150]} | {marker[:100]}")
         m.tool("delete_checkpoint", name=vm, label="smoke")

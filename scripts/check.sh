@@ -43,8 +43,18 @@ python3 scripts/test-site.py
 say "smoke.py prints no viewer link or credential"
 python3 scripts/test-smoke-logging.py
 
+# The concurrent client behind smoke.py's recovery checks (a fake server), the recovery helpers
+# (canned replies), and smoke.py's VM-free protocol checks against the freshly built debug binary.
+# The real server runs in a fresh, empty AGENTPC_HOME (it sees no VM at all) with
+# AGENTPC_KEEP_RUNNING=1, over a ghost VM name: no VM is created, started or stopped.
+# `scripts/test-smoke-client.py --fake-only` runs without starting any agentpc server.
+say "smoke.py concurrent client and VM-free protocol checks"
+cargo build --locked --quiet
+python3 scripts/test-smoke-client.py
+
 say "VM test scripts compile"
-python3 -m py_compile scripts/smoke.py scripts/lifecycle-stress.py scripts/test-smoke-logging.py
+python3 -m py_compile scripts/smoke.py scripts/lifecycle-stress.py scripts/test-smoke-logging.py \
+  scripts/test-smoke-client.py
 
 say "plugin manifests parse"
 find plugin .claude-plugin -name '*.json' -print0 | xargs -0 -n1 python3 -m json.tool >/dev/null

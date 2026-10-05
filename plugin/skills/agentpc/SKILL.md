@@ -32,6 +32,8 @@ curl -fsSL https://agentpc.pawanpaudel.com.np/install.sh | sh
 | `take_screenshot(name, save_to?)` | PNG screenshot; works even while booting or hung. `save_to` also writes it to a Mac path |
 | `run_command(name, command, timeout?, background?)` | Shell command: PowerShell on Windows, bash on Ubuntu and Arch. Returns typed `structuredContent` (`state`, `exit_code`, `stdout`, `stderr`, `timed_out`, `termination_confirmed`, `effect_unknown`, `job_id`, ...) plus the readable `exit code: N` text; each stream is trimmed to its first and last 10,000 characters. At a foreground run's `timeout` (default 120 s) agentpc attempts to stop it and returns its partial output, and the reply says whether the stop was confirmed; `background: true` (servers, long jobs) returns a job id to poll with `get_job_status`. See "Running commands" |
 | `get_job_status(name, id, tail_lines?, wait_seconds?, cursor?)` | Job state (queued, running, exited with its code, stopped, ended without an exit code, or missing) plus its log, typed. `wait_seconds` (0 by default, at most 30) waits without ever stopping the job; `cursor` reads the log incrementally. Also takes a foreground run's `job_id`. See "Watching jobs" |
+| `list_jobs(name, limit?, cursor?)` | Find jobs again when their id was lost (a cancelled or disconnected `run_command`): the VM's job records, newest id first, metadata only, never a command or output. `limit` 1 to 100 (default 20); `next_cursor` continues. Read-only. See "Finding jobs again" |
+| `wait_for_service(name, guest_port, protocol?, timeout_seconds?, path?, expected_status?, job_id?)` | Wait until a TCP port accepts a connection, or an HTTP path answers its expected status, on the VM's own `127.0.0.1`. `timeout_seconds` 1 to 120 (default 30). Read-only: never stops the service or a job. See "Waiting for a service" |
 | `stop_job(name, id)` | Stop a background job (or a foreground run's `job_id`) and everything it started; for an exited job, only what it left running |
 | `upload_file` / `download_file` | Copy files or folders between this Mac and a VM |
 | `forward_port(name, guest_port, host_port?, protocol?)` | Reach a server in the VM from the Mac at `127.0.0.1:<host_port>` (a free port if omitted). TCP (default) is an SSH tunnel: reaches a server on the guest's own `127.0.0.1`. `protocol: "udp"` is a QEMU host forward: the guest server must listen on `0.0.0.0`; not on offline VMs. Lasts until the VM stops |
@@ -68,13 +70,14 @@ copy, so a client that joins text blocks sees the same text as ever. Read the ty
 `isError`:
 
 - `state`: `exited` (`exit_code` is its code), `timed_out`, `not_started` (it never ran),
-  `connection_lost` (SSH failed while it may have been running) or `started` (a background job).
+  `connection_lost` (SSH failed while it may have been running), `started` (a background job) or
+  `cancelled` (its request was cancelled and agentpc tried to stop it; see "Cancellation").
 - `stdout`, `stderr`, `stdout_bytes`, `stderr_bytes`, `stdout_truncated`, `stderr_truncated`,
-  `output_truncated`; `timed_out`, `termination_confirmed`, `effect_unknown`, `recovery_action`, `error`;
+  `output_truncated`; `timed_out`, `request_cancelled`, `termination_confirmed`, `effect_unknown`, `recovery_action`, `error`;
   `execution_id` (issued to each run; null only when the call failed before one was, such as an unknown or stopped VM), `job_id` (background jobs, and foreground runs whose fate is
   uncertain) and `log_path`.
 - `isError` is true for any nonzero exit, any timeout (even when the command's own code is known to be
-  0), and any run that did not start or lost its connection. It is false only for exit 0 and a
+  0), any cancelled request, and any run that did not start or lost its connection. It is false only for exit 0 and a
   background start. Foreground exit codes are the low 8 bits SSH reports (Windows `exit -1` reads 255).
 - At `timeout`, agentpc attempts to stop the command and what it started, and keeps the partial output.
   `termination_confirmed: true` means it verified that none of the processes it identified is left: on
@@ -100,6 +103,23 @@ copy, so a client that joins text blocks sees the same text as ever. Read the ty
   before sending: a bigger one is `not_started` with no `execution_id` and no `recovery_action`. For a
   bigger script, `upload_file` it and run the file.
 
+## Cancellation
+
+A foreground `run_command` whose request is cancelled (the client's `notifications/cancelled`), whose
+client disconnects or whose MCP session ends is stopped in the VM like a timeout (bounded, identity
+checked, never retried), with `request_cancelled: true` and `isError`:
+
+- `state: cancelled` with `termination_confirmed: true`: stopped and verified. `state: exited` with its
+  `exit_code`: it had already finished. `state: not_started` (no `recovery_action`): it never began.
+  `state: cancelled` with `termination_confirmed: false`, `effect_unknown: true` and
+  `recovery_action: stop_job`: it may still be running; use the `job_id` with `get_job_status` /
+  `stop_job` and don't rerun it before you know.
+- A client that cancelled usually never receives the reply. Find the run with `list_jobs`; then
+  `get_job_status` shows `stopped` with `stop_reason: request_cancelled` (or `not_started`).
+- A `background: true` start is detached on purpose: cancelling its request, disconnecting or ending
+  the session does not stop the job. End it with `stop_job`. A hard kill of the MCP server cleans up
+  nothing; the job records stay in the VM.
+
 ## Watching jobs
 
 `get_job_status` also returns typed `structuredContent` (`state`: `queued`, `running`, `exited`,
@@ -124,6 +144,51 @@ or `output`, `has_more`, `next_cursor`, `cursor_reset`, `cursor_reset_reason`, `
   started: don't blindly retry. An unreachable VM is an error (`state: unknown`), never `ended`.
 - An exited job that left a child running still reports its own exit code. A foreground `job_id` has
   status only (exited with its code, stopped at its timeout, or not started), no log to replay.
+
+## Finding jobs again
+
+`list_jobs {name, limit?, cursor?}` is read-only and returns typed `structuredContent` (`jobs`,
+`limit`, `has_more`, `next_cursor`, `scan_truncated`, `note`, `error_code`) and one readable text block.
+Per job: `job_id`, `kind`, `state`, `exit_code`, `stop_reason`, `log_available`, `records`,
+`recorded_at`, `finished_at` and a `note` for an unresolved entry: never a command, environment, output,
+log text or path.
+
+- Newest id first; `limit` 1 to 100 (default 20, else `invalid_limit`). When `has_more` is true pass
+  `next_cursor` as `cursor`: the next page continues below the last job shown, so jobs created meanwhile
+  do not shift it.
+- A cursor from before the VM was reset, restored or recreated is `cursor_stale`: the VM's generation
+  changed, its records may differ from what the earlier pages listed (a restored checkpoint can keep
+  some), so the listing cannot safely continue. Call again without a cursor. `invalid_cursor` is a
+  malformed cursor or one of another VM.
+- Best effort, not an immutable history: records age out, and a huge directory keeps only its first
+  entries (`scan_truncated`), so jobs may be missing. A `queued`, `missing` or `unknown` entry is
+  unresolved, not proof the command never started; don't blindly rerun it.
+- Cancelling the call abandons only the listing; it writes nothing and stops nothing.
+
+## Waiting for a service
+
+`wait_for_service {name, guest_port, protocol?, timeout_seconds?, path?, expected_status?, job_id?}`
+looks only at the VM's own IPv4 `127.0.0.1` (not another host, a URL or a proxy) and is read-only.
+
+- `protocol: "tcp"` (default): ready when a connection is accepted. `"http"`: ready when one `GET path`
+  (`/` by default; a path, not a URL; no credentials in it, because it is echoed back and visible in the
+  VM's process list) answers `expected_status` (default 200). `path` and `expected_status` are HTTP-only
+  and refused with `tcp`. Redirects are not followed; no body, header or guest text is returned.
+- `timeout_seconds` is 1 to 120 (default 30) and bounds the waiting, not the wall clock: a call can run
+  about 5 s past it, so with a short client timeout use a shorter one and call again.
+- The result has `state` (`ready`, `timed_out`, `job_failed`, `cancelled`, `error`), the last `tcp`
+  (`accepted`, `refused`, `timed_out`, `failed`, `unsupported`) or `http_outcome` (`status_matched`,
+  `redirect`, `status_mismatched`, `no_response`, `malformed`) with `http_status`, `attempts`, `waited_ms`
+  and `error_code`. Anything but `ready` is an error; `timed_out` keeps the last observation. No probe
+  answer at all is `error` (`guest_unreachable`, `bad_guest_reply`), never a guess. `probe_unsupported`
+  means the guest's bash has no `/dev/tcp` or it has no `timeout` command: check with `run_command`.
+- `job_id` ends the wait early (`job_failed`) only for a proven failure: nonzero exit, stopped, or never
+  started. Exited 0 (a server may outlive its wrapper), queued, running, ended without a code, missing or
+  unreadable are not failure.
+- Ready describes the endpoint, not a process: nothing checks who owns the port, so it does not prove
+  `job_id` or any program is serving. Waiting never stops, restarts or signals the service or the job;
+  cancelling it only stops probing. Each probe makes short-lived connections (and one GET), so it can
+  consume a one-shot listener: don't point it at one.
 
 ## Looking without acting
 

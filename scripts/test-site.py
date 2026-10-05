@@ -154,6 +154,27 @@ def check():
     mcp_page = (SITE / "mcp.html").read_text()
     for tool in sorted(documented):
         require(f'translate="no">{tool}</code>' in mcp_page, f"mcp.html must document {tool}")
+    # The recovery/readiness vocabulary: the new states, reasons and error codes must be in the
+    # source (so a typo here is caught) and in every document an agent or user reads.
+    vocabulary = ["list_jobs", "wait_for_service", "request_cancelled", "cursor_stale",
+                  "scan_truncated", "job_failed", "probe_unsupported", "status_matched",
+                  "timeout_seconds", "notifications/cancelled"]
+    source_text = "".join((ROOT / "src" / f).read_text() for f in ("mcp.rs", "jobs.rs", "readiness.rs", "execution.rs"))
+    documents = {
+        "AGENTS.md": (ROOT / "AGENTS.md").read_text(),
+        "README.md": (ROOT / "README.md").read_text(),
+        "plugin/skills/agentpc/SKILL.md": (ROOT / "plugin" / "skills" / "agentpc" / "SKILL.md").read_text(),
+        "site/mcp.html": mcp_page,
+    }
+    for term in vocabulary:
+        if term != "notifications/cancelled":  # the protocol's own method name, not in our source
+            camel = "".join(word.title() for word in term.split("_"))  # serde snake_case of a Rust variant
+            require(term in source_text or camel in source_text,
+                    f"the source no longer has {term}: update the vocabulary list")
+        for doc, text in documents.items():
+            require(term in text, f"{doc} must document {term}")
+    require("list_jobs" in (SITE / "llms.txt").read_text() and "wait_for_service" in (SITE / "llms.txt").read_text(),
+            "llms.txt must mention list_jobs and wait_for_service")
     if errors:
         for error in errors:
             print(f"FAIL: {error}")

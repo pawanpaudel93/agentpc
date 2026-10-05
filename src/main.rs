@@ -7,6 +7,7 @@ mod jobs;
 mod mcp;
 mod ops;
 mod qemu;
+mod readiness;
 mod registry;
 mod setup;
 mod update;

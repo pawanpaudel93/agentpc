@@ -78,7 +78,8 @@ pub struct CommandOutcome {
     /// still running at `timeout` and agentpc tried to stop it (see `termination_confirmed`).
     /// `not_started`: it never ran (and won't). `connection_lost`: the SSH connection failed
     /// while it may have been running (see `effect_unknown`). `started`: a background job was
-    /// started.
+    /// started. `cancelled`: the request was cancelled while the command ran and agentpc tried
+    /// to stop it (see `request_cancelled` and `termination_confirmed`).
     pub state: ExecutionState,
     /// Id agentpc gave this execution in the VM (foreground or background); null when the
     /// call failed before one was issued.
@@ -110,11 +111,18 @@ pub struct CommandOutcome {
     /// Whether the call reached `timeout`: the command was still running then, or (with `state`
     /// `exited`) it had finished but processes it left running still held its output open.
     pub timed_out: bool,
-    /// After a timeout: true once agentpc verified that none of the processes it identified as
-    /// the execution's (its systemd scope, its marked or descendant processes, its recorded
-    /// root by pid and start time) are left; false when that couldn't be verified (it may
-    /// still be running; also whenever the process list couldn't be read). Null when nothing
-    /// needed stopping (no timeout, or it never started). Processes that left that tracking (a
+    /// Whether the run_command request itself was cancelled before the command's end was
+    /// known: the client sent notifications/cancelled for it, the client disconnected, or this
+    /// MCP server shut down. agentpc then stopped it in the VM as at a timeout (see `state`
+    /// and `termination_confirmed`). A client that cancelled usually never receives this
+    /// reply; the VM's record says the same (get_job_status: `stopped` with `stop_reason`
+    /// `request_cancelled`, or `not_started`).
+    pub request_cancelled: bool,
+    /// After a timeout or a request cancellation: true once agentpc verified that none of the
+    /// processes it identified as the execution's (its systemd scope, its marked or descendant
+    /// processes, its recorded root by pid and start time) are left; false when that couldn't
+    /// be verified (it may still be running; also whenever the process list couldn't be read).
+    /// Null when nothing needed stopping (no timeout or cancellation, or it never started). Processes that left that tracking (a
     /// system service it started, for one; on Windows, a process whose launcher had already
     /// exited) aren't covered.
     pub termination_confirmed: Option<bool>,
@@ -140,6 +148,7 @@ pub enum ExecutionState {
     NotStarted,
     ConnectionLost,
     Started,
+    Cancelled,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +180,7 @@ impl CommandOutcome {
             stderr_truncated: false,
             output_truncated: false,
             timed_out: false,
+            request_cancelled: false,
             termination_confirmed: None,
             effect_unknown: false,
             recovery_action: None,
@@ -202,9 +212,10 @@ impl CommandOutcome {
 
     /// Whether the tool call reports an error.
     /// A reply that reached `timeout` is always one, as it always was (even when the
-    /// command's own exit code 0 is known).
+    /// command's own exit code 0 is known), and so is a cancelled request's.
     pub fn is_error(&self) -> bool {
         self.timed_out
+            || self.request_cancelled
             || !matches!(
                 (self.state, self.exit_code),
                 (ExecutionState::Exited, Some(0)) | (ExecutionState::Started, _)
@@ -241,6 +252,52 @@ impl Reply {
         let mut r = Self::not_started(text, Some(RecoveryAction::Retry));
         r.outcome.execution_id = Some(id);
         r
+    }
+
+    /// The reply for supervision that started nothing (see `Supervision`); None for `Done`
+    /// and `Lost`, which have their own.
+    pub fn refused<T>(s: &Supervision<T>, background: bool) -> Option<Self> {
+        let (text, cancelled) = match s {
+            Supervision::Done(_) | Supervision::Lost(_) => return None,
+            Supervision::CancelledBeforeStart => (
+                "the request was cancelled before the command was sent to the VM; nothing was \
+                 sent, so nothing ran."
+                    .to_string(),
+                true,
+            ),
+            Supervision::ShuttingDown => (
+                "the agentpc MCP server is shutting down; nothing was sent to the VM.".to_string(),
+                false,
+            ),
+            Supervision::Busy => (
+                format!(
+                    "agentpc is already running {MAX_SUPERVISED} commands for this session; \
+                     nothing was sent to the VM. Wait for some to finish, or start long ones with \
+                     background: true."
+                ),
+                false,
+            ),
+        };
+        let mut r = Self::not_started(text, None);
+        r.outcome.request_cancelled = cancelled;
+        r.outcome.background = background;
+        Some(r)
+    }
+
+    /// The supervising task of execution `id` failed: whether the command ran is unknown.
+    pub fn supervision_lost(id: u64, name: &str, why: &str, background: bool) -> Self {
+        let mut o = CommandOutcome::new(ExecutionState::ConnectionLost, Some(id));
+        o.background = background;
+        o.effect_unknown = true;
+        o.job_id = Some(id);
+        o.recovery_action = Some(RecoveryAction::GetJobStatus);
+        o.error = Some(format!("agentpc lost track of the command: {why}"));
+        let text = format!(
+            "agentpc lost track of the command ({why}), so whether it ran is unknown (execution \
+             id {id}). Check it with get_job_status name={name} id={id}; stop it with stop_job \
+             name={name} id={id}."
+        );
+        Self { outcome: o, text }
     }
 
     /// A failure before anything was started, with `text` as its message.
@@ -449,6 +506,336 @@ async fn drain_into<R: tokio::io::AsyncRead + Unpin>(mut r: R, s: Arc<Mutex<Stre
 }
 
 // ---------------------------------------------------------------------------------------------
+// Supervision: a run owned by its own task, not by the request that started it
+
+/// Who asked a supervised run to stop before its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelSource {
+    /// The request's cancellation token fired: the client sent notifications/cancelled for
+    /// it, or its connection ended (rmcp then cancels every pending request's token).
+    Request,
+    /// The future waiting on the run was dropped before the run ended.
+    HandlerDropped,
+    /// This MCP server is shutting down.
+    Shutdown,
+}
+
+impl CancelSource {
+    /// Why, for a reply.
+    pub fn describe(self) -> &'static str {
+        match self {
+            CancelSource::Request => {
+                "the client cancelled the request (or its connection to agentpc ended)"
+            }
+            CancelSource::HandlerDropped => "agentpc stopped waiting for the request",
+            CancelSource::Shutdown => "the agentpc MCP server is shutting down",
+        }
+    }
+}
+
+/// Why a foreground run is being stopped in the guest before its end; also what the stop
+/// records in `<id>.stopped`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopCause {
+    /// Its run_command timeout.
+    Timeout,
+    /// Its request was cancelled (see `CancelSource`).
+    RequestCancelled,
+}
+
+/// A one-shot, clonable request to stop a supervised run: the first `fire` wins and later
+/// ones change nothing, so however many sources ask (the request's token, a dropped handler,
+/// shutdown), the run is stopped at most once.
+#[derive(Clone, Debug)]
+pub struct CancelSignal(Arc<tokio::sync::watch::Sender<Option<CancelSource>>>);
+
+impl Default for CancelSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancelSignal {
+    pub fn new() -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(None)))
+    }
+
+    /// Asks the run to stop; true when this call was the first.
+    pub fn fire(&self, source: CancelSource) -> bool {
+        self.0.send_if_modified(|v| {
+            if v.is_none() {
+                *v = Some(source);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Who asked, once someone has.
+    pub fn fired(&self) -> Option<CancelSource> {
+        *self.0.borrow()
+    }
+
+    /// Resolves once the signal fires (never, if nobody fires it).
+    pub async fn wait(&self) -> CancelSource {
+        let mut rx = self.0.subscribe();
+        // The sender lives in `self`, so the channel can't close while this waits.
+        let got = rx.wait_for(Option::is_some).await.ok().and_then(|v| *v);
+        match got {
+            Some(source) => source,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// How a request's own cancellation applies to the work it supervises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// A foreground command: the request's cancellation, or the request's handler going
+    /// away, stops it.
+    Foreground,
+    /// A background job's launch: once it is under way, it finishes (the job is meant to
+    /// outlive the request); only a cancellation known before anything starts prevents it.
+    Background,
+}
+
+/// What became of supervised work.
+#[derive(Debug)]
+pub enum Supervision<T> {
+    /// It ran to its end (which may itself be a stop after a cancellation).
+    Done(T),
+    /// The request was already cancelled: nothing was started.
+    CancelledBeforeStart,
+    /// The server is shutting down: nothing was started.
+    ShuttingDown,
+    /// MAX_SUPERVISED runs are already under way: nothing was started.
+    Busy,
+    /// The supervising task failed (a panic); whether the work ran is unknown.
+    Lost(String),
+}
+
+/// What `Supervisors::close` found under way: foreground commands it asked to stop, and
+/// background launches it only waits for (they are never stopped).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Closing {
+    pub foreground: usize,
+    pub background: usize,
+}
+
+/// The most runs one server supervises at once; one more is refused before it starts.
+pub const MAX_SUPERVISED: usize = 256;
+
+/// The runs this server supervises, so its shutdown can signal and wait for them. Each run
+/// is its own task and leaves the registry when that task ends (or is dropped).
+#[derive(Clone)]
+pub struct Supervisors(Arc<Registry>);
+
+/// Test seam type: see `Supervisors::set_before_publish`.
+#[cfg(test)]
+type PublishHook = Arc<dyn Fn(usize) + Send + Sync>;
+
+struct Registry {
+    state: Mutex<Active>,
+    /// How many runs are active, for `drain`.
+    count: tokio::sync::watch::Sender<usize>,
+    /// Test seam: called with each count just before it is published.
+    #[cfg(test)]
+    before_publish: Mutex<Option<PublishHook>>,
+}
+
+impl Registry {
+    #[cfg(test)]
+    fn before_publish(&self, n: usize) {
+        let hook = self.before_publish.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(n);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn before_publish(&self, _: usize) {}
+}
+
+#[derive(Default)]
+struct Active {
+    closing: bool,
+    next: u64,
+    signals: std::collections::HashMap<u64, (CancelSignal, Mode)>,
+}
+
+impl Default for Supervisors {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A run's place in the registry, given up when its task ends or is dropped.
+struct Enrolled {
+    registry: Arc<Registry>,
+    key: u64,
+}
+
+impl Drop for Enrolled {
+    fn drop(&mut self) {
+        let mut st = self.registry.state.lock().unwrap();
+        st.signals.remove(&self.key);
+        // Published while the lock is held, so counts reach `drain` in the order they were
+        // taken: two runs ending at once can't leave a stale count behind.
+        let n = st.signals.len();
+        self.registry.before_publish(n);
+        self.registry.count.send_replace(n);
+    }
+}
+
+/// Fires the run's signal if the future waiting on a foreground run is dropped first.
+struct Armed {
+    signal: CancelSignal,
+    armed: bool,
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        if self.armed {
+            self.signal.fire(CancelSource::HandlerDropped);
+        }
+    }
+}
+
+impl Supervisors {
+    pub fn new() -> Self {
+        Self(Arc::new(Registry {
+            state: Mutex::new(Active::default()),
+            count: tokio::sync::watch::Sender::new(0),
+            #[cfg(test)]
+            before_publish: Mutex::new(None),
+        }))
+    }
+
+    /// Test seam: `hook` sees each active count just before it is published to `drain`.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn set_before_publish(&self, hook: impl Fn(usize) + Send + Sync + 'static) {
+        *self.0.before_publish.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Runs being supervised now.
+    pub fn active(&self) -> usize {
+        self.0.state.lock().unwrap().signals.len()
+    }
+
+    fn enroll(&self, signal: CancelSignal, mode: Mode) -> Result<Enrolled, bool> {
+        let mut st = self.0.state.lock().unwrap();
+        if st.closing {
+            return Err(true);
+        }
+        if st.signals.len() >= MAX_SUPERVISED {
+            return Err(false);
+        }
+        let key = st.next;
+        st.next += 1;
+        st.signals.insert(key, (signal, mode));
+        let n = st.signals.len();
+        // Under the lock, as in `Enrolled::drop`.
+        self.0.before_publish(n);
+        self.0.count.send_replace(n);
+        drop(st);
+        Ok(Enrolled {
+            registry: self.0.clone(),
+            key,
+        })
+    }
+
+    /// Starts `work` as its own task and waits for its end. The task owns the run: dropping
+    /// this future doesn't stop it. In `Mode::Foreground`, `requested` resolving (the
+    /// request's cancellation token) or this future being dropped fires the run's signal,
+    /// which `work` must answer by stopping the run (once); the task still runs to its end.
+    /// In `Mode::Background` neither does: once started, the work finishes. Either way, a
+    /// `requested` that has already resolved means nothing starts.
+    pub async fn supervise<T, F, W, R>(&self, mode: Mode, requested: R, work: W) -> Supervision<T>
+    where
+        R: Future<Output = ()>,
+        W: FnOnce(CancelSignal) -> F,
+        F: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        use futures::FutureExt;
+        let mut requested = std::pin::pin!(requested);
+        // Cancelled before anything started: nothing starts (and nothing needs stopping).
+        if requested.as_mut().now_or_never().is_some() {
+            return Supervision::CancelledBeforeStart;
+        }
+        let signal = CancelSignal::new();
+        let enrolled = match self.enroll(signal.clone(), mode) {
+            Ok(e) => e,
+            Err(true) => return Supervision::ShuttingDown,
+            Err(false) => return Supervision::Busy,
+        };
+        let fut = work(signal.clone());
+        let mut join = tokio::spawn(async move {
+            let _enrolled = enrolled;
+            fut.await
+        });
+        let mut guard = Armed {
+            signal: signal.clone(),
+            armed: mode == Mode::Foreground,
+        };
+        let joined = match mode {
+            Mode::Foreground => {
+                // The request's cancellation only asks; the run's task does the stopping and
+                // is still awaited for its reply.
+                let asked = async {
+                    requested.await;
+                    signal.fire(CancelSource::Request);
+                    std::future::pending::<()>().await
+                };
+                tokio::select! {
+                    joined = &mut join => joined,
+                    () = asked => unreachable!("pending"),
+                }
+            }
+            Mode::Background => join.await,
+        };
+        // Ended (or failed): nothing left to cancel.
+        guard.armed = false;
+        match joined {
+            Ok(t) => Supervision::Done(t),
+            Err(e) => Supervision::Lost(e.to_string()),
+        }
+    }
+
+    /// Stops taking new runs and asks every active foreground run to stop
+    /// (`CancelSource::Shutdown`); background launches are only waited for. Returns what was
+    /// under way.
+    pub fn close(&self) -> Closing {
+        let runs: Vec<(CancelSignal, Mode)> = {
+            let mut st = self.0.state.lock().unwrap();
+            st.closing = true;
+            st.signals.values().cloned().collect()
+        };
+        let mut closing = Closing::default();
+        for (signal, mode) in &runs {
+            match mode {
+                Mode::Foreground => {
+                    signal.fire(CancelSource::Shutdown);
+                    closing.foreground += 1;
+                }
+                // A launch under way finishes; shutdown only waits for it.
+                Mode::Background => closing.background += 1,
+            }
+        }
+        closing
+    }
+
+    /// Waits until no run is active, or until `deadline`; returns how many are still active.
+    pub async fn drain(&self, deadline: tokio::time::Instant) -> usize {
+        let mut rx = self.0.count.subscribe();
+        let _ = tokio::time::timeout_at(deadline, rx.wait_for(|n| *n == 0)).await;
+        self.active()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The host side of a foreground run
 
 /// Result of the guest-side cancellation of a timed-out execution.
@@ -545,6 +932,8 @@ pub struct Facts {
     /// ended on its own).
     pub code: Option<i32>,
     pub timed_out: bool,
+    /// Set when the run was stopped because its request was cancelled (who asked).
+    pub request_cancelled: Option<CancelSource>,
     pub start: Start,
     pub cancel: Option<Cancel>,
     pub probe: Option<Probe>,
@@ -571,8 +960,10 @@ fn is_wrapper_code(code: i32) -> bool {
 /// clear answer (ssh's own failure code, a signal, an unknown start), `probe` asks the guest's
 /// records (bounded by `limits.probe`). Output reading is bounded too: whatever arrived is
 /// kept even if something still holds the pipes open.
+// Kept for callers without a request to cancel (tests/execution.rs drives it directly).
+#[allow(dead_code)]
 pub async fn run_foreground<C, CF, P, PF>(
-    mut cmd: tokio::process::Command,
+    cmd: tokio::process::Command,
     id: u64,
     timeout: Duration,
     limits: Limits,
@@ -585,7 +976,44 @@ where
     P: FnOnce() -> PF,
     PF: Future<Output = Probe>,
 {
+    // A signal nobody fires: only the timeout stops this run early.
+    let never = CancelSignal::new();
+    run_supervised(cmd, id, timeout, limits, &never, |_| cancel(), probe).await
+}
+
+/// `run_foreground`, also stopped early when `signal` fires (its request was cancelled):
+/// then `cancel` gets `StopCause::RequestCancelled` and runs the same bounded guest-side
+/// stop as at a timeout, once. A signal already fired before anything starts means nothing
+/// is spawned at all. A run that ended by itself is never cancelled, whatever fires later.
+pub async fn run_supervised<C, CF, P, PF>(
+    mut cmd: tokio::process::Command,
+    id: u64,
+    timeout: Duration,
+    limits: Limits,
+    signal: &CancelSignal,
+    cancel: C,
+    probe: P,
+) -> std::io::Result<Facts>
+where
+    C: FnOnce(StopCause) -> CF,
+    CF: Future<Output = Cancel>,
+    P: FnOnce() -> PF,
+    PF: Future<Output = Probe>,
+{
     use std::process::Stdio;
+    // Cancelled before anything was spawned: nothing reaches the VM, so nothing can start.
+    if let Some(source) = signal.fired() {
+        return Ok(Facts {
+            code: None,
+            timed_out: false,
+            request_cancelled: Some(source),
+            start: Start::Absent,
+            cancel: Some(Cancel::NotStarted),
+            probe: None,
+            stdout: Captured::default(),
+            stderr: Captured::default(),
+        });
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -599,22 +1027,34 @@ where
     let mut read_out = tokio::spawn(drain_into(child.stdout.take().unwrap(), out.clone()));
     let mut read_err = tokio::spawn(drain_into(child.stderr.take().unwrap(), err.clone()));
 
-    let waited = tokio::time::timeout(timeout, child.wait()).await;
-    let timed_out = waited.is_err();
-    // A failed wait (not a timeout) leaves no status: judged like a signal, by the VM's record.
-    let mut status = waited.ok().and_then(Result::ok);
+    // Its own end comes first when both are ready: a run that ended is never stopped.
+    let (mut status, stop) = tokio::select! {
+        biased;
+        // A failed wait (not a stop) leaves no status: judged like a signal, by the VM's record.
+        waited = child.wait() => (waited.ok(), None),
+        () = tokio::time::sleep(timeout) => (None, Some((StopCause::Timeout, None))),
+        source = signal.wait() => (None, Some((StopCause::RequestCancelled, Some(source)))),
+    };
+    let timed_out = matches!(stop, Some((StopCause::Timeout, _)));
+    let mut request_cancelled = stop.and_then(|(_, source)| source);
     let mut cancelled = None;
-    if timed_out {
+    // One guest-side stop per run, whichever path asks for it.
+    let mut cancel = Some(cancel);
+    let unanswered = || {
+        Cancel::Unconfirmed(format!(
+            "the VM did not answer within {}s",
+            limits.cancel.as_secs()
+        ))
+    };
+    if let Some((cause, _)) = stop {
         // Stop it in the guest while its session still carries output here; once its
         // processes are gone the guest ends the session and the rest of its output arrives.
-        let c = tokio::time::timeout(limits.cancel, cancel())
+        // Once: whatever else asks later (the signal again, shutdown), this run's one stop
+        // is this one.
+        let stop_once = cancel.take().expect("the run's one stop");
+        let c = tokio::time::timeout(limits.cancel, stop_once(cause))
             .await
-            .unwrap_or_else(|_| {
-                Cancel::Unconfirmed(format!(
-                    "the VM did not answer within {}s",
-                    limits.cancel.as_secs()
-                ))
-            });
+            .unwrap_or_else(|_| unanswered());
         cancelled = Some(c);
         status = tokio::time::timeout(limits.session_grace, child.wait())
             .await
@@ -643,8 +1083,8 @@ where
         (Start::Absent, Start::Absent) => Start::Absent,
         _ => Start::Unknown,
     };
-    // A timed-out run's status is the kill's, not the command's.
-    let code = if timed_out {
+    // A stopped run's status is the kill's, not the command's.
+    let code = if stop.is_some() {
         None
     } else {
         status.and_then(|s| s.code())
@@ -657,24 +1097,48 @@ where
         (Start::Absent, Some(c)) => is_wrapper_code(c),
         _ => false,
     };
-    let needs_probe = !timed_out && !settled;
+    let needs_probe = stop.is_none() && !settled;
+    // A cancellation while the check runs ends the wait for it: the stop below answers for
+    // the command (its script writes the same tombstone first).
+    let mut cancelled_during_check = None;
     let probed = if needs_probe {
-        Some(
-            tokio::time::timeout(limits.probe, probe())
-                .await
-                .unwrap_or_else(|_| {
-                    Probe::Failed(format!(
-                        "the VM did not answer within {}s",
-                        limits.probe.as_secs()
-                    ))
-                }),
-        )
+        tokio::select! {
+            biased;
+            p = tokio::time::timeout(limits.probe, probe()) => Some(p.unwrap_or_else(|_| {
+                Probe::Failed(format!(
+                    "the VM did not answer within {}s",
+                    limits.probe.as_secs()
+                ))
+            })),
+            source = signal.wait() => {
+                cancelled_during_check = Some(source);
+                None
+            }
+        }
     } else {
         None
     };
+    // ssh ended before the command's end was known (a dropped connection) and the request was
+    // cancelled since (on the same tick, or during the check): unless the check proved the
+    // command finished (its recorded exit) or never started, the run's one stop still runs,
+    // so nothing is left running for a reply nobody receives. `Gone` proves only that the
+    // recorded root is gone: what it started (its scope, marked processes) may live on, and
+    // the stop finds those by identity, never by a bare pid.
+    let late = cancelled_during_check.or_else(|| needs_probe.then(|| signal.fired()).flatten());
+    let unsettled = !matches!(probed, Some(Probe::Exited(_)) | Some(Probe::NotStarted));
+    if let (Some(source), true) = (late, unsettled)
+        && let Some(stop_once) = cancel.take()
+    {
+        let c = tokio::time::timeout(limits.cancel, stop_once(StopCause::RequestCancelled))
+            .await
+            .unwrap_or_else(|_| unanswered());
+        cancelled = Some(c);
+        request_cancelled = Some(source);
+    }
     Ok(Facts {
         code,
         timed_out,
+        request_cancelled,
         start,
         cancel: cancelled,
         probe: probed,
@@ -694,6 +1158,67 @@ pub fn conclude(f: Facts, id: u64, name: &str, timeout: u64) -> Reply {
     );
     let mut o = base;
     let head: String;
+
+    if let Some(source) = f.request_cancelled {
+        o.request_cancelled = true;
+        let why = source.describe();
+        match f
+            .cancel
+            .unwrap_or(Cancel::Unconfirmed("no cancellation ran".into()))
+        {
+            // It had already finished: its own code, and the verified absence of leftovers.
+            Cancel::Stopped { exited: Some(rec) } => {
+                let code = ssh_code(rec);
+                o.exit_code = Some(code);
+                o.termination_confirmed = Some(true);
+                o.error = Some(format!("request cancelled: {why}"));
+                head = format!(
+                    "exit code: {code} (the VM recorded this exit code, but the request was \
+                     cancelled before the run ended: {why}; agentpc's cleanup then verified that \
+                     none of the processes it identified is left (execution id {id}).)"
+                );
+            }
+            Cancel::Stopped { exited: None } => {
+                o.state = S::Cancelled;
+                o.termination_confirmed = Some(true);
+                o.error = Some(format!("request cancelled: {why}"));
+                head = format!(
+                    "cancelled: {why}. agentpc stopped the command and every process it started \
+                     that it could identify (execution id {id}).\n(partial output below)"
+                );
+            }
+            Cancel::NotStarted => {
+                o.state = S::NotStarted;
+                o.error = Some(format!(
+                    "request cancelled before the command started: {why}"
+                ));
+                head = format!(
+                    "the command did not run: the request was cancelled before it started \
+                     ({why}); it never ran and now never will (execution id {id})."
+                );
+            }
+            Cancel::Unconfirmed(w) => {
+                o.state = S::Cancelled;
+                o.termination_confirmed = Some(false);
+                o.effect_unknown = true;
+                o.job_id = Some(id);
+                o.recovery_action = Some(RecoveryAction::StopJob);
+                o.error = Some(format!(
+                    "request cancelled ({why}), but agentpc could not confirm the command \
+                     stopped: {w}"
+                ));
+                head = format!(
+                    "cancelled: {why}. agentpc could not confirm the command stopped ({w}), so it \
+                     may still be running in the VM (execution id {id}). {handles}\n(partial \
+                     output below)"
+                );
+            }
+        }
+        return Reply {
+            outcome: o,
+            text: head + &output,
+        };
+    }
 
     if f.timed_out {
         o.timed_out = true;
@@ -1125,6 +1650,12 @@ if (Own) {{ 'AGENTPC_PROBE running' }} else {{ 'AGENTPC_PROBE gone' }}"#,
 /// before a reboot) never counts; a background job from an agentpc without proofs falls back
 /// to its command line naming `<id>.sh`.
 pub fn linux_own(id: u64) -> String {
+    linux_own_by(&id.to_string())
+}
+
+/// `linux_own` for an id given as shell text (a number, or `$id` in a loop over many jobs, as
+/// list_jobs does): the same function, byte for byte, for a number.
+pub fn linux_own_by(id: &str) -> String {
     format!(
         r#"st() {{ sed 's/.*) //' /proc/$1/stat 2>/dev/null | awk '{{ print $20 }}'; }}
 own() {{
@@ -1140,6 +1671,12 @@ own() {{
 /// PowerShell function `Own`: whether the process recorded in `<id>.pid` (pid and creation
 /// time) is still running, without a WMI query.
 pub fn windows_own(id: u64) -> String {
+    windows_own_by(&id.to_string())
+}
+
+/// `windows_own` for an id given as PowerShell text (a number, or `$id` in a loop over many
+/// jobs, as list_jobs does): the same function, byte for byte, for a number.
+pub fn windows_own_by(id: &str) -> String {
     format!(
         r#"function Own {{
   $rec = "$(try {{ [IO.File]::ReadAllText("$d\{id}.pid") }} catch {{ }})".Trim() -split ' '
@@ -1154,6 +1691,15 @@ pub fn windows_own(id: u64) -> String {
 // ---------------------------------------------------------------------------------------------
 // Job scripts (stop_job and the foreground cancellation; get_job_status's are in `jobs`)
 
+/// What a stop writes into `<id>.stopped`; get_job_status reports it as `stop_reason`.
+fn stopped_word(cause: Option<StopCause>) -> &'static str {
+    match cause {
+        None => "stop_job",
+        Some(StopCause::Timeout) => "timeout",
+        Some(StopCause::RequestCancelled) => "request_cancelled",
+    }
+}
+
 /// stop_job's bash for job `id`, or (`cancel`) the cancellation of a timed-out foreground
 /// execution. Exit codes: 0 when none of the job's identified processes is left (stopped,
 /// already exited, or not running), 1 when some would not stop, 3 for no such job, and in
@@ -1161,7 +1707,14 @@ pub fn windows_own(id: u64) -> String {
 /// means it now never starts. A foreground execution (`<id>.fg`) gets `<id>.cancel` from
 /// stop_job too.
 pub fn linux_stop_script(id: u64, cancel: bool) -> String {
-    let why = if cancel { "timeout" } else { "stop_job" };
+    linux_stop_for(id, cancel.then_some(StopCause::Timeout))
+}
+
+/// `linux_stop_script` for stop_job (`None`) or the cancellation of a foreground execution
+/// for `cause`, whose word (`timeout`, `request_cancelled`) its `<id>.stopped` records.
+pub fn linux_stop_for(id: u64, cause: Option<StopCause>) -> String {
+    let cancel = cause.is_some();
+    let why = stopped_word(cause);
     // The job's processes: everything in its systemd scope (agentpc-job-<id>.scope, a
     // cgroup only the job's processes are in), its recorded wrapper and that wrapper's
     // session while it is provably the same process (boot id and start time in
@@ -1238,7 +1791,13 @@ else echo {why} > $d/{id}.stopped; echo "stopped job {id} ($n process(es))"; fi"
 /// stop_job's PowerShell, or (`cancel`) the cancellation of a foreground execution, with the
 /// same exit codes as `linux_stop_script`.
 pub fn windows_stop_script(id: u64, cancel: bool) -> String {
-    let why = if cancel { "timeout" } else { "stop_job" };
+    windows_stop_for(id, cancel.then_some(StopCause::Timeout))
+}
+
+/// Windows's counterpart of `linux_stop_for`.
+pub fn windows_stop_for(id: u64, cause: Option<StopCause>) -> String {
+    let cancel = cause.is_some();
+    let why = stopped_word(cause);
     // The job is a scheduled task whose PowerShell runs <id>.ps1 and records its pid and
     // creation time in <id>.pid (a foreground execution: the SSH session's PowerShell,
     // recorded the same way, and no task). The task is disabled first, so a job not yet
@@ -1338,6 +1897,7 @@ mod tests {
         Facts {
             code,
             timed_out: false,
+            request_cancelled: None,
             start,
             cancel: None,
             probe: None,
@@ -1771,6 +2331,7 @@ mod tests {
             "termination_confirmed",
             "effect_unknown",
             "recovery_action",
+            "request_cancelled",
         ] {
             assert!(props.contains_key(field), "schema lacks {field}");
         }
@@ -1781,6 +2342,7 @@ mod tests {
             "not_started",
             "connection_lost",
             "started",
+            "cancelled",
         ] {
             assert!(states.contains(&format!("\"{s}\"")), "{s}");
         }
@@ -1793,6 +2355,8 @@ mod tests {
         f.timed_out = true;
         f.cancel = Some(Cancel::Unconfirmed("x".into()));
         samples.push(conclude(f, 3, "vm", 1).outcome);
+        samples.push(conclude(cancelled(Cancel::Stopped { exited: None }), 4, "vm", 1).outcome);
+        samples.push(conclude(cancelled(Cancel::Unconfirmed("x".into())), 5, "vm", 1).outcome);
         for o in samples {
             let v = serde_json::to_value(&o).unwrap();
             let obj = v.as_object().unwrap();
@@ -1896,5 +2460,155 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    fn cancelled(cancel: Cancel) -> Facts {
+        let mut f = facts(None, Start::Seen);
+        f.request_cancelled = Some(CancelSource::Request);
+        f.cancel = Some(cancel);
+        f
+    }
+
+    /// A cancelled request is its own outcome, never a timeout, with what the stop proved.
+    #[test]
+    fn a_cancelled_request_is_reported_apart_from_a_timeout() {
+        let r = conclude(cancelled(Cancel::Stopped { exited: None }), 9, "vm", 30);
+        let o = &r.outcome;
+        assert_eq!(o.state, ExecutionState::Cancelled);
+        assert!(o.request_cancelled && !o.timed_out && !o.effect_unknown);
+        assert_eq!(o.termination_confirmed, Some(true));
+        assert_eq!((o.job_id, o.recovery_action), (None, None));
+        assert!(o.error.as_deref().unwrap().contains("cancelled"), "{o:?}");
+        assert!(r.text.starts_with("cancelled: "), "{}", r.text);
+        assert!(!r.text.contains("timed out"), "{}", r.text);
+        assert!(
+            r.text
+                .ends_with("(partial output below)\n--- stdout ---\nout"),
+            "{}",
+            r.text
+        );
+        let res = r.into_result();
+        assert_eq!(res.is_error, Some(true));
+        assert_eq!(sc(&res)["state"], "cancelled");
+        assert_eq!(sc(&res)["request_cancelled"], true);
+        assert_eq!(sc(&res)["timed_out"], false);
+
+        // It had already exited: its code is known and kept, and the reply says the request
+        // was cancelled, not that the command was killed.
+        let r = conclude(cancelled(Cancel::Stopped { exited: Some(2) }), 9, "vm", 30);
+        assert_eq!(
+            (r.outcome.state, r.outcome.exit_code),
+            (ExecutionState::Exited, Some(2))
+        );
+        assert!(r.outcome.request_cancelled);
+        assert_eq!(r.outcome.termination_confirmed, Some(true));
+        assert!(r.text.starts_with("exit code: 2 ("), "{}", r.text);
+        assert!(!r.text.contains("killed"), "{}", r.text);
+        assert_eq!(r.into_result().is_error, Some(true));
+
+        // It never started: proven, and not offered for a retry the client didn't ask for.
+        let mut f = cancelled(Cancel::NotStarted);
+        f.start = Start::Absent;
+        let r = conclude(f, 9, "vm", 30);
+        assert_eq!(r.outcome.state, ExecutionState::NotStarted);
+        assert!(r.outcome.request_cancelled && !r.outcome.effect_unknown);
+        assert_eq!(r.outcome.recovery_action, None);
+        assert_eq!(r.outcome.termination_confirmed, None);
+        assert!(r.text.contains("never"), "{}", r.text);
+
+        // Unconfirmed: it may still run; the id and the next step are handed out.
+        let r = conclude(
+            cancelled(Cancel::Unconfirmed("no answer".into())),
+            9,
+            "vm",
+            30,
+        );
+        let o = &r.outcome;
+        assert_eq!(o.state, ExecutionState::Cancelled);
+        assert!(o.effect_unknown && o.request_cancelled);
+        assert_eq!(o.termination_confirmed, Some(false));
+        assert_eq!(o.job_id, Some(9));
+        assert_eq!(o.recovery_action, Some(RecoveryAction::StopJob));
+        assert!(o.error.as_deref().unwrap().contains("no answer"));
+        assert!(r.text.contains("stop_job name=vm id=9"), "{}", r.text);
+        assert!(r.text.contains("may still be running"), "{}", r.text);
+
+        // Each source is named.
+        for (src, says) in [
+            (CancelSource::Request, "client cancelled"),
+            (CancelSource::HandlerDropped, "stopped waiting"),
+            (CancelSource::Shutdown, "shutting down"),
+        ] {
+            let mut f = cancelled(Cancel::Stopped { exited: None });
+            f.request_cancelled = Some(src);
+            let r = conclude(f, 9, "vm", 30);
+            assert!(r.text.contains(says), "{src:?}: {}", r.text);
+        }
+    }
+
+    /// The refusals before anything is sent: no id, nothing to recover.
+    #[test]
+    fn refusals_before_dispatch_send_nothing() {
+        for background in [false, true] {
+            let r = Reply::refused(&Supervision::<()>::CancelledBeforeStart, background).unwrap();
+            let o = &r.outcome;
+            assert_eq!(o.state, ExecutionState::NotStarted);
+            assert!(o.request_cancelled);
+            assert_eq!(o.background, background);
+            assert_eq!(
+                (o.execution_id, o.job_id, o.recovery_action),
+                (None, None, None)
+            );
+            assert!(r.text.contains("nothing was sent"), "{}", r.text);
+            let r = Reply::refused(&Supervision::<()>::ShuttingDown, background).unwrap();
+            assert_eq!(r.outcome.state, ExecutionState::NotStarted);
+            assert!(!r.outcome.request_cancelled);
+            assert!(r.text.contains("shutting down"), "{}", r.text);
+            let r = Reply::refused(&Supervision::<()>::Busy, background).unwrap();
+            assert_eq!(r.outcome.state, ExecutionState::NotStarted);
+            assert!(r.text.contains(&MAX_SUPERVISED.to_string()), "{}", r.text);
+            assert!(Reply::refused(&Supervision::Done(()), background).is_none());
+        }
+        // A supervisor that failed: the id is handed out, nothing is assumed.
+        let r = Reply::supervision_lost(5, "vm", "panic", false);
+        assert!(r.outcome.effect_unknown);
+        assert_eq!(r.outcome.job_id, Some(5));
+        assert_eq!(
+            r.outcome.recovery_action,
+            Some(RecoveryAction::GetJobStatus)
+        );
+        assert!(r.text.contains("get_job_status name=vm id=5"), "{}", r.text);
+    }
+
+    /// The stop a cancelled request runs records `request_cancelled`, distinct from the
+    /// timeout's and stop_job's words; the existing scripts are unchanged.
+    #[test]
+    fn a_request_cancellation_records_its_own_stop_reason() {
+        let l = linux_stop_for(42, Some(StopCause::RequestCancelled));
+        assert!(l.contains("echo request_cancelled > $d/42.stopped"), "{l}");
+        assert!(
+            l.contains("exit 4"),
+            "cancel mode: a never-started run is reported"
+        );
+        assert!(!l.contains("timeout"), "{l}");
+        let w = windows_stop_for(42, Some(StopCause::RequestCancelled));
+        assert!(
+            w.contains("Set-Content -Encoding ascii \"$d\\42.stopped\" 'request_cancelled'"),
+            "{w}"
+        );
+        assert!(w.contains("never started\"; exit 4"));
+        assert_eq!(
+            linux_stop_script(42, true),
+            linux_stop_for(42, Some(StopCause::Timeout))
+        );
+        assert_eq!(linux_stop_script(42, false), linux_stop_for(42, None));
+        assert_eq!(
+            windows_stop_script(42, true),
+            windows_stop_for(42, Some(StopCause::Timeout))
+        );
+        assert_eq!(windows_stop_script(42, false), windows_stop_for(42, None));
+        assert!(
+            linux_stop_for(42, Some(StopCause::Timeout)).contains("echo timeout > $d/42.stopped")
+        );
     }
 }

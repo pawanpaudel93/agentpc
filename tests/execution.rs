@@ -623,6 +623,7 @@ fn windows_explicit_exit_codes_are_recorded() {
             Facts {
                 code: Some(ssh),
                 timed_out: false,
+                request_cancelled: None,
                 start: Start::Seen,
                 cancel: None,
                 probe: Some(probe),
@@ -1024,5 +1025,1214 @@ fn linux_background_scope_keeps_dollars_on_every_systemd() {
             version >= 254,
             "systemd {version}: {scopes:?}"
         );
+    }
+}
+
+// -----------------------------------------------------------------------------------------
+// Supervision and request cancellation: the run belongs to its own task, a cancelled
+// request or a dropped handler stops it in the "guest" once, and a run that ended by itself
+// is never stopped. Real local processes stand in for ssh and the guest, as above.
+
+use std::sync::{Arc, Mutex};
+
+/// Every guest-side stop the run asked for, in order.
+#[derive(Clone, Default)]
+struct Cleanups(Arc<Mutex<Vec<StopCause>>>);
+
+impl Cleanups {
+    fn calls(&self) -> Vec<StopCause> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// The process group a test script recorded (`echo $$ > pidfile`, its own group).
+fn group(pidfile: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(pidfile)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn kill_group(pidfile: &std::path::Path, sig: &str) {
+    if let Some(g) = group(pidfile) {
+        let _ = std::process::Command::new("kill")
+            .args([sig, &format!("-{g}")])
+            .status();
+    }
+}
+
+fn group_alive(pidfile: &std::path::Path) -> bool {
+    group(pidfile).is_some_and(|g| {
+        std::process::Command::new("kill")
+            .args(["-0", &format!("-{g}")])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
+/// The guest-side stop, played locally: records why it was asked, kills the recorded group
+/// (after `delay`), and answers `answer`.
+fn stopper(
+    cleanups: &Cleanups,
+    pidfile: &std::path::Path,
+    delay: Duration,
+    answer: Cancel,
+) -> impl FnOnce(StopCause) -> std::pin::Pin<Box<dyn std::future::Future<Output = Cancel> + Send>>
++ Send
++ 'static {
+    let cleanups = cleanups.clone();
+    let pidfile = pidfile.to_path_buf();
+    move |cause| {
+        Box::pin(async move {
+            cleanups.0.lock().unwrap().push(cause);
+            tokio::time::sleep(delay).await;
+            kill_group(&pidfile, "-TERM");
+            answer
+        })
+    }
+}
+
+async fn wait_for_file(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A script that records its group, prints `before` after the marker, then sleeps.
+fn sleeper(pidfile: &std::path::Path, id: u64) -> String {
+    format!(
+        "echo $$ > {}; {}; echo before; sleep 30; echo after",
+        pidfile.display(),
+        marker_printf(id)
+    )
+}
+
+/// One supervised foreground run of `script`, the way run_command's handler runs it.
+async fn supervised_run(
+    sup: &Supervisors,
+    requested: impl std::future::Future<Output = ()>,
+    script: String,
+    id: u64,
+    stop: impl FnOnce(StopCause) -> std::pin::Pin<Box<dyn std::future::Future<Output = Cancel> + Send>>
+    + Send
+    + 'static,
+) -> Supervision<(Reply, Option<CancelSource>)> {
+    sup.supervise(Mode::Foreground, requested, move |signal| async move {
+        let f = run_supervised(
+            sh(&script),
+            id,
+            Duration::from_secs(30),
+            FAST,
+            &signal,
+            stop,
+            never_probe,
+        )
+        .await
+        .unwrap();
+        let who = f.request_cancelled;
+        (conclude(f, id, "vm", 30), who)
+    })
+    .await
+}
+
+async fn drained(sup: &Supervisors) {
+    let left = sup
+        .drain(tokio::time::Instant::now() + Duration::from_secs(10))
+        .await;
+    assert_eq!(left, 0, "supervised runs left");
+}
+
+#[tokio::test]
+async fn a_cancelled_request_stops_its_started_run_once_and_keeps_partial_output() {
+    let dir = tempdir();
+    let pidfile = dir.join("pid");
+    let cleanups = Cleanups::default();
+    let sup = Supervisors::new();
+    let pf = pidfile.clone();
+    let requested = async move {
+        wait_for_file(&pf).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+    let started = std::time::Instant::now();
+    let s = supervised_run(
+        &sup,
+        requested,
+        sleeper(&pidfile, 21),
+        21,
+        stopper(
+            &cleanups,
+            &pidfile,
+            Duration::ZERO,
+            Cancel::Stopped { exited: None },
+        ),
+    )
+    .await;
+    let Supervision::Done((r, who)) = s else {
+        panic!("{s:?}")
+    };
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(cleanups.calls(), [StopCause::RequestCancelled]);
+    assert_eq!(who, Some(CancelSource::Request));
+    let o = &r.outcome;
+    assert_eq!(o.state, ExecutionState::Cancelled);
+    assert!(o.request_cancelled && !o.timed_out && !o.effect_unknown);
+    assert_eq!(o.termination_confirmed, Some(true));
+    assert_eq!(o.exit_code, None);
+    assert_eq!(o.stdout, "before");
+    assert!(r.text.starts_with("cancelled: "), "{}", r.text);
+    assert!(r.text.contains("--- stdout ---\nbefore"), "{}", r.text);
+    let res = r.into_result();
+    assert_eq!(res.is_error, Some(true));
+    assert_eq!(
+        res.structured_content.as_ref().unwrap()["state"],
+        "cancelled"
+    );
+    assert_eq!(
+        res.structured_content.as_ref().unwrap()["request_cancelled"],
+        true
+    );
+    assert!(!group_alive(&pidfile));
+    drained(&sup).await;
+}
+
+/// The future waiting on the run goes away (rmcp drops a handler only when its runtime goes,
+/// but nothing here may depend on that): the run's own task still stops it in the guest and
+/// ends; nothing is left behind.
+#[tokio::test]
+async fn dropping_the_waiting_handler_still_stops_the_run() {
+    let dir = tempdir();
+    let pidfile = dir.join("pid");
+    let cleanups = Cleanups::default();
+    let sup = Supervisors::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let script = sleeper(&pidfile, 22);
+    let stop = stopper(
+        &cleanups,
+        &pidfile,
+        Duration::ZERO,
+        Cancel::Stopped { exited: None },
+    );
+    let waiting = sup.supervise(
+        Mode::Foreground,
+        std::future::pending(),
+        move |signal| async move {
+            let f = run_supervised(
+                sh(&script),
+                22,
+                Duration::from_secs(30),
+                FAST,
+                &signal,
+                stop,
+                never_probe,
+            )
+            .await
+            .unwrap();
+            let _ = tx.send((f.request_cancelled, conclude(f, 22, "vm", 30).outcome));
+        },
+    );
+    let pf = pidfile.clone();
+    tokio::select! {
+        _ = waiting => panic!("the run ended by itself"),
+        () = async { wait_for_file(&pf).await; tokio::time::sleep(Duration::from_millis(300)).await } => {}
+    }
+    // `waiting` is dropped here, mid-run.
+    let (who, o) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("the run ended")
+        .unwrap();
+    assert_eq!(who, Some(CancelSource::HandlerDropped));
+    assert_eq!(cleanups.calls(), [StopCause::RequestCancelled]);
+    assert_eq!(o.state, ExecutionState::Cancelled);
+    assert_eq!(o.termination_confirmed, Some(true));
+    assert!(!group_alive(&pidfile));
+    drained(&sup).await;
+}
+
+/// A run that ended by itself is never stopped: not when its request's token fires during the
+/// steps after it (here a leftover holds its pipes, so it is still reading), and not when the
+/// finished handler goes away. rmcp also cancels a request's token when it sends the reply.
+#[tokio::test]
+async fn a_run_that_ended_is_never_cancelled_even_when_its_token_fires_at_the_end() {
+    for round in 0..3 {
+        let dir = tempdir();
+        let done = dir.join("done");
+        let leftover = dir.join("pid");
+        let cleanups = Cleanups::default();
+        let sup = Supervisors::new();
+        // The command exits 3 at once; a leftover keeps its pipes for 2 s, longer than the
+        // run reads them (FAST.drain_grace), so the token fires while the run still works.
+        let script = format!(
+            "{}; (echo $$ > {}; exec sleep 2) & touch {}; exit 3",
+            marker_printf(23),
+            leftover.display(),
+            done.display()
+        );
+        let d = done.clone();
+        let requested = async move {
+            wait_for_file(&d).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        let s = supervised_run(
+            &sup,
+            requested,
+            script,
+            23,
+            stopper(
+                &cleanups,
+                &leftover,
+                Duration::ZERO,
+                Cancel::Stopped { exited: None },
+            ),
+        )
+        .await;
+        let Supervision::Done((r, who)) = s else {
+            panic!("{s:?}")
+        };
+        assert_eq!(cleanups.calls(), [], "round {round}");
+        assert_eq!(who, None, "round {round}");
+        assert_eq!(
+            (r.outcome.state, r.outcome.exit_code),
+            (ExecutionState::Exited, Some(3)),
+            "round {round}"
+        );
+        assert!(!r.outcome.request_cancelled);
+        drained(&sup).await;
+        kill_group(&leftover, "-KILL");
+    }
+    // The ordinary case: done, then whatever fires is ignored.
+    let sup = Supervisors::new();
+    let s = sup
+        .supervise(
+            Mode::Foreground,
+            std::future::pending(),
+            |signal| async move {
+                let f = run_supervised(
+                    sh(&format!("{}; exit 0", marker_printf(24))),
+                    24,
+                    Duration::from_secs(30),
+                    FAST,
+                    &signal,
+                    |_| async { panic!("a finished run was cancelled") },
+                    never_probe,
+                )
+                .await
+                .unwrap();
+                (f.request_cancelled, signal)
+            },
+        )
+        .await;
+    let Supervision::Done((who, signal)) = s else {
+        panic!("{s:?}")
+    };
+    assert_eq!(who, None);
+    assert_eq!(
+        signal.fired(),
+        None,
+        "a finished handler disarms its signal"
+    );
+    drained(&sup).await;
+}
+
+/// A request already cancelled starts nothing; one cancelled after its run was dispatched
+/// but before the wrapper started the payload gets the guest's "never started" answer.
+#[tokio::test]
+async fn a_cancellation_before_the_start_never_starts_the_command() {
+    let dir = tempdir();
+    let ran = dir.join("ran");
+    let sup = Supervisors::new();
+    // Already cancelled when the call arrives: no task, no process.
+    let mut invoked = false;
+    let s = sup
+        .supervise(Mode::Foreground, std::future::ready(()), |_| {
+            invoked = true;
+            async {}
+        })
+        .await;
+    assert!(matches!(s, Supervision::CancelledBeforeStart), "{s:?}");
+    assert!(!invoked, "the work was not even built");
+    let s = sup
+        .supervise(Mode::Background, std::future::ready(()), |_| async {})
+        .await;
+    assert!(matches!(s, Supervision::CancelledBeforeStart), "{s:?}");
+    // Fired between the call's check and the spawn: nothing is spawned or stopped.
+    let signal = CancelSignal::new();
+    assert!(signal.fire(CancelSource::Request));
+    let f = run_supervised(
+        sh(&format!("touch {}", ran.display())),
+        25,
+        Duration::from_secs(30),
+        FAST,
+        &signal,
+        |_| async { panic!("nothing was started, so nothing is stopped") },
+        never_probe,
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!ran.exists(), "the command was spawned");
+    assert_eq!(f.request_cancelled, Some(CancelSource::Request));
+    let r = conclude(f, 25, "vm", 30);
+    let o = &r.outcome;
+    assert_eq!(o.state, ExecutionState::NotStarted);
+    assert!(o.request_cancelled && !o.effect_unknown);
+    assert_eq!((o.execution_id, o.job_id), (Some(25), None));
+    assert_eq!(o.termination_confirmed, None);
+    assert_eq!(
+        o.recovery_action, None,
+        "a cancelled request is not retried"
+    );
+    assert!(r.text.contains("never"), "{}", r.text);
+    // Dispatched, cancelled before the wrapper's marker: the guest says it never started.
+    let pidfile = dir.join("pid");
+    let cleanups = Cleanups::default();
+    let script = format!(
+        "echo $$ > {}; sleep 1; touch {}; {}; echo payload",
+        pidfile.display(),
+        ran.display(),
+        marker_printf(26)
+    );
+    let pf = pidfile.clone();
+    let s = supervised_run(
+        &sup,
+        async move { wait_for_file(&pf).await },
+        script,
+        26,
+        stopper(&cleanups, &pidfile, Duration::ZERO, Cancel::NotStarted),
+    )
+    .await;
+    let Supervision::Done((r, _)) = s else {
+        panic!("{s:?}")
+    };
+    assert_eq!(cleanups.calls(), [StopCause::RequestCancelled]);
+    assert_eq!(r.outcome.state, ExecutionState::NotStarted);
+    assert!(r.outcome.request_cancelled);
+    assert_eq!(r.outcome.stdout, "");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(!ran.exists(), "the payload started after the cancellation");
+    drained(&sup).await;
+}
+
+/// The guest can't confirm the stop, or doesn't answer at all: the reply (and the bounded
+/// time it takes) says so and hands out the id; it never claims termination.
+#[tokio::test]
+async fn an_unconfirmed_or_hanging_cleanup_is_bounded_and_honest() {
+    for (n, hang) in [(27u64, false), (28, true)] {
+        let dir = tempdir();
+        let pidfile = dir.join("pid");
+        let sup = Supervisors::new();
+        let pf = pidfile.clone();
+        let started = std::time::Instant::now();
+        let script = sleeper(&pidfile, n);
+        let s = sup
+            .supervise(
+                Mode::Foreground,
+                async move { wait_for_file(&pf).await },
+                move |signal| async move {
+                    let f = run_supervised(
+                        sh(&script),
+                        n,
+                        Duration::from_secs(30),
+                        FAST,
+                        &signal,
+                        move |_| async move {
+                            if hang {
+                                std::future::pending::<Cancel>().await
+                            } else {
+                                Cancel::Unconfirmed("the VM did not answer".into())
+                            }
+                        },
+                        never_probe,
+                    )
+                    .await
+                    .unwrap();
+                    conclude(f, n, "vm", 30)
+                },
+            )
+            .await;
+        let elapsed = started.elapsed();
+        kill_group(&pidfile, "-KILL");
+        let Supervision::Done(r) = s else {
+            panic!("{s:?}")
+        };
+        assert!(
+            elapsed < FAST.cancel + FAST.session_grace + FAST.drain_grace + Duration::from_secs(3),
+            "{elapsed:?}"
+        );
+        let o = &r.outcome;
+        assert_eq!(o.state, ExecutionState::Cancelled, "{n}");
+        assert!(o.request_cancelled && o.effect_unknown, "{n}");
+        assert_eq!(o.termination_confirmed, Some(false), "{n}");
+        assert_eq!(o.job_id, Some(n));
+        assert_eq!(o.recovery_action, Some(RecoveryAction::StopJob));
+        assert!(
+            r.text.contains(&format!("get_job_status name=vm id={n}")),
+            "{}",
+            r.text
+        );
+        assert!(!r.text.contains("agentpc stopped"), "{}", r.text);
+        drained(&sup).await;
+    }
+}
+
+/// Every source may ask (the token, the handler going away, shutdown, and the timeout racing
+/// them), yet the guest-side stop runs once.
+#[tokio::test]
+async fn many_cancellations_stop_the_run_once() {
+    let dir = tempdir();
+    let pidfile = dir.join("pid");
+    let cleanups = Cleanups::default();
+    let sup = Supervisors::new();
+    let pf = pidfile.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let script = sleeper(&pidfile, 29);
+    // A slow stop, so the other sources fire while it runs.
+    let stop = stopper(
+        &cleanups,
+        &pidfile,
+        Duration::from_millis(400),
+        Cancel::Stopped { exited: None },
+    );
+    let waiting = sup.supervise(
+        Mode::Foreground,
+        async move { wait_for_file(&pf).await },
+        move |signal| async move {
+            let f = run_supervised(
+                sh(&script),
+                29,
+                // The timeout falls inside the slow stop.
+                Duration::from_millis(600),
+                FAST,
+                &signal,
+                stop,
+                never_probe,
+            )
+            .await
+            .unwrap();
+            let _ = tx.send(f.request_cancelled);
+        },
+    );
+    let _ = tokio::time::timeout(Duration::from_millis(500), waiting).await;
+    sup.close();
+    let who = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(who, Some(CancelSource::Request));
+    assert_eq!(cleanups.calls(), [StopCause::RequestCancelled]);
+    drained(&sup).await;
+    assert_eq!(cleanups.calls().len(), 1);
+}
+
+/// Shutdown asks every run to stop, waits for them within its deadline, and takes no new
+/// ones; a run that won't end doesn't hold it past the deadline.
+#[tokio::test]
+async fn shutdown_signals_and_drains_runs_within_its_deadline() {
+    let dir = tempdir();
+    let sup = Supervisors::new();
+    let cleanups = Cleanups::default();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut pidfiles = vec![];
+    for n in [31u64, 32] {
+        let pidfile = dir.join(format!("pid{n}"));
+        pidfiles.push(pidfile.clone());
+        let script = sleeper(&pidfile, n);
+        let stop = stopper(
+            &cleanups,
+            &pidfile,
+            Duration::ZERO,
+            Cancel::Stopped { exited: None },
+        );
+        let tx = tx.clone();
+        let sup2 = sup.clone();
+        tokio::spawn(async move {
+            let s = sup2
+                .supervise(
+                    Mode::Foreground,
+                    std::future::pending(),
+                    move |signal| async move {
+                        let f = run_supervised(
+                            sh(&script),
+                            n,
+                            Duration::from_secs(30),
+                            FAST,
+                            &signal,
+                            stop,
+                            never_probe,
+                        )
+                        .await
+                        .unwrap();
+                        (f.request_cancelled, conclude(f, n, "vm", 30).outcome.state)
+                    },
+                )
+                .await;
+            let _ = tx.send(s);
+        });
+    }
+    for p in &pidfiles {
+        wait_for_file(p).await;
+    }
+    assert_eq!(sup.active(), 2);
+    let started = std::time::Instant::now();
+    assert_eq!(
+        sup.close(),
+        Closing {
+            foreground: 2,
+            background: 0
+        }
+    );
+    drained(&sup).await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+    for _ in 0..2 {
+        let s = rx.recv().await.unwrap();
+        let Supervision::Done((who, state)) = s else {
+            panic!("{s:?}")
+        };
+        assert_eq!(who, Some(CancelSource::Shutdown));
+        assert_eq!(state, ExecutionState::Cancelled);
+    }
+    assert_eq!(
+        cleanups.calls(),
+        [StopCause::RequestCancelled, StopCause::RequestCancelled]
+    );
+    for p in &pidfiles {
+        assert!(!group_alive(p));
+    }
+    // Closed: nothing new starts.
+    let mut invoked = false;
+    let s = sup
+        .supervise(Mode::Foreground, std::future::pending(), |_| {
+            invoked = true;
+            async {}
+        })
+        .await;
+    assert!(matches!(s, Supervision::ShuttingDown), "{s:?}");
+    assert!(!invoked);
+    // A run that ignores its signal is waited for only until the deadline.
+    let sup = Supervisors::new();
+    let stuck = sup.clone();
+    tokio::spawn(async move {
+        stuck
+            .supervise(Mode::Foreground, std::future::pending(), |_| {
+                std::future::pending::<()>()
+            })
+            .await
+    });
+    while sup.active() == 0 {
+        tokio::task::yield_now().await;
+    }
+    sup.close();
+    let started = std::time::Instant::now();
+    let left = sup
+        .drain(tokio::time::Instant::now() + Duration::from_millis(300))
+        .await;
+    assert_eq!(left, 1);
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+/// The registry is bounded: one run past MAX_SUPERVISED is refused before it starts.
+#[tokio::test]
+async fn supervision_is_bounded() {
+    let sup = Supervisors::new();
+    for _ in 0..MAX_SUPERVISED {
+        let s = sup.clone();
+        tokio::spawn(async move {
+            s.supervise(
+                Mode::Foreground,
+                std::future::pending(),
+                |signal| async move {
+                    signal.wait().await;
+                },
+            )
+            .await
+        });
+    }
+    while sup.active() < MAX_SUPERVISED {
+        tokio::task::yield_now().await;
+    }
+    let mut invoked = false;
+    let s = sup
+        .supervise(Mode::Foreground, std::future::pending(), |_| {
+            invoked = true;
+            async {}
+        })
+        .await;
+    assert!(matches!(s, Supervision::Busy), "{s:?}");
+    assert!(!invoked);
+    assert_eq!(
+        sup.close(),
+        Closing {
+            foreground: MAX_SUPERVISED,
+            background: 0
+        }
+    );
+    drained(&sup).await;
+}
+
+/// A background launch outlives its request's cancellation: once started it completes, and
+/// neither the token nor the handler going away fires its signal.
+#[tokio::test]
+async fn a_background_launch_is_not_cancelled_with_its_request() {
+    let sup = Supervisors::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let waiting = sup.supervise(
+        Mode::Background,
+        tokio::time::sleep(Duration::from_millis(50)),
+        move |signal| async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let _ = tx.send(signal.fired());
+        },
+    );
+    // The token fires at 50 ms; the handler is dropped at 150 ms.
+    let _ = tokio::time::timeout(Duration::from_millis(150), waiting).await;
+    let fired = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fired, None, "the launch was asked to stop");
+    drained(&sup).await;
+}
+
+/// Review I1: ssh ends (here with 255, the code of a dropped connection) while the command
+/// lives on in the "guest", and the request is cancelled on the same tick or while the
+/// follow-up check runs. Before the fix only the check ran and its `running` answer went into
+/// a reply nobody receives; now the run's one stop still runs, and a check that hangs doesn't
+/// hold it back. A check that proves the command finished keeps that, and stops nothing.
+#[tokio::test]
+async fn a_cancellation_after_a_lost_connection_still_stops_the_command() {
+    let lost = |pidfile: &std::path::Path, id: u64| {
+        format!(
+            "echo $$ > {}; {}; (exec sleep 30) >/dev/null 2>&1 & exit 255",
+            pidfile.display(),
+            marker_printf(id)
+        )
+    };
+    // The cancellation lands as the check answers: still running, or no answer.
+    for (n, answer) in [
+        (51u64, Probe::Running),
+        (52, Probe::Failed("no answer".into())),
+    ] {
+        let dir = tempdir();
+        let pidfile = dir.join("pid");
+        let cleanups = Cleanups::default();
+        let signal = CancelSignal::new();
+        let sig = signal.clone();
+        let f = run_supervised(
+            sh(&lost(&pidfile, n)),
+            n,
+            Duration::from_secs(30),
+            FAST,
+            &signal,
+            stopper(
+                &cleanups,
+                &pidfile,
+                Duration::ZERO,
+                Cancel::Stopped { exited: None },
+            ),
+            move || async move {
+                sig.fire(CancelSource::Request);
+                answer
+            },
+        )
+        .await
+        .unwrap();
+        let alive = group_alive(&pidfile);
+        kill_group(&pidfile, "-KILL");
+        assert_eq!(cleanups.calls(), [StopCause::RequestCancelled], "{n}");
+        assert!(!alive, "{n}: the command was left running");
+        assert_eq!(f.request_cancelled, Some(CancelSource::Request), "{n}");
+        let o = conclude(f, n, "vm", 30).outcome;
+        assert_eq!(o.state, ExecutionState::Cancelled, "{n}");
+        assert!(o.request_cancelled, "{n}");
+        assert_eq!(o.termination_confirmed, Some(true), "{n}");
+    }
+    // Re-review 1: the recorded root died with the connection (no exit record), so the
+    // check says `gone`, but a nohup'd member of the run lives on. `gone` proves nothing
+    // about the rest of the run: the one stop still runs and the member is ended.
+    let dir = tempdir();
+    let pidfile = dir.join("pid");
+    let member = dir.join("member");
+    let cleanups = Cleanups::default();
+    let signal = CancelSignal::new();
+    let sig = signal.clone();
+    let script = format!(
+        "echo $$ > {}; {}; nohup sh -c 'echo $$ > {}; exec sleep 30' >/dev/null 2>&1 & exit 255",
+        pidfile.display(),
+        marker_printf(55),
+        member.display()
+    );
+    let m = member.clone();
+    let f = run_supervised(
+        sh(&script),
+        55,
+        Duration::from_secs(30),
+        FAST,
+        &signal,
+        stopper(
+            &cleanups,
+            &pidfile,
+            Duration::ZERO,
+            Cancel::Stopped { exited: None },
+        ),
+        move || async move {
+            // The member is up before the check answers.
+            wait_for_file(&m).await;
+            sig.fire(CancelSource::Request);
+            Probe::Gone
+        },
+    )
+    .await
+    .unwrap();
+    let member_pid = std::fs::read_to_string(&member).unwrap();
+    let member_alive = std::process::Command::new("kill")
+        .args(["-0", member_pid.trim()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    kill_group(&pidfile, "-KILL");
+    assert_eq!(cleanups.calls(), [StopCause::RequestCancelled]);
+    assert!(!member_alive, "the nohup'd member was left running");
+    assert_eq!(f.request_cancelled, Some(CancelSource::Request));
+    let o = conclude(f, 55, "vm", 30).outcome;
+    assert_eq!(o.state, ExecutionState::Cancelled);
+    assert!(o.request_cancelled);
+    assert_eq!(o.termination_confirmed, Some(true));
+    // The check hangs; the cancellation comes while it waits: the stop doesn't wait out the
+    // check's (here 20 s) deadline.
+    let dir = tempdir();
+    let pidfile = dir.join("pid");
+    let cleanups = Cleanups::default();
+    let signal = CancelSignal::new();
+    let checking = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (sig, flag) = (signal.clone(), checking.clone());
+    tokio::spawn(async move {
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        sig.fire(CancelSource::Request);
+    });
+    let slow = Limits {
+        probe: Duration::from_secs(20),
+        ..FAST
+    };
+    let started = std::time::Instant::now();
+    let f = run_supervised(
+        sh(&lost(&pidfile, 53)),
+        53,
+        Duration::from_secs(30),
+        slow,
+        &signal,
+        stopper(
+            &cleanups,
+            &pidfile,
+            Duration::ZERO,
+            Cancel::Stopped { exited: None },
+        ),
+        move || async move {
+            checking.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<Probe>().await
+        },
+    )
+    .await
+    .unwrap();
+    let took = started.elapsed();
+    let alive = group_alive(&pidfile);
+    kill_group(&pidfile, "-KILL");
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert_eq!(cleanups.calls(), [StopCause::RequestCancelled]);
+    assert!(!alive);
+    assert_eq!(
+        conclude(f, 53, "vm", 30).outcome.state,
+        ExecutionState::Cancelled
+    );
+    // The check proves it finished (its recorded code): nothing is stopped, the code is kept.
+    let dir = tempdir();
+    let pidfile = dir.join("pid");
+    let signal = CancelSignal::new();
+    let sig = signal.clone();
+    let f = run_supervised(
+        sh(&lost(&pidfile, 54)),
+        54,
+        Duration::from_secs(30),
+        FAST,
+        &signal,
+        |_| async { panic!("a finished command was stopped") },
+        move || async move {
+            sig.fire(CancelSource::Request);
+            Probe::Exited(0)
+        },
+    )
+    .await
+    .unwrap();
+    kill_group(&pidfile, "-KILL");
+    assert_eq!(f.request_cancelled, None);
+    let o = conclude(f, 54, "vm", 30).outcome;
+    assert_eq!(o.exit_code, Some(0));
+    assert!(!o.request_cancelled);
+}
+
+/// Review I2: two runs end at once on a multi-threaded runtime (as in production). Run A has
+/// counted what is left (1) but not yet published it when run B ends and publishes 0; A's
+/// late 1 must not leave `drain` waiting for a run that is gone. The seam holds A at exactly
+/// that point and lets B go (or try to) meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_sees_the_last_end_however_two_ends_interleave() {
+    use std::sync::mpsc;
+    let sup = Supervisors::new();
+    let (a_end, a_rx) = tokio::sync::oneshot::channel::<()>();
+    let (b_end, b_rx) = tokio::sync::oneshot::channel::<()>();
+    let (b_done_tx, b_done_rx) = mpsc::channel::<()>();
+    let s = sup.clone();
+    tokio::spawn(async move {
+        s.supervise(Mode::Foreground, std::future::pending(), |_| async move {
+            let _ = a_rx.await;
+        })
+        .await
+    });
+    let s = sup.clone();
+    tokio::spawn(async move {
+        s.supervise(Mode::Foreground, std::future::pending(), |_| async move {
+            let _ = b_rx.await;
+        })
+        .await;
+        let _ = b_done_tx.send(());
+    });
+    while sup.active() < 2 {
+        tokio::task::yield_now().await;
+    }
+    let (in_window_tx, in_window_rx) = mpsc::channel::<()>();
+    let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let b_done = Mutex::new(b_done_rx);
+    let in_window = Mutex::new(in_window_tx);
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let a_released = released.clone();
+    sup.set_before_publish(move |n| {
+        if n == 1 && !held.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            // A, between counting and publishing: let B end now, if it can.
+            let _ = in_window.lock().unwrap().send(());
+            let _ = b_done.lock().unwrap().recv_timeout(Duration::from_secs(2));
+            a_released.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    a_end.send(()).unwrap();
+    tokio::task::spawn_blocking(move || in_window_rx.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("A reached the window");
+    b_end.send(()).unwrap();
+    sup.close();
+    // Both ends are over (A's publish is the statement after its seam returns) before
+    // shutdown starts waiting.
+    while !released.load(std::sync::atomic::Ordering::SeqCst) || sup.active() > 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let started = std::time::Instant::now();
+    let left = sup
+        .drain(tokio::time::Instant::now() + Duration::from_secs(8))
+        .await;
+    let took = started.elapsed();
+    assert_eq!(left, 0);
+    assert!(
+        took < Duration::from_secs(5),
+        "drain waited {took:?} for runs that had ended"
+    );
+}
+
+/// Shutdown tells foreground commands it stops from background launches it only waits for.
+#[tokio::test]
+async fn close_counts_stopped_commands_apart_from_awaited_launches() {
+    let sup = Supervisors::new();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let (fired_tx, mut fired_rx) = tokio::sync::mpsc::unbounded_channel();
+    let s = sup.clone();
+    tokio::spawn(async move {
+        s.supervise(
+            Mode::Foreground,
+            std::future::pending(),
+            |signal| async move {
+                signal.wait().await;
+            },
+        )
+        .await
+    });
+    let s = sup.clone();
+    tokio::spawn(async move {
+        s.supervise(
+            Mode::Background,
+            std::future::pending(),
+            |signal| async move {
+                let _ = rx.await;
+                let _ = fired_tx.send(signal.fired());
+            },
+        )
+        .await
+    });
+    while sup.active() < 2 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        sup.close(),
+        Closing {
+            foreground: 1,
+            background: 1
+        }
+    );
+    // The foreground run stops; the launch is waited for, not stopped: it is still there
+    // until it finishes by itself, and was never asked to stop.
+    let left = sup
+        .drain(tokio::time::Instant::now() + Duration::from_millis(500))
+        .await;
+    assert_eq!(left, 1);
+    tx.send(()).unwrap();
+    assert_eq!(fired_rx.recv().await, Some(None));
+    drained(&sup).await;
+}
+
+// ---- The same through a real rmcp server and client, over an in-memory pipe ---------------
+
+mod rpc {
+    use super::*;
+    use rmcp::model::{
+        CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult, ClientRequest,
+        ContentBlock, ServerCapabilities, ServerConfig,
+    };
+    use rmcp::service::{PeerRequestOptions, RequestContext, RunningService};
+    use rmcp::{RoleClient, RoleServer, ServerHandler, ServiceExt};
+
+    /// A server with run_command's two paths: `fg` supervises a foreground run of the
+    /// `script` argument with the request's own cancellation token, `bg` a launch that
+    /// starts a detached process after a delay.
+    #[derive(Clone)]
+    struct Server {
+        sup: Supervisors,
+        cleanups: Cleanups,
+        pidfile: std::path::PathBuf,
+        /// What each handler concluded, once it got past its supervision.
+        returned: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ServerHandler for Server {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn call_tool(
+            &self,
+            req: CallToolRequestParams,
+            ctx: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, rmcp::ErrorData> {
+            let arg = |k: &str| {
+                req.arguments
+                    .as_ref()
+                    .and_then(|a| a.get(k))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let text = match req.name.as_ref() {
+                "fg" => {
+                    let script = arg("script");
+                    let stop = stopper(
+                        &self.cleanups,
+                        &self.pidfile,
+                        Duration::ZERO,
+                        Cancel::Stopped { exited: None },
+                    );
+                    let s = self
+                        .sup
+                        .supervise(
+                            Mode::Foreground,
+                            ctx.ct.cancelled(),
+                            move |signal| async move {
+                                let f = run_supervised(
+                                    sh(&script),
+                                    41,
+                                    Duration::from_secs(30),
+                                    FAST,
+                                    &signal,
+                                    stop,
+                                    never_probe,
+                                )
+                                .await
+                                .unwrap();
+                                conclude(f, 41, "vm", 30)
+                            },
+                        )
+                        .await;
+                    match s {
+                        Supervision::Done(r) => format!("{:?}", r.outcome.state),
+                        other => format!("{other:?}"),
+                    }
+                }
+                "bg" => {
+                    let pidfile = self.pidfile.clone();
+                    let s = self
+                        .sup
+                        .supervise(Mode::Background, ctx.ct.cancelled(), move |_| async move {
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            // Detached, as a background job is: not killed with anything here.
+                            use std::os::unix::process::CommandExt;
+                            let mut job = std::process::Command::new("sh")
+                                .args([
+                                    "-c",
+                                    &format!("echo $$ > {}; exec sleep 30", pidfile.display()),
+                                ])
+                                .process_group(0)
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .spawn()
+                                .unwrap();
+                            // Reaped by a thread of its own, never waited on here.
+                            std::thread::spawn(move || job.wait());
+                        })
+                        .await;
+                    format!("{s:?}")
+                }
+                other => format!("no tool {other}"),
+            };
+            self.returned.lock().unwrap().push(text.clone());
+            Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
+        }
+    }
+
+    async fn connect(
+        server: Server,
+    ) -> (RunningService<RoleClient, ()>, tokio::task::JoinHandle<()>) {
+        let (server_io, client_io) = tokio::io::duplex(1 << 16);
+        let served = tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        (().serve(client_io).await.unwrap(), served)
+    }
+
+    fn server(dir: &TempDir) -> Server {
+        Server {
+            sup: Supervisors::new(),
+            cleanups: Cleanups::default(),
+            pidfile: dir.join("pid"),
+            returned: Arc::default(),
+        }
+    }
+
+    fn call(name: &'static str, script: &str) -> ClientRequest {
+        let mut params = CallToolRequestParams::new(name);
+        params.arguments = serde_json::json!({ "script": script }).as_object().cloned();
+        ClientRequest::CallToolRequest(CallToolRequest::new(params))
+    }
+
+    async fn until(what: &str, mut ok: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !ok() {
+            assert!(std::time::Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// rmcp 3.4.1 doesn't abort a handler on notifications/cancelled: it cancels the request's
+    /// token and drops the reply. The handler sees the token, the run is stopped in the guest
+    /// once, and the handler itself still runs to its end.
+    #[tokio::test]
+    async fn notifications_cancelled_stops_the_foreground_run() {
+        let dir = tempdir();
+        let srv = server(&dir);
+        let (client, _served) = connect(srv.clone()).await;
+        let handle = client
+            .peer()
+            .send_cancellable_request(
+                call("fg", &sleeper(&srv.pidfile, 41)),
+                PeerRequestOptions::no_options(),
+            )
+            .await
+            .unwrap();
+        wait_for_file(&srv.pidfile).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let cancelled_at = std::time::Instant::now();
+        handle.cancel(Some("test".into())).await.unwrap();
+        until("the stop ran", || !srv.cleanups.calls().is_empty()).await;
+        assert!(cancelled_at.elapsed() < Duration::from_secs(5));
+        until("the handler returned", || {
+            !srv.returned.lock().unwrap().is_empty()
+        })
+        .await;
+        assert_eq!(*srv.returned.lock().unwrap(), ["Cancelled"]);
+        assert_eq!(srv.cleanups.calls(), [StopCause::RequestCancelled]);
+        assert!(!group_alive(&srv.pidfile));
+        drained(&srv.sup).await;
+    }
+
+    /// A call that completes gets its reply, and rmcp cancelling the finished request's token
+    /// when it sends that reply stops nothing.
+    #[tokio::test]
+    async fn a_completed_call_is_never_cancelled() {
+        let dir = tempdir();
+        let srv = server(&dir);
+        let (client, _served) = connect(srv.clone()).await;
+        let r = client
+            .peer()
+            .send_request(call("fg", &format!("{}; echo hi", marker_printf(41))))
+            .await
+            .unwrap();
+        assert!(format!("{r:?}").contains("Exited"), "{r:?}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(srv.cleanups.calls(), []);
+        drained(&srv.sup).await;
+    }
+
+    /// The client goes away mid-run (its transport closes): once rmcp's serve loop ends, the
+    /// request's token is cancelled and the run is stopped.
+    #[tokio::test]
+    async fn a_disconnected_client_stops_the_foreground_run() {
+        let dir = tempdir();
+        let srv = server(&dir);
+        let (client, served) = connect(srv.clone()).await;
+        let handle = client
+            .peer()
+            .send_cancellable_request(
+                call("fg", &sleeper(&srv.pidfile, 41)),
+                PeerRequestOptions::no_options(),
+            )
+            .await
+            .unwrap();
+        wait_for_file(&srv.pidfile).await;
+        drop(handle);
+        client.cancel().await.unwrap();
+        until("the stop ran", || !srv.cleanups.calls().is_empty()).await;
+        assert_eq!(srv.cleanups.calls(), [StopCause::RequestCancelled]);
+        let _ = tokio::time::timeout(Duration::from_secs(10), served).await;
+        drained(&srv.sup).await;
+        assert!(!group_alive(&srv.pidfile));
+    }
+
+    /// Cancelling a background start's request mid-launch doesn't stop the launch or the job
+    /// it starts.
+    #[tokio::test]
+    async fn cancelling_a_background_start_keeps_the_job() {
+        let dir = tempdir();
+        let srv = server(&dir);
+        let (client, _served) = connect(srv.clone()).await;
+        let handle = client
+            .peer()
+            .send_cancellable_request(call("bg", ""), PeerRequestOptions::no_options())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.cancel(Some("test".into())).await.unwrap();
+        wait_for_file(&srv.pidfile).await;
+        until("the job recorded itself", || group(&srv.pidfile).is_some()).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let alive = group_alive(&srv.pidfile);
+        kill_group(&srv.pidfile, "-KILL");
+        assert!(alive, "the background job was killed with its request");
+        drained(&srv.sup).await;
+        assert!(srv.returned.lock().unwrap()[0].starts_with("Done"));
     }
 }

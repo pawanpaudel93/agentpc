@@ -26,11 +26,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::execution::{self, Cancel, Captured, Probe, RecoveryAction, Reply, drain_ends};
+use crate::execution::{self, Cancel, Captured, Mode, Probe, RecoveryAction, Reply, drain_ends};
 #[cfg(test)]
 use crate::execution::{CAPTURE_KEEP, clip};
 use crate::instance::{Image, Instance, Os};
-use crate::{jobs, ops, qemu};
+use crate::{jobs, ops, qemu, readiness};
 
 const INSTRUCTIONS: &str = "\
 Controls instant, resettable Windows, Ubuntu and Arch Linux ARM desktop VMs on this Mac. Treat
@@ -136,6 +136,36 @@ Rules:
   has_more says call again. If cursor_reset is true (VM reset, reboot, log replaced or rewritten;
   detection is best effort) discard what you assumed: output restarts at the log's beginning. missing
   means nothing has recorded itself under that id yet, not that it never started: don't blindly retry.
+- Cancellation: a foreground run_command whose request is cancelled (notifications/cancelled), whose
+  client disconnects or whose MCP session ends is stopped in the VM like a timeout: state \"cancelled\"
+  with request_cancelled true and termination_confirmed saying whether the stop was verified (a
+  command that had already exited keeps state \"exited\" and its code). The client that cancelled
+  usually never receives that reply, so recover the execution id with list_jobs and read it with
+  get_job_status (stopped, stop_reason request_cancelled; or not_started). A background start is
+  detached: cancelling its request or ending the session does not stop the job; end it with stop_job.
+  A hard kill of the MCP server gives no cleanup; the job records stay in the VM.
+- Finding a job again: list_jobs {name, limit?, cursor?} lists the job records in a VM, newest id first
+  (limit 1 to 100, default 20), metadata only: job_id, kind, state, exit_code, stop_reason, which records
+  exist and file times, never a command, environment, output or log text. has_more with next_cursor
+  gives the next page, which continues below the last job shown. A cursor from before a VM reset,
+  restore or recreation is refused with cursor_stale (the VM's generation changed and its records may
+  differ, so it cannot safely continue): call again without cursor. The listing is best effort, not an
+  immutable history: records age out, scan_truncated means a huge directory may have hidden jobs, and a
+  queued, missing or unknown record is unresolved, not proof the command never started.
+- Waiting for a server: wait_for_service {name, guest_port, protocol?, timeout_seconds?, path?,
+  expected_status?, job_id?} polls only the VM's own 127.0.0.1 (IPv4): protocol tcp (default) is ready
+  when a connection is accepted; protocol http is ready when GET path (default \"/\", a path not a
+  URL, with no credentials in it: it is echoed back and visible in the VM's process list) answers
+  expected_status (default 200), with redirects not followed and no response body, header or guest
+  text returned. timeout_seconds is 1 to 120 (default 30) and bounds the waiting, not the wall clock (a
+  call can run about 5 s past it). The result is structured (state ready, timed_out, job_failed,
+  cancelled or error; the last observation; error_code such as probe_unsupported) and anything but
+  ready is an error. With job_id (a run_command job) the wait ends early only for a proven failure: a
+  nonzero exit, stopped or never started. A job that exited 0 (a server may outlive its wrapper), is
+  queued, running, ended without a code, missing or unreadable is not failure. A ready result
+  does not prove which process serves the port, and there is no ownership check. Waiting never stops, restarts
+  or signals the service or the job, and cancelling it only stops probing, but each probe makes
+  short-lived connections (and one GET), so it can consume a one-shot listener.
 - Reach a server in the VM from the Mac with forward_port (works even for servers bound to the
   guest's own 127.0.0.1); it returns a 127.0.0.1:<port> address and lasts until the VM stops.
   For a UDP server pass protocol: \"udp\"; it must listen on 0.0.0.0 (on Windows, also allow
@@ -167,10 +197,12 @@ pub async fn serve() -> Result<()> {
         });
     }
     let running = gateway.clone().serve((tokio::io::stdin(), out)).await?;
-    running.waiting().await?;
-    // Client disconnected / stdin EOF: stop the VMs this process left running so they don't
-    // pile up. CLI-started VMs aren't in `owned`, so they're untouched.
+    let quit = running.waiting().await;
+    // Client disconnected / stdin EOF (or the serve loop failed): stop this session's
+    // commands still running and the VMs this process left running so they don't pile up,
+    // before any error is returned. CLI-started VMs aren't in `owned`, so they're untouched.
     gateway.shutdown().await;
+    quit?;
     Ok(())
 }
 
@@ -187,6 +219,10 @@ fn protocol_stdout() -> Result<tokio::fs::File> {
     }
     Ok(tokio::fs::File::from_std(fd.into()))
 }
+
+/// How long a session's shutdown may take: stopping its VMs and its foreground commands'
+/// cleanup run side by side within it.
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(45);
 
 type Client = Arc<RunningService<RoleClient, ()>>;
 /// Per-instance slot, locked while connecting so concurrent calls share one session.
@@ -209,6 +245,9 @@ struct Gateway {
     /// Per VM, the desktop tools its driver marks read-only: only those are re-sent after a
     /// dropped connection.
     read_only: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// Foreground runs (and background launches) under way, each owned by its own task, so
+    /// a cancelled request still stops its command and shutdown can wait for them.
+    supervisors: execution::Supervisors,
     /// Test seam: drivers `session` hands out, in order, instead of connecting over SSH.
     #[cfg(test)]
     dials: Arc<Mutex<std::collections::VecDeque<RunningService<RoleClient, ()>>>>,
@@ -228,6 +267,7 @@ impl Gateway {
             connected: Default::default(),
             reconnected: Default::default(),
             read_only: Default::default(),
+            supervisors: execution::Supervisors::new(),
             #[cfg(test)]
             dials: Default::default(),
             exe: std::env::current_exe()
@@ -310,10 +350,52 @@ impl Gateway {
         Ok(())
     }
 
-    /// Best-effort, bounded shutdown: gracefully stop the VMs this session left running, unless
+    /// Best-effort, bounded shutdown: stop the foreground commands still running for this
+    /// session's requests, and gracefully stop the VMs this session left running, unless
     /// AGENTPC_KEEP_RUNNING=1. Force-quit any that don't stop in time so the process can exit.
     async fn shutdown(&self) {
-        if ops::keep_running() {
+        self.shutdown_with(ops::keep_running(), SHUTDOWN_BUDGET)
+            .await
+    }
+
+    /// Shutdown within `budget`: every supervised run is asked to stop at once (a foreground
+    /// command is cleaned up in its VM even when the VMs keep running) and waited for, side
+    /// by side with stopping this session's VMs (unless `keep_running`), all against one
+    /// deadline. What is still under way at the deadline is left: its record in the VM lets
+    /// get_job_status / stop_job find it later.
+    async fn shutdown_with(&self, keep_running: bool, budget: Duration) {
+        let deadline = std::time::Instant::now() + budget;
+        let closing = self.supervisors.close();
+        if closing.foreground > 0 {
+            crate::log!(
+                "MCP server exiting; stopping {} foreground run_command command(s) still running",
+                closing.foreground
+            );
+        }
+        if closing.background > 0 {
+            crate::log!(
+                "MCP server exiting; waiting for {} background job launch(es) to finish (the \
+                 jobs themselves keep running)",
+                closing.background
+            );
+        }
+        let drain = self
+            .supervisors
+            .drain(tokio::time::Instant::from_std(deadline));
+        let (left, ()) = tokio::join!(drain, self.stop_owned_vms(keep_running, deadline));
+        if left > 0 {
+            crate::log!(
+                "{left} run_command call(s) were still being stopped or launched at the \
+                 shutdown deadline; get_job_status / stop_job can find them by their records in \
+                 the VM"
+            );
+        }
+    }
+
+    /// Gracefully stop the VMs this session left running (unless `keep_running`), by
+    /// `deadline`.
+    async fn stop_owned_vms(&self, keep_running: bool, deadline: std::time::Instant) {
+        if keep_running {
             return;
         }
         let names: Vec<String> = self.owned.lock().unwrap().iter().cloned().collect();
@@ -334,7 +416,6 @@ impl Gateway {
         );
         // Bound the lock-holding operation itself. Cancelling a spawn_blocking waiter
         // would leave that stop running (and its lock held) past the session deadline.
-        let deadline = std::time::Instant::now() + Duration::from_secs(45);
         let stops = running.into_iter().map(|inst| {
             let mine = mine.clone();
             blocking(move || ops::stop_if_owned(&inst, &mine, deadline))
@@ -514,6 +595,43 @@ struct JobArgs {
     /// A `next_cursor` from an earlier reply about this job, or "start": returns the log from
     /// that position instead of its tail (at most 16 KiB per reply), with the next cursor.
     cursor: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ListJobsArgs {
+    name: String,
+    /// Jobs per page, newest first (default 20, 1 to 100).
+    #[schemars(range(min = 1, max = 100), extend("default" = 20))]
+    limit: Option<u64>,
+    /// A `next_cursor` from the previous list_jobs reply for this VM: the next page, below the
+    /// last job shown. Omit it to list from the newest job.
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct WaitServiceArgs {
+    name: String,
+    /// The TCP port to check on the VM's own 127.0.0.1 (1 to 65535).
+    #[schemars(range(min = 1, max = 65535))]
+    guest_port: i64,
+    /// "tcp" (default): ready when a connection is accepted. "http": ready when a GET of `path`
+    /// answers with `expected_status`.
+    #[schemars(extend("enum" = ["tcp", "http"], "default" = "tcp"))]
+    protocol: Option<String>,
+    /// Seconds to wait (1 to 120, default 30). A wait only waits: it never stops the service.
+    #[schemars(range(min = 1, max = 120), extend("default" = 30))]
+    timeout_seconds: Option<i64>,
+    /// http only (refused with tcp): a path on the VM's own server, starting with / (when
+    /// omitted: "/"). Not a URL: no scheme, host, port or fragment. A query ("?a=b") is allowed
+    /// but is echoed in the result: do not put credentials in it.
+    path: Option<String>,
+    /// http only (refused with tcp): the status that counts as ready, 100 to 599 (when omitted:
+    /// 200). Redirects are not followed, so a 301 is ready only if you ask for 301.
+    #[schemars(range(min = 100, max = 599))]
+    expected_status: Option<i64>,
+    /// A job started by run_command: if it is proven to have failed (nonzero exit, stopped or
+    /// cancelled, or never started) the wait ends early. It does not tie the endpoint to the job.
+    job_id: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -881,7 +999,13 @@ impl Gateway {
                           it started in the VM (best effort on Windows, where a process whose launcher has\n\
                           already exited can be missed), and returns its partial output; if the stop can't be\n\
                           confirmed (or the connection fails before its end is known), the reply says so and gives a job_id for\n\
-                          get_job_status / stop_job. Commands are never retried. A Linux foreground command is\n\
+                          get_job_status / stop_job. A foreground run whose request is cancelled\n\
+                          (notifications/cancelled), whose client disconnects or whose session ends is stopped the same\n\
+                          way: state cancelled, request_cancelled true, termination_confirmed saying whether the stop was\n\
+                          verified (a command that had already exited keeps state exited and its code); the cancelling\n\
+                          client usually never receives that reply, so find the run again with list_jobs and read it with\n\
+                          get_job_status (stopped, stop_reason request_cancelled). A background start is detached and is\n\
+                          not stopped by cancellation: end it with stop_job. Commands are never retried. A Linux foreground command is\n\
                           limited to 92 KiB (94,208 UTF-8 bytes) of text, checked before sending (upload_file a bigger script and run it). For servers\n\
                           or anything slow,\n\
                           pass background: true -- it keeps running after the call, returns a job id, and you\n\
@@ -897,13 +1021,36 @@ impl Gateway {
             open_world_hint = true
         )
     )]
-    async fn run_command(&self, Parameters(a): Parameters<ExecArgs>) -> CallToolResult {
+    async fn run_command(
+        &self,
+        Parameters(a): Parameters<ExecArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        // Each run is its own task, owned by `supervisors` rather than by this request: a
+        // cancelled request (notifications/cancelled, or the client going away) or this
+        // handler being dropped stops a foreground command in the VM, as its timeout would.
+        // A background start, once under way, is left to finish: the job is meant to outlive
+        // the request. A request cancelled before anything was sent starts nothing.
         if a.background {
-            return exec_background(&a.name, &a.command).await.into_result();
+            let id = job_id();
+            let name = a.name.clone();
+            let s = self
+                .supervisors
+                .supervise(Mode::Background, ctx.ct.cancelled(), move |_| async move {
+                    exec_background(&a.name, &a.command, id).await
+                })
+                .await;
+            return settle(s, id, &name, true).into_result();
         }
-        run_tracked(&a.name, &a.command, a.timeout)
-            .await
-            .into_result()
+        run_tracked(
+            &self.supervisors,
+            &a.name,
+            &a.command,
+            a.timeout,
+            ctx.ct.cancelled(),
+        )
+        .await
+        .into_result()
     }
 
     #[tool(
@@ -1096,6 +1243,84 @@ impl Gateway {
     )]
     async fn job_status(&self, Parameters(a): Parameters<JobArgs>) -> CallToolResult {
         job_status(a).await
+    }
+
+    #[tool(
+        name = "list_jobs",
+        title = "List jobs",
+        description = "List the jobs recorded in a VM, newest id first, so a job whose id was lost (a\n\
+                          cancelled or disconnected run_command, a lost reply) can be found again. Metadata only:\n\
+                          per job its job_id, kind (foreground, background, or unknown), state (same rules as\n\
+                          get_job_status), exit_code, stop_reason, whether it has a log, which records exist, and\n\
+                          recorded_at / finished_at file-system times when they are known. Never a command, environment,\n\
+                          output or log text: read those with get_job_status. limit is 1 to 100 (default 20). When\n\
+                          has_more is true, pass next_cursor as cursor for the next page: pages continue below the\n\
+                          last job shown within the VM as it was when the first page was read, so jobs created\n\
+                          meanwhile do not shift them; a cursor from before a VM reset, restore or recreation is refused\n\
+                          (cursor_stale: the VM's generation changed and its records may differ, so the listing cannot\n\
+                          safely continue; call again without cursor). The listing is best effort, not an immutable history: records age out, and\n\
+                          a huge directory keeps only its first entries (scan_truncated). A queued or missing record is\n\
+                          unresolved, not proof that its command never started. Read-only.",
+        output_schema = jobs::list_output_schema(),
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_jobs(
+        &self,
+        Parameters(a): Parameters<ListJobsArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        list_jobs(a, ctx.ct.cancelled()).await
+    }
+
+    #[tool(
+        name = "wait_for_service",
+        title = "Wait for service",
+        description = "Wait until a TCP port or an HTTP path in a VM answers, looking only at that VM's own\n\
+                          127.0.0.1 (IPv4 loopback only: a service listening just on ::1 shows as refused; never\n\
+                          another host, URL or proxy). protocol tcp (default): ready when a\n\
+                          connection to guest_port is accepted. protocol http: ready when GET path (default \"/\",\n\
+                          a path starting with /, not a URL) answers with expected_status (default 200); redirects\n\
+                          are not followed and no headers or credentials are sent.\n\
+                          Do not put credentials in path or its query: they are echoed in the result and visible in\n\
+                          the VM's process list.\n\
+                          path and expected_status are http only and refused with tcp. timeout_seconds is 1 to\n\
+                          120 (default 30) and bounds the waiting, not the wall clock: a call can run about 5 s past\n\
+                          it while a last probe finishes, and a client with a shorter request timeout should use a\n\
+                          shorter one and call again. The\n\
+                          result is structured: state (ready, timed_out, job_failed, cancelled, error), the last\n\
+                          observation (tcp: accepted|refused|timed_out|failed|unsupported; http_outcome:\n\
+                          status_matched|redirect|status_mismatched|no_response|malformed; http_status, the\n\
+                          number only), attempts, waited_ms, and the job. Never a response body, header or guest\n\
+                          error text. Anything but ready is an error, and timed_out keeps the last observation.\n\
+                          job_id (from run_command) ends the wait early only when that job is proven to have\n\
+                          failed: a nonzero exit, stopped or cancelled, or never started; a job that exited 0 (a\n\
+                          server may outlive its wrapper), is queued, running, ended without a code, missing or\n\
+                          unreadable does not. Readiness describes the endpoint, not a process: a TCP connection\n\
+                          proves only that something accepted it, an HTTP match only that the status criterion\n\
+                          matched, and neither proves job_id or any program is the one serving; there is no endpoint\n\
+                          ownership check, so anything listening on that port satisfies it.\n\
+                          Waiting never stops, restarts or signals the service or the job, and cancelling it only\n\
+                          stops probing. It makes short-lived connections to the port (and one GET), so do not point\n\
+                          it at a one-shot listener.",
+        output_schema = readiness::output_schema(),
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn wait_for_service(
+        &self,
+        Parameters(a): Parameters<WaitServiceArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        wait_for_service(a, ctx.ct.cancelled()).await
     }
 
     #[tool(
@@ -1717,8 +1942,17 @@ async fn ssh_raw(inst: &Instance, remote: &str, timeout: u64) -> Result<Raw> {
 }
 
 /// Run a user's foreground command, tracked (see `execution`): recorded in the VM before it
-/// starts, stopped there at its timeout, and judged without guessing from text.
-async fn run_tracked(name: &str, command: &str, timeout: u64) -> Reply {
+/// starts, stopped there at its timeout or when its request is cancelled (`requested`, the
+/// request's cancellation token, or this future being dropped), and judged without guessing
+/// from text. The run itself is a task `supervisors` owns, so its stop and its reply are
+/// finished even when nobody waits for them any more.
+async fn run_tracked(
+    supervisors: &execution::Supervisors,
+    name: &str,
+    command: &str,
+    timeout: u64,
+    requested: impl std::future::Future<Output = ()>,
+) -> Reply {
     let inst = match load(name) {
         Ok(inst) => inst,
         Err(e) => return Reply::not_started(format!("{e:#}"), None),
@@ -1740,28 +1974,74 @@ async fn run_tracked(name: &str, command: &str, timeout: u64) -> Reply {
         Os::Ubuntu | Os::Arch => execution::linux_foreground(id, command, ops::LINUX_SESSION_ENV),
         Os::Windows => execution::windows_foreground(id, command),
     };
-    let mut cmd = tokio::process::Command::new("ssh");
-    cmd.args(ops::ssh_args(&inst, &remote));
-    let limits = execution::Limits::DEFAULT;
-    let facts = execution::run_foreground(
-        cmd,
-        id,
-        Duration::from_secs(timeout),
-        limits,
-        || cancel_execution(&inst, id, limits.cancel),
-        || probe_execution(&inst, id, limits.probe),
-    )
-    .await;
-    match facts {
-        Ok(f) => execution::conclude(f, id, name, timeout),
-        Err(e) => Reply::spawn_failed(id, format!("run ssh: {e}")),
+    // The VM this run starts in: a stop or check for it never reaches a reset or restored
+    // VM, whose records (and ids) are another generation's.
+    let generation = jobs::vm_generation(&inst.dir, inst.slot);
+    let owned_name = name.to_string();
+    let s = supervisors
+        .supervise(Mode::Foreground, requested, move |signal| async move {
+            let name = owned_name;
+            let mut cmd = tokio::process::Command::new("ssh");
+            cmd.args(ops::ssh_args(&inst, &remote));
+            let limits = execution::Limits::DEFAULT;
+            let facts = execution::run_supervised(
+                cmd,
+                id,
+                Duration::from_secs(timeout),
+                limits,
+                &signal,
+                |cause| cancel_execution(&inst, id, cause, &generation, limits.cancel),
+                || probe_execution(&inst, id, &generation, limits.probe),
+            )
+            .await;
+            let reply = match facts {
+                Ok(f) => execution::conclude(f, id, &name, timeout),
+                Err(e) => Reply::spawn_failed(id, format!("run ssh: {e}")),
+            };
+            // A cancelled request's reply usually goes nowhere (rmcp drops it): say what
+            // became of the command here too. Its state and id only; no command or output.
+            if reply.outcome.request_cancelled {
+                crate::log!(
+                    "run_command on {name} cancelled: execution {id} is {:?} (termination \
+                     confirmed: {:?})",
+                    reply.outcome.state,
+                    reply.outcome.termination_confirmed
+                );
+            }
+            reply
+        })
+        .await;
+    settle(s, id, name, false)
+}
+
+/// The reply for a supervised run: its own, or why it never started or was lost.
+fn settle(s: execution::Supervision<Reply>, id: u64, name: &str, background: bool) -> Reply {
+    match s {
+        execution::Supervision::Done(r) => r,
+        execution::Supervision::Lost(why) => Reply::supervision_lost(id, name, &why, background),
+        refused => Reply::refused(&refused, background).expect("a refusal"),
     }
 }
 
-/// Stop a timed-out foreground execution with `stop_job`'s script in cancel mode; its exit
-/// code (not its text) says what it found.
-async fn cancel_execution(inst: &Instance, id: u64, deadline: Duration) -> Cancel {
-    let script = stop_job_script(inst.os, id, true);
+/// Stop a foreground execution in the guest, at its timeout or when its request was
+/// cancelled, with `stop_job`'s script in cancel mode (recording `cause` as the reason); its
+/// exit code (not its text) says what it found. Nothing is sent to a VM that is no longer the
+/// `generation` the execution started in.
+async fn cancel_execution(
+    inst: &Instance,
+    id: u64,
+    cause: execution::StopCause,
+    generation: &str,
+    deadline: Duration,
+) -> Cancel {
+    if jobs::vm_generation(&inst.dir, inst.slot) != generation {
+        return Cancel::Unconfirmed(
+            "the VM was reset, restored or replaced since the command started, so agentpc \
+             left it alone"
+                .into(),
+        );
+    }
+    let script = cancel_script(inst.os, id, cause);
     let remote = match inst.os {
         Os::Ubuntu | Os::Arch => script,
         Os::Windows => ops::windows_command(&script),
@@ -1780,7 +2060,12 @@ async fn cancel_execution(inst: &Instance, id: u64, deadline: Duration) -> Cance
 
 /// After a failed connection: what the VM's records say (and make sure an execution that
 /// never recorded itself never starts).
-async fn probe_execution(inst: &Instance, id: u64, deadline: Duration) -> Probe {
+async fn probe_execution(inst: &Instance, id: u64, generation: &str, deadline: Duration) -> Probe {
+    if jobs::vm_generation(&inst.dir, inst.slot) != generation {
+        return Probe::Failed(
+            "the VM was reset, restored or replaced since the command started".into(),
+        );
+    }
     let remote = match inst.os {
         Os::Ubuntu | Os::Arch => execution::linux_probe(id),
         Os::Windows => ops::windows_command(&execution::windows_probe(id)),
@@ -1801,7 +2086,7 @@ async fn probe_execution(inst: &Instance, id: u64, deadline: Duration) -> Probe 
 /// Start `command` detached from the SSH session, which would otherwise take it down when it
 /// ends. On Windows that means a scheduled task in the logged-in session (so GUI apps show).
 /// The command travels base64-encoded, so no quoting can break it.
-async fn exec_background(name: &str, command: &str) -> Reply {
+async fn exec_background(name: &str, command: &str, id: u64) -> Reply {
     use base64::Engine;
     let refused = |text: String, recovery| {
         let mut r = Reply::not_started(text, recovery);
@@ -1818,7 +2103,6 @@ async fn exec_background(name: &str, command: &str) -> Reply {
             Some(RecoveryAction::StartVm),
         );
     }
-    let id = job_id();
     // On Windows, as in the foreground: a failed last command (a cmdlet error sets no exit
     // code) ends the job with its native code, or 1, rather than a 0 that looks like success.
     // The job first records its PowerShell's pid and creation time, so stop_job can still
@@ -1886,6 +2170,126 @@ $log"#
     execution::background_started(id, text, log)
 }
 
+/// Wait for a TCP or HTTP endpoint on a VM's own 127.0.0.1 (see `readiness`). The arguments
+/// are checked first (a bad one needs no VM); then a read-only probe script runs over SSH again
+/// and again until the criterion holds, the deadline passes, the optional job is proven failed,
+/// or `cancelled` (the request's cancellation) completes. Cancelling, or dropping this future,
+/// drops the probe in flight with the SSH call it owns. Nothing here stops or signals the
+/// service or the job, retries a payload or leaves a forward behind.
+async fn wait_for_service(
+    a: WaitServiceArgs,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> CallToolResult {
+    let req = match readiness::Request::new(
+        &a.name,
+        a.guest_port,
+        a.protocol.as_deref(),
+        a.timeout_seconds,
+        a.path.as_deref(),
+        a.expected_status,
+        a.job_id,
+    ) {
+        Ok(r) => r,
+        Err(e) => return e.into_result(),
+    };
+    let inst = match load(&a.name) {
+        Ok(inst) => inst,
+        Err(e) => {
+            return req
+                .failure(readiness::ErrorCode::NoSuchVm, format!("{e:#}"))
+                .into_result();
+        }
+    };
+    if !inst.running() {
+        return req
+            .failure(
+                readiness::ErrorCode::VmNotRunning,
+                format!("VM {} is not running; start_vm first", a.name),
+            )
+            .into_result();
+    }
+    let generation = jobs::vm_generation(&inst.dir, inst.slot);
+    let (inst, name, generation) = (&inst, &req.name, &generation);
+    readiness::wait(
+        &req,
+        readiness::Pacing::DEFAULT,
+        |q, budget| {
+            let q = q.clone();
+            async move {
+                let job = q
+                    .job_id
+                    .map(|id| guest_job_now(inst, name, id, generation, budget));
+                readiness::attempt(guest_probe(inst, &q, budget), job).await
+            }
+        },
+        cancelled,
+    )
+    .await
+    .into_result()
+}
+
+/// One readiness probe: the generated script over SSH, within the budget plus the transport
+/// allowance. The reply is parsed against a fixed vocabulary; the guest's stderr, and anything
+/// it printed outside that vocabulary, is dropped, so the failures here are fixed phrases.
+async fn guest_probe(
+    inst: &Instance,
+    q: &readiness::Query,
+    budget: Duration,
+) -> Result<readiness::GuestProbe, readiness::ProbeFailure> {
+    use readiness::ProbeFailure;
+    let script = match inst.os {
+        Os::Ubuntu | Os::Arch => readiness::linux_probe_script(q, budget),
+        Os::Windows => ops::windows_command(&readiness::windows_probe_script(q, budget)),
+    };
+    let secs = (budget + readiness::Pacing::DEFAULT.transport)
+        .as_secs_f64()
+        .ceil() as u64;
+    let raw = ssh_raw(inst, &script, secs)
+        .await
+        .map_err(|_| ProbeFailure::unreachable("ssh could not be run"))?;
+    if raw.timed_out {
+        return Err(ProbeFailure::unreachable(&format!(
+            "no answer within {secs} s"
+        )));
+    }
+    match raw.code {
+        Some(0) => {}
+        Some(255) | None => return Err(ProbeFailure::unreachable("ssh could not reach the VM")),
+        Some(c) => {
+            return Err(ProbeFailure::bad_reply(&format!(
+                "the probe script exited {c}"
+            )));
+        }
+    }
+    let bytes = raw
+        .stdout
+        .whole()
+        .ok_or_else(|| ProbeFailure::bad_reply("the probe's reply was larger than expected"))?;
+    readiness::parse_probe(&bytes, q.protocol).map_err(|e| ProbeFailure::bad_reply(&e))
+}
+
+/// The optional job's state for a wait: the read-only get_job_status path, once, asking for no
+/// log bytes, within the same time as the probe it runs beside so neither holds the other up.
+/// A failed read is a status with `error`, never a guess.
+async fn guest_job_now(
+    inst: &Instance,
+    name: &str,
+    id: u64,
+    generation: &str,
+    budget: Duration,
+) -> jobs::JobStatus {
+    let mut req = jobs::Request::new(name, id, 0, Duration::ZERO, None, generation.to_string());
+    req.cap = 0;
+    let pacing = jobs::Pacing {
+        ceiling: budget + readiness::Pacing::DEFAULT.transport,
+        ..jobs::Pacing::DEFAULT
+    };
+    jobs::observe(&req, pacing, |q, timeout| {
+        guest_status(inst, id, q.clone(), timeout)
+    })
+    .await
+}
+
 /// Report a job's state and log (see `jobs`): the guest's read-only status script is run over
 /// SSH, once or repeatedly within `wait_seconds`, and its machine-readable report is turned
 /// into the structured result and the readable text. A foreground execution's id (an <id>.fg
@@ -1923,6 +2327,93 @@ async fn job_status(a: JobArgs) -> CallToolResult {
     })
     .await
     .into_result()
+}
+
+/// List a VM's jobs (see `jobs`): the arguments are checked first (a bad limit or cursor needs no
+/// VM), then one read-only guest script lists a page over SSH. `cancelled` (the request's
+/// cancellation) abandons only that query. Nothing here reaches the probe that tombstones an
+/// unstarted execution, the cancellation, or the stop script.
+async fn list_jobs(
+    a: ListJobsArgs,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> CallToolResult {
+    let mut req = match jobs::ListRequest::new(&a.name, a.limit, a.cursor.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return e.into_list_result(),
+    };
+    let inst = match load(&a.name) {
+        Ok(inst) => inst,
+        Err(e) => {
+            return jobs::JobList::failure(jobs::ListErrorCode::NoSuchVm, format!("{e:#}"))
+                .into_list_result();
+        }
+    };
+    if let Err(e) = req.bind_generation(&jobs::vm_generation(&inst.dir, inst.slot)) {
+        return e.into_list_result();
+    }
+    if !inst.running() {
+        return jobs::JobList::failure(
+            jobs::ListErrorCode::VmNotRunning,
+            format!("VM {} is not running; start_vm first", a.name),
+        )
+        .into_list_result();
+    }
+    let inst = &inst;
+    jobs::list_observe(
+        &req,
+        |q, timeout| guest_list(inst, q.clone(), timeout),
+        cancelled,
+    )
+    .await
+    .into_list_result()
+}
+
+/// One listing: the read-only script over SSH, within `timeout`.
+async fn guest_list(
+    inst: &Instance,
+    query: jobs::ListQuery,
+    timeout: Duration,
+) -> Result<jobs::GuestList, jobs::Failure> {
+    let script = match inst.os {
+        Os::Ubuntu | Os::Arch => jobs::linux_list_script(&query),
+        Os::Windows => ops::windows_command(&jobs::windows_list_script(&query)),
+    };
+    let secs = timeout.as_secs_f64().ceil().max(1.0) as u64;
+    let raw = ssh_raw(inst, &script, secs)
+        .await
+        .map_err(|e| jobs::Failure::unreachable(&format!("{e:#}")))?;
+    let why = |what: &str| {
+        let stderr = raw.stderr.text();
+        let stderr = stderr.lines().next().unwrap_or("").trim();
+        if stderr.is_empty() {
+            what.to_string()
+        } else {
+            format!("{what}: {}", execution::clip(stderr, 200))
+        }
+    };
+    if raw.timed_out {
+        return Err(jobs::Failure::timeout(&format!(
+            "no answer within {secs} s"
+        )));
+    }
+    match raw.code {
+        Some(0) => {}
+        Some(255) | None => {
+            return Err(jobs::Failure::unreachable(&why(
+                "ssh could not reach the VM",
+            )));
+        }
+        Some(c) => {
+            return Err(jobs::Failure::bad_reply(&why(&format!(
+                "the listing script exited {c}"
+            ))));
+        }
+    }
+    let bytes = raw
+        .stdout
+        .whole()
+        .ok_or_else(|| jobs::Failure::bad_reply("the listing was larger than expected"))?;
+    jobs::parse_list_report(&bytes, &query).map_err(|e| jobs::Failure::bad_reply(&e))
 }
 
 /// One status check: the read-only script over SSH, within `timeout`.
@@ -1997,6 +2488,14 @@ fn stop_job_script(os: Os, id: u64, cancel: bool) -> String {
     match os {
         Os::Ubuntu | Os::Arch => execution::linux_stop_script(id, cancel),
         Os::Windows => execution::windows_stop_script(id, cancel),
+    }
+}
+
+/// The stop script in cancel mode for a foreground execution, recording `cause`.
+fn cancel_script(os: Os, id: u64, cause: execution::StopCause) -> String {
+    match os {
+        Os::Ubuntu | Os::Arch => execution::linux_stop_for(id, Some(cause)),
+        Os::Windows => execution::windows_stop_for(id, Some(cause)),
     }
 }
 
@@ -2313,10 +2812,15 @@ mod tests {
             "{:?}",
             run.description
         );
-        for t in tools
-            .iter()
-            .filter(|t| !["run_command", "get_job_status"].contains(&&*t.name))
-        {
+        for t in tools.iter().filter(|t| {
+            ![
+                "run_command",
+                "get_job_status",
+                "list_jobs",
+                "wait_for_service",
+            ]
+            .contains(&&*t.name)
+        }) {
             assert!(t.output_schema.is_none(), "{}", t.name);
         }
         // The job tools accept a foreground execution's job_id too.
@@ -2325,6 +2829,84 @@ mod tests {
             assert!(
                 t.description.as_deref().unwrap().contains("job_id"),
                 "{name}"
+            );
+        }
+    }
+
+    /// The text an agent reads first (server instructions and the tool descriptions) states the
+    /// recovery and readiness contract, including its limits.
+    #[test]
+    fn instructions_and_descriptions_state_the_recovery_and_readiness_contract() {
+        let tools = super::Gateway::tool_router().list_all();
+        let desc = |n: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == n)
+                .unwrap()
+                .description
+                .as_deref()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        // Whitespace-normalized, so a phrase is found wherever the text wraps.
+        let ins = super::INSTRUCTIONS
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ins = ins.as_str();
+        for term in [
+            "list_jobs",
+            "wait_for_service",
+            "request_cancelled",
+            "cursor_stale",
+            "job_failed",
+            "notifications/cancelled",
+            "detached",
+            "metadata",
+            "127.0.0.1",
+            "does not prove",
+            "one-shot",
+        ] {
+            assert!(ins.contains(term), "INSTRUCTIONS lack {term}");
+        }
+        // Cancellation: a foreground run is stopped, a background start is not, and where the
+        // outcome can still be read.
+        let run = desc("run_command");
+        for term in [
+            "cancelled",
+            "request_cancelled",
+            "background",
+            "list_jobs",
+            "termination_confirmed",
+        ] {
+            assert!(run.contains(term), "run_command description lacks {term}");
+        }
+        // A stale cursor is described by what changed, not as proof the records are gone.
+        let list = desc("list_jobs");
+        assert!(
+            list.contains("cursor_stale") && list.contains("generation"),
+            "{list}"
+        );
+        for text in [ins, list.as_str()] {
+            assert!(
+                !text.contains("jobs are gone"),
+                "claims restored jobs are gone"
+            );
+        }
+        // Readiness limits are stated where an agent reads them.
+        let wait = desc("wait_for_service");
+        for term in [
+            "IPv4",
+            "ownership",
+            "one-shot",
+            "never stops",
+            "about 5 s past",
+        ] {
+            assert!(
+                wait.contains(term),
+                "wait_for_service description lacks {term}"
             );
         }
     }
@@ -2495,6 +3077,518 @@ mod tests {
         assert_eq!(r.structured_content.unwrap()["error_code"], "no_such_vm");
     }
 
+    /// tools/list: list_jobs is read-only, declares its typed result (success and error alike,
+    /// one schema), and bounds `limit` in its input schema.
+    #[test]
+    fn list_jobs_declares_read_only_and_its_schemas() {
+        let tools = super::Gateway::tool_router().list_all();
+        let t = tools.iter().find(|t| t.name == "list_jobs").unwrap();
+        let ann = t.annotations.as_ref().unwrap();
+        assert_eq!(ann.read_only_hint, Some(true));
+        assert_eq!(ann.destructive_hint, Some(false));
+        assert_eq!(ann.open_world_hint, Some(false));
+        let out = t.output_schema.as_ref().expect("an output schema");
+        assert_eq!(out["type"], "object");
+        for f in [
+            "jobs",
+            "has_more",
+            "next_cursor",
+            "listed_at",
+            "scan_truncated",
+            "note",
+            "error",
+            "error_code",
+        ] {
+            assert!(out["properties"].get(f).is_some(), "{f}");
+        }
+        let input = &t.input_schema;
+        for f in ["name", "limit", "cursor"] {
+            assert!(input["properties"].get(f).is_some(), "{f}");
+        }
+        assert_eq!(
+            super::required(input),
+            ["name"],
+            "limit and cursor are optional"
+        );
+        let l = &input["properties"]["limit"];
+        assert_eq!(l["minimum"], 1, "{l}");
+        assert_eq!(l["maximum"], crate::jobs::LIST_MAX_LIMIT, "{l}");
+        assert_eq!(l["default"], crate::jobs::LIST_DEFAULT_LIMIT, "{l}");
+        let d = t.description.as_deref().unwrap();
+        for word in [
+            "newest",
+            "next_cursor",
+            "Read-only",
+            "cursor_stale",
+            "best effort",
+        ] {
+            assert!(d.contains(word), "{word} in {d}");
+        }
+        // No tool but the four structured ones declares an output schema.
+        let with: Vec<&str> = tools
+            .iter()
+            .filter(|t| t.output_schema.is_some())
+            .map(|t| &*t.name)
+            .collect();
+        assert_eq!(
+            with,
+            [
+                "get_job_status",
+                "list_jobs",
+                "run_command",
+                "wait_for_service"
+            ],
+            "{with:?}"
+        );
+    }
+
+    #[test]
+    fn list_jobs_args_keep_a_small_shape() {
+        let a: super::ListJobsArgs = serde_json::from_str(r#"{"name":"vm"}"#).unwrap();
+        assert!(a.limit.is_none() && a.cursor.is_none());
+        let a: super::ListJobsArgs =
+            serde_json::from_str(r#"{"name":"vm","limit":100,"cursor":"abc"}"#).unwrap();
+        assert_eq!((a.limit, a.cursor.as_deref()), (Some(100), Some("abc")));
+        // Negative or fractional limits are not integers: the protocol refuses them.
+        for bad in [
+            r#"{"name":"vm","limit":-1}"#,
+            r#"{"name":"vm","limit":1.5}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<super::ListJobsArgs>(bad).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// list_jobs's path (the handler, `list_jobs` and `guest_list`) is a read: it never calls
+    /// the probe that tombstones an unstarted execution, the cancellation, or the stop script,
+    /// and never the status path that reads a log.
+    #[test]
+    fn list_jobs_never_reaches_the_mutating_probe_or_cancel_or_a_log_read() {
+        let src = include_str!("mcp.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        let start = prod
+            .find("\nasync fn list_jobs(\n    a: ListJobsArgs")
+            .unwrap();
+        let end = start + prod[start..].find("/// One status check").unwrap();
+        let path = &prod[start..end];
+        assert!(path.contains("guest_list") && path.contains("list_observe"));
+        for name in [
+            "probe_execution",
+            "cancel_execution",
+            "stop_job",
+            "run_tracked",
+            "linux_probe",
+            "windows_probe",
+            "stop_job_script",
+            "guest_status",
+            "linux_script(",
+            "windows_script(",
+            ".cancel",
+            "upload_file",
+            "exec(",
+        ] {
+            assert!(!path.contains(name), "{name} in list_jobs's path");
+        }
+        // The request's cancellation reaches the query (and only the query).
+        let start = prod.find("async fn list_jobs(\n        &self,").unwrap();
+        let handler = &prod[start..start + 400];
+        assert!(
+            handler.contains("ctx: RequestContext<RoleServer>"),
+            "{handler}"
+        );
+        assert!(handler.contains("ctx.ct.cancelled()"), "{handler}");
+    }
+
+    /// The tool through its handler, with no VM: a bad limit or cursor is a structured error
+    /// that needs neither the VM nor SSH (it is refused before either), and a good request
+    /// for a VM that does not exist gets its own error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_jobs_refuses_bad_arguments_before_any_vm_work() {
+        let call = |limit: Option<u64>, cursor: Option<&str>| {
+            super::list_jobs(
+                super::ListJobsArgs {
+                    name: "no-such-vm-for-jobs-test".into(),
+                    limit,
+                    cursor: cursor.map(str::to_string),
+                },
+                std::future::pending(),
+            )
+        };
+        let code = |r: CallToolResult| {
+            assert_eq!(r.is_error, Some(true));
+            let v = r.structured_content.unwrap();
+            assert_eq!(v["jobs"], serde_json::json!([]));
+            v["error_code"].as_str().unwrap().to_string()
+        };
+        assert_eq!(code(call(Some(0), None).await), "invalid_limit");
+        assert_eq!(code(call(Some(101), None).await), "invalid_limit");
+        assert_eq!(code(call(Some(5), Some("garbage")).await), "invalid_cursor");
+        assert_eq!(code(call(None, Some("start")).await), "invalid_cursor");
+        let other = crate::jobs::ListCursor {
+            vm: "another-vm".into(),
+            generation: "g".into(),
+            high_water: 9,
+            last: 5,
+        }
+        .encode();
+        let r = call(None, Some(&other)).await;
+        assert!(r.content[0].as_text().unwrap().text.contains("another-vm"));
+        assert_eq!(code(r), "invalid_cursor");
+        // Valid arguments for a VM that does not exist: its own error, and still structured.
+        let mine = crate::jobs::ListCursor {
+            vm: "no-such-vm-for-jobs-test".into(),
+            generation: "g".into(),
+            high_water: 9,
+            last: 5,
+        }
+        .encode();
+        assert_eq!(code(call(None, None).await), "no_such_vm");
+        assert_eq!(code(call(Some(100), Some(&mine)).await), "no_such_vm");
+    }
+
+    /// Over the real protocol (an in-memory pipe to the gateway): tools/list carries
+    /// list_jobs's annotations and schemas, and a bad call comes back as a tool error with
+    /// structured content, a readable text block and no JSON mirror.
+    #[tokio::test]
+    async fn list_jobs_over_the_protocol() {
+        let (server_io, client_io) = tokio::io::duplex(1 << 18);
+        tokio::spawn(async move {
+            if let Ok(running) = super::Gateway::new().serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = ().serve(client_io).await.unwrap();
+        let tools = client.list_all_tools().await.unwrap();
+        let t = tools.iter().find(|t| t.name == "list_jobs").unwrap();
+        assert_eq!(t.annotations.as_ref().unwrap().read_only_hint, Some(true));
+        assert!(t.output_schema.is_some());
+        assert_eq!(t.input_schema["properties"]["limit"]["maximum"], 100);
+        let call = |args: serde_json::Value| {
+            client.call_tool(
+                CallToolRequestParams::new("list_jobs")
+                    .with_arguments(args.as_object().unwrap().clone()),
+            )
+        };
+        let r = call(serde_json::json!({"name": "x", "limit": 0}))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(r.content.len(), 1);
+        let said = texts(&r);
+        assert!(
+            said.contains("between 1 and 100") && !said.starts_with('{'),
+            "{said}"
+        );
+        assert_eq!(r.structured_content.unwrap()["error_code"], "invalid_limit");
+        let r = call(serde_json::json!({"name": "x", "cursor": "nonsense"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.structured_content.unwrap()["error_code"],
+            "invalid_cursor"
+        );
+        let r = call(serde_json::json!({"name": "no-such-vm-for-jobs-test"}))
+            .await
+            .unwrap();
+        let v = r.structured_content.unwrap();
+        assert_eq!(
+            (v["error_code"].as_str(), v["jobs"].as_array().map(Vec::len)),
+            (Some("no_such_vm"), Some(0))
+        );
+        client.cancel().await.ok();
+    }
+
+    /// tools/list: wait_for_service declares its typed result, its argument bounds and, in its
+    /// description, what a ready result does and does not prove.
+    #[test]
+    fn wait_for_service_declares_its_annotations_and_schemas() {
+        let tools = super::Gateway::tool_router().list_all();
+        let t = tools.iter().find(|t| t.name == "wait_for_service").unwrap();
+        let a = t.annotations.as_ref().unwrap();
+        assert_eq!(
+            (
+                a.read_only_hint,
+                a.destructive_hint,
+                a.idempotent_hint,
+                a.open_world_hint
+            ),
+            (Some(true), Some(false), Some(true), Some(false))
+        );
+        let out = serde_json::Value::Object((**t.output_schema.as_ref().unwrap()).clone());
+        for f in [
+            "state",
+            "tcp",
+            "http_outcome",
+            "http_status",
+            "attempts",
+            "waited_ms",
+            "timed_out",
+            "cancelled",
+            "job",
+            "error",
+            "error_code",
+            "criterion_met",
+        ] {
+            assert!(out["properties"].get(f).is_some(), "{f}");
+        }
+        let input = serde_json::Value::Object((*t.input_schema).clone());
+        let p = &input["properties"];
+        assert_eq!(
+            (
+                p["guest_port"]["minimum"].as_i64(),
+                p["guest_port"]["maximum"].as_i64()
+            ),
+            (Some(1), Some(65535))
+        );
+        assert_eq!(
+            (
+                p["timeout_seconds"]["minimum"].as_i64(),
+                p["timeout_seconds"]["maximum"].as_i64()
+            ),
+            (Some(1), Some(120))
+        );
+        assert_eq!(p["timeout_seconds"]["default"], 30);
+        assert_eq!(p["protocol"]["enum"], serde_json::json!(["tcp", "http"]));
+        // path and expected_status are HTTP-only: advertising defaults would have a client that
+        // fills schema defaults send them with protocol tcp, which is refused.
+        assert!(p["expected_status"].get("default").is_none(), "{p}");
+        assert!(p["path"].get("default").is_none(), "{p}");
+        for f in ["path", "expected_status"] {
+            let d = p[f]["description"].as_str().unwrap();
+            assert!(d.contains("http only"), "{f}: {d}");
+        }
+        let mut required: Vec<&str> = input["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        required.sort();
+        assert_eq!(required, ["guest_port", "name"]);
+        let d = t.description.as_deref().unwrap();
+        for word in [
+            "127.0.0.1",
+            "redirects",
+            "never stops",
+            "proves only",
+            "not a process",
+            "job_id",
+            "timed_out keeps",
+            "Do not put credentials in path or its query",
+        ] {
+            assert!(d.contains(word), "{word} in {d}");
+        }
+    }
+
+    /// wait_for_service's path (the handler, `wait_for_service`, `guest_probe` and
+    /// `guest_job_now`) only probes and reads: no stop or signal, no tombstone or cancel
+    /// record, no payload run, no upload, no forward.
+    #[test]
+    fn wait_for_service_never_reaches_a_mutating_path() {
+        let src = include_str!("mcp.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        let start = prod
+            .find("\nasync fn wait_for_service(\n    a: WaitServiceArgs")
+            .unwrap();
+        let end = start + prod[start..].find("/// Stop a background job").unwrap();
+        let path = &prod[start..end];
+        assert!(path.contains("guest_probe") && path.contains("guest_job_now"));
+        for name in [
+            "probe_execution",
+            "cancel_execution",
+            "stop_job",
+            "run_tracked",
+            "linux_probe(",
+            "windows_probe(",
+            "stop_job_script",
+            ".cancel",
+            "upload_file",
+            "forward",
+            "exec(",
+            "kill",
+            "curl",
+            "proxy",
+        ] {
+            assert!(!path.contains(name), "{name} in wait_for_service's path");
+        }
+        let start = prod
+            .find("async fn wait_for_service(\n        &self,")
+            .unwrap();
+        let handler = &prod[start..start + 400];
+        assert!(handler.contains("ctx.ct.cancelled()"), "{handler}");
+    }
+
+    #[test]
+    fn wait_for_service_args_keep_a_small_shape() {
+        let a: super::WaitServiceArgs =
+            serde_json::from_str(r#"{"name":"vm","guest_port":8080}"#).unwrap();
+        assert_eq!(a.guest_port, 8080);
+        assert!(a.protocol.is_none() && a.timeout_seconds.is_none() && a.path.is_none());
+        assert!(a.expected_status.is_none() && a.job_id.is_none());
+        let a: super::WaitServiceArgs = serde_json::from_str(
+            r#"{"name":"vm","guest_port":80,"protocol":"http","timeout_seconds":5,"path":"/h","expected_status":204,"job_id":7}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (a.timeout_seconds, a.expected_status, a.job_id),
+            (Some(5), Some(204), Some(7))
+        );
+        // Out-of-range numbers still parse: they come back as typed errors, not protocol errors.
+        let a: super::WaitServiceArgs =
+            serde_json::from_str(r#"{"name":"vm","guest_port":70000,"timeout_seconds":-1}"#)
+                .unwrap();
+        assert_eq!((a.guest_port, a.timeout_seconds), (70000, Some(-1)));
+        // No host, URL, header or credential arguments exist.
+        let schema = serde_json::to_value(schemars::schema_for!(super::WaitServiceArgs)).unwrap();
+        let mut names: Vec<&str> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "expected_status",
+                "guest_port",
+                "job_id",
+                "name",
+                "path",
+                "protocol",
+                "timeout_seconds"
+            ]
+        );
+    }
+
+    /// The tool through its handler, with no VM: bad arguments are structured errors refused
+    /// before any VM or SSH work, and a good request for a VM that does not exist gets its own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_service_refuses_bad_arguments_before_any_vm_work() {
+        let call = |port: i64,
+                    protocol: Option<&str>,
+                    timeout: Option<i64>,
+                    path: Option<&str>,
+                    status: Option<i64>| {
+            super::wait_for_service(
+                super::WaitServiceArgs {
+                    name: "no-such-vm-for-readiness-test".into(),
+                    guest_port: port,
+                    protocol: protocol.map(str::to_string),
+                    timeout_seconds: timeout,
+                    path: path.map(str::to_string),
+                    expected_status: status,
+                    job_id: None,
+                },
+                std::future::pending(),
+            )
+        };
+        let code = |r: CallToolResult| {
+            assert_eq!(r.is_error, Some(true));
+            let v = r.structured_content.unwrap();
+            assert_eq!(v["state"], "error");
+            assert_eq!(v["attempts"], 0);
+            v["error_code"].as_str().unwrap().to_string()
+        };
+        assert_eq!(code(call(0, None, None, None, None).await), "invalid_port");
+        assert_eq!(
+            code(call(65536, None, None, None, None).await),
+            "invalid_port"
+        );
+        assert_eq!(
+            code(call(80, Some("udp"), None, None, None).await),
+            "invalid_protocol"
+        );
+        assert_eq!(
+            code(call(80, None, Some(0), None, None).await),
+            "invalid_timeout"
+        );
+        assert_eq!(
+            code(call(80, None, Some(121), None, None).await),
+            "invalid_timeout"
+        );
+        assert_eq!(
+            code(call(80, Some("http"), None, Some("//x"), None).await),
+            "invalid_path"
+        );
+        assert_eq!(
+            code(call(80, Some("http"), None, None, Some(99)).await),
+            "invalid_status"
+        );
+        assert_eq!(
+            code(call(80, None, None, Some("/x"), None).await),
+            "invalid_argument"
+        );
+        assert_eq!(code(call(80, None, None, None, None).await), "no_such_vm");
+        assert_eq!(
+            code(call(80, Some("http"), Some(120), Some("/h"), Some(204)).await),
+            "no_such_vm"
+        );
+    }
+
+    /// A client that fills in every default the input schema advertises must still get an
+    /// ordinary tcp call accepted (here: past argument checks, to the VM lookup).
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_service_schema_defaults_make_a_valid_tcp_call() {
+        let tools = super::Gateway::tool_router().list_all();
+        let t = tools.iter().find(|t| t.name == "wait_for_service").unwrap();
+        let input = serde_json::Value::Object((*t.input_schema).clone());
+        let mut args =
+            serde_json::json!({"name": "no-such-vm-for-readiness-test", "guest_port": 80});
+        for (k, v) in input["properties"].as_object().unwrap() {
+            if let Some(d) = v.get("default") {
+                args[k] = d.clone();
+            }
+        }
+        let a: super::WaitServiceArgs = serde_json::from_value(args).unwrap();
+        let r = super::wait_for_service(a, std::future::pending()).await;
+        assert_eq!(
+            r.structured_content.unwrap()["error_code"],
+            "no_such_vm",
+            "schema defaults must not invalidate a tcp call"
+        );
+    }
+
+    /// Over the real protocol (an in-memory pipe to the gateway): a bad call comes back as a
+    /// tool error with structured content and one readable text block, no JSON mirror.
+    #[tokio::test]
+    async fn wait_for_service_over_the_protocol() {
+        let (server_io, client_io) = tokio::io::duplex(1 << 18);
+        tokio::spawn(async move {
+            if let Ok(running) = super::Gateway::new().serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = ().serve(client_io).await.unwrap();
+        let tools = client.list_all_tools().await.unwrap();
+        let t = tools.iter().find(|t| t.name == "wait_for_service").unwrap();
+        assert!(t.output_schema.is_some());
+        let call = |args: serde_json::Value| {
+            client.call_tool(
+                CallToolRequestParams::new("wait_for_service")
+                    .with_arguments(args.as_object().unwrap().clone()),
+            )
+        };
+        let r = call(serde_json::json!({"name": "x", "guest_port": 0}))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(r.content.len(), 1);
+        let said = texts(&r);
+        assert!(
+            said.contains("between 1 and 65535") && !said.starts_with('{'),
+            "{said}"
+        );
+        assert_eq!(r.structured_content.unwrap()["error_code"], "invalid_port");
+        let r = call(serde_json::json!({"name": "no-such-vm-for-readiness-test", "guest_port": 80, "protocol": "http", "path": "/a b"}))
+            .await
+            .unwrap();
+        assert_eq!(r.structured_content.unwrap()["error_code"], "no_such_vm");
+        client.cancel().await.ok();
+    }
+
     #[test]
     fn captures_short_output_whole() {
         let mut c = super::Captured::default();
@@ -2615,6 +3709,111 @@ mod tests {
         );
         assert_eq!(super::similar("clik", &names), ["click"]);
         assert!(super::similar("screenshot", &names).is_empty());
+    }
+
+    // ---- shutdown and supervised runs (no processes: plain futures stand in for runs) ------
+
+    /// Shutdown asks every supervised run to stop and waits for it, whether or not the VMs
+    /// keep running (AGENTPC_KEEP_RUNNING only spares the VMs), and takes no new ones.
+    #[tokio::test]
+    async fn shutdown_stops_supervised_runs_whether_or_not_vms_keep_running() {
+        use crate::execution::{CancelSource, Mode, Supervision};
+        use std::time::Duration;
+        for keep in [true, false] {
+            let gw = super::Gateway::new();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let sup = gw.supervisors.clone();
+            tokio::spawn(async move {
+                sup.supervise(
+                    Mode::Foreground,
+                    std::future::pending(),
+                    |signal| async move {
+                        let _ = tx.send(signal.wait().await);
+                    },
+                )
+                .await
+            });
+            while gw.supervisors.active() == 0 {
+                tokio::task::yield_now().await;
+            }
+            let started = std::time::Instant::now();
+            gw.shutdown_with(keep, Duration::from_secs(5)).await;
+            assert!(started.elapsed() < Duration::from_secs(2), "keep {keep}");
+            let who = tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .expect("the run was asked to stop");
+            assert_eq!(who.unwrap(), CancelSource::Shutdown, "keep {keep}");
+            assert_eq!(gw.supervisors.active(), 0, "keep {keep}");
+            let s = gw
+                .supervisors
+                .supervise(Mode::Foreground, std::future::pending(), |_| async {})
+                .await;
+            assert!(matches!(s, Supervision::ShuttingDown), "keep {keep}");
+        }
+        // A run that won't end holds shutdown only until its budget, not a second one.
+        let gw = super::Gateway::new();
+        let sup = gw.supervisors.clone();
+        tokio::spawn(async move {
+            sup.supervise(Mode::Foreground, std::future::pending(), |_| {
+                std::future::pending::<()>()
+            })
+            .await
+        });
+        while gw.supervisors.active() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let started = std::time::Instant::now();
+        gw.shutdown_with(true, std::time::Duration::from_millis(300))
+            .await;
+        let took = started.elapsed();
+        assert!(
+            took >= std::time::Duration::from_millis(250)
+                && took < std::time::Duration::from_secs(2),
+            "{took:?}"
+        );
+        assert_eq!(super::SHUTDOWN_BUDGET, std::time::Duration::from_secs(45));
+    }
+
+    /// Review minor 3: a serve loop that ends in an error (a JoinError) still runs the bounded
+    /// shutdown (supervised cleanup, VM stops) before the error is returned.
+    #[test]
+    fn serve_shuts_down_before_returning_a_serve_loop_error() {
+        let src = include_str!("mcp.rs");
+        let start = src.find("pub async fn serve() -> Result<()> {").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(!body.contains("waiting().await?"), "{body}");
+        let shutdown = body.find("gateway.shutdown().await").unwrap();
+        let waited = body.find("running.waiting().await").unwrap();
+        assert!(waited < shutdown, "{body}");
+        let after = &body[shutdown..];
+        assert!(
+            after.contains("?;") || after.contains(".map(|_| ())"),
+            "{body}"
+        );
+    }
+
+    /// run_command observes its request's cancellation token; a background start is launched
+    /// in `Mode::Background`, so cancelling its request never stops the job.
+    #[test]
+    fn run_command_supervises_with_its_request_token() {
+        let src = include_str!("mcp.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        let start = prod.find("async fn run_command(").unwrap();
+        let end = start + prod[start..].find("#[tool(").unwrap();
+        let handler = &prod[start..end];
+        assert!(
+            handler.contains("ctx: RequestContext<RoleServer>"),
+            "{handler}"
+        );
+        assert!(handler.contains("ctx.ct.cancelled()"), "{handler}");
+        assert!(handler.contains("Mode::Background"), "{handler}");
+        assert!(handler.contains("run_tracked("), "{handler}");
+        assert!(handler.contains("&self.supervisors,"), "{handler}");
+        let start = prod.find("async fn run_tracked(").unwrap();
+        let end = start + prod[start..].find("\n}\n").unwrap();
+        let tracked = &prod[start..end];
+        assert!(tracked.contains("Mode::Foreground, requested"), "{tracked}");
+        assert!(tracked.contains("run_supervised("), "{tracked}");
     }
 
     // ---- inspect_desktop: dispatch tests against a fake desktop driver -------------------

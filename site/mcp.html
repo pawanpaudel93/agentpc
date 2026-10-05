@@ -251,8 +251,9 @@ tool_timeout_sec = 900</code></pre>
                     <code translate="no">structuredContent</code> plus the readable exit code, stdout and
                     stderr, each stream trimmed to its first and last 10,000 characters. A foreground run that
                     reaches <code translate="no">timeout</code> (default 120 s) gets an attempt to stop it, and its partial output
-                    is kept; the reply says whether the stop was confirmed.
-                    <code translate="no">background: true</code> returns a job id.
+                    is kept; the reply says whether the stop was confirmed. A foreground run whose request is
+                    cancelled, or whose client disconnects, is stopped the same way.
+                    <code translate="no">background: true</code> returns a detached job id that cancellation does not stop.
                     <a href="#results">Results and recovery</a>.
                   </td>
                 </tr>
@@ -264,6 +265,25 @@ tool_timeout_sec = 900</code></pre>
                     <code translate="no">wait_seconds</code> (0 to 30, default 0) waits without ever stopping the job;
                     <code translate="no">cursor</code> reads the log incrementally. Also takes the
                     <code translate="no">job_id</code> of a foreground run whose outcome was uncertain.
+                  </td>
+                </tr>
+                <tr>
+                  <td><code translate="no">list_jobs</code></td>
+                  <td>
+                    Find a job again when its id was lost (a cancelled or disconnected
+                    <code translate="no">run_command</code>): the VM's job records, newest id first, as metadata only (id,
+                    kind, state, exit code, stop reason, which records exist, file times), never a command, environment,
+                    output or log. <code translate="no">limit</code> 1 to 100 (default 20); <code translate="no">next_cursor</code>
+                    continues below the last job shown. Read-only. <a href="#results">Results and recovery</a>.
+                  </td>
+                </tr>
+                <tr>
+                  <td><code translate="no">wait_for_service</code></td>
+                  <td>
+                    Wait until a TCP port accepts a connection, or an HTTP path answers its expected status, on the VM's own
+                    <code translate="no">127.0.0.1</code>. <code translate="no">timeout_seconds</code> 1 to 120 (default 30).
+                    Read-only: it never stops or restarts the service or a job.
+                    <a href="#results">Results and recovery</a>.
                   </td>
                 </tr>
                 <tr>
@@ -470,7 +490,7 @@ get_job_status  { "name": "ubuntu-1", "id": 1, "cursor": "&lt;next_cursor&gt;", 
           <section class="doc-section" id="results">
             <h2>Results and recovery</h2>
             <p>
-              <code translate="no">run_command</code> and <code translate="no">get_job_status</code> declare an
+              <code translate="no">run_command</code>, <code translate="no">get_job_status</code>, <code translate="no">list_jobs</code> and <code translate="no">wait_for_service</code> declare an
               <code translate="no">outputSchema</code> and return matching <code translate="no">structuredContent</code>
               (<code translate="no">schema_version</code> 1) next to the readable text scripts have always parsed
               (<code translate="no">exit code: N</code>, <code translate="no">STATE: …</code>). The text is a single block,
@@ -485,15 +505,15 @@ get_job_status  { "name": "ubuntu-1", "id": 1, "cursor": "&lt;next_cursor&gt;", 
               <tbody>
                 <tr>
                   <td><code translate="no">state</code></td>
-                  <td><code translate="no">exited</code> (it ran to its end), <code translate="no">timed_out</code>, <code translate="no">not_started</code> (it never ran), <code translate="no">connection_lost</code> (SSH failed while it may have been running) or <code translate="no">started</code> (a background job).</td>
+                  <td><code translate="no">exited</code> (it ran to its end), <code translate="no">timed_out</code>, <code translate="no">not_started</code> (it never ran), <code translate="no">connection_lost</code> (SSH failed while it may have been running), <code translate="no">started</code> (a background job) or <code translate="no">cancelled</code> (its request was cancelled and agentpc tried to stop it).</td>
                 </tr>
                 <tr>
                   <td><code translate="no">exit_code</code>, <code translate="no">stdout</code>, <code translate="no">stderr</code></td>
                   <td>The command's code and its separate streams, with <code translate="no">stdout_bytes</code> / <code translate="no">stderr_bytes</code> and truncation flags (<code translate="no">output_truncated</code>) saying whether part of a stream was left out. Foreground codes are the low 8 bits SSH reports: on Windows <code translate="no">exit -1</code> reads 255.</td>
                 </tr>
                 <tr>
-                  <td><code translate="no">timed_out</code>, <code translate="no">termination_confirmed</code>, <code translate="no">effect_unknown</code></td>
-                  <td>Whether the call reached its timeout; whether agentpc verified that none of the processes it identified is left (<code translate="no">null</code> when nothing needed stopping); and whether it is unknown if the command ran, finished or is still running.</td>
+                  <td><code translate="no">timed_out</code>, <code translate="no">request_cancelled</code>, <code translate="no">termination_confirmed</code>, <code translate="no">effect_unknown</code></td>
+                  <td>Whether the call reached its timeout; whether its request was cancelled, its client disconnected or its session ended before the command's end was known; whether agentpc verified that none of the processes it identified is left (<code translate="no">null</code> when nothing needed stopping); and whether it is unknown if the command ran, finished or is still running.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">execution_id</code>, <code translate="no">job_id</code>, <code translate="no">recovery_action</code></td>
@@ -503,7 +523,7 @@ get_job_status  { "name": "ubuntu-1", "id": 1, "cursor": "&lt;next_cursor&gt;", 
             </table>
             <p>
               <code translate="no">isError</code> is true for every nonzero exit, every timeout (even when the command's own
-              exit code is known to be 0), and every run that didn't start or lost its connection. It is false only for exit 0 and a
+              exit code is known to be 0), every cancelled request, and every run that didn't start or lost its connection. It is false only for exit 0 and a
               background start. Commands are never retried automatically.
             </p>
             <h3>Timeouts</h3>
@@ -514,6 +534,13 @@ get_job_status  { "name": "ubuntu-1", "id": 1, "cursor": "&lt;next_cursor&gt;", 
               <li>A command whose exit code the VM recorded but whose run had not ended by the timeout (a child it left may have held its output, or it ended right at the deadline) returns that exit code with <code translate="no">timed_out: true</code>, after cleanup verified that none of the processes agentpc identified remains. Start servers with <code translate="no">background: true</code>.</li>
               <li>A Linux foreground command is limited to 92 KiB (94,208 UTF-8 bytes) of text. agentpc checks that before sending anything: a bigger one comes back <code translate="no">not_started</code> with no <code translate="no">recovery_action</code>. For a bigger script, <code translate="no">upload_file</code> it and run the file.</li>
             </ul>
+            <h3>Cancellation</h3>
+            <ul>
+              <li>A foreground <code translate="no">run_command</code> is stopped in the VM, as at a timeout (bounded, identity-checked, never retried), when its request is cancelled (<code translate="no">notifications/cancelled</code>), the client disconnects or the MCP session ends; <code translate="no">request_cancelled</code> is then true and the call is an error.</li>
+              <li><code translate="no">cancelled</code> with <code translate="no">termination_confirmed: true</code>: stopped and verified. <code translate="no">exited</code> with its code: it had already finished. <code translate="no">not_started</code> with no <code translate="no">recovery_action</code>: it never began. <code translate="no">cancelled</code> with <code translate="no">termination_confirmed: false</code>, <code translate="no">effect_unknown: true</code> and <code translate="no">recovery_action: stop_job</code>: it may still be running; use the <code translate="no">job_id</code> and don't rerun it before you know.</li>
+              <li>A client that cancelled usually never receives that reply. Find the run with <code translate="no">list_jobs</code>; <code translate="no">get_job_status</code> then shows <code translate="no">stopped</code> with <code translate="no">stop_reason: request_cancelled</code>, or <code translate="no">not_started</code>.</li>
+              <li>A <code translate="no">background: true</code> start is detached on purpose: cancelling its request, disconnecting or ending the session does not stop the job. End it with <code translate="no">stop_job</code>. <code translate="no">AGENTPC_KEEP_RUNNING=1</code> keeps VMs, not foreground commands, and a hard kill of the MCP server cleans up nothing: the job records stay in the VM.</li>
+            </ul>
             <h3>get_job_status</h3>
             <ul>
               <li><code translate="no">state</code>: <code translate="no">queued</code>, <code translate="no">running</code>, <code translate="no">exited</code>, <code translate="no">stopped</code>, <code translate="no">ended</code>, <code translate="no">not_started</code>, <code translate="no">missing</code> or <code translate="no">unknown</code> (the VM couldn't be read: an error, never reported as <code translate="no">ended</code>). An exited job reports its own exit code even if it left a child running.</li>
@@ -522,6 +549,21 @@ get_job_status  { "name": "ubuntu-1", "id": 1, "cursor": "&lt;next_cursor&gt;", 
               <li>A cursor that no longer matches (VM reset or restored, guest reboot, log replaced, shortened, rewritten or removed) comes back with <code translate="no">cursor_reset: true</code> and a <code translate="no">cursor_reset_reason</code>, restarted at the log's beginning: discard what you assumed. Detection is best effort; it can miss a guest clock step, a Windows log recreated within the file system's tunneling window, and a log rewritten with the same first 64 bytes.</li>
               <li><code translate="no">missing</code> means nothing has recorded itself under that id yet. That doesn't prove the command never started, so don't blindly retry it.</li>
               <li>A foreground <code translate="no">job_id</code> has status only (exited with its code, stopped at its timeout, or not started); its output went to the <code translate="no">run_command</code> reply, so there is no log to replay.</li>
+            </ul>
+            <h3>list_jobs</h3>
+            <ul>
+              <li>Read-only, metadata only: per job <code translate="no">job_id</code>, <code translate="no">kind</code>, <code translate="no">state</code>, <code translate="no">exit_code</code>, <code translate="no">stop_reason</code> (<code translate="no">timeout</code>, <code translate="no">stop_job</code>, <code translate="no">request_cancelled</code>), <code translate="no">log_available</code>, <code translate="no">records</code>, <code translate="no">recorded_at</code> and <code translate="no">finished_at</code>. Never a command, environment, output, log text or path. Newest id first; <code translate="no">limit</code> is 1 to 100 (default 20).</li>
+              <li>When <code translate="no">has_more</code> is true, pass <code translate="no">next_cursor</code> as <code translate="no">cursor</code>: the next page continues below the last job shown within the VM as the first page saw it, so jobs created meanwhile don't shift it.</li>
+              <li>A cursor from before a VM reset, restore or recreation is <code translate="no">cursor_stale</code>: the VM's generation changed, so its records may differ from what the earlier pages listed (a restored checkpoint can keep some) and the listing cannot safely continue. Call again without a cursor. A malformed cursor, or one of another VM, is <code translate="no">invalid_cursor</code>.</li>
+              <li>Best effort, not an immutable history: records age out, and a huge job directory keeps only its first entries (<code translate="no">scan_truncated</code>), so jobs may be missing. A <code translate="no">queued</code>, <code translate="no">missing</code> or <code translate="no">unknown</code> entry is unresolved, not proof the command never started. Cancelling the call abandons only the listing.</li>
+            </ul>
+            <h3>wait_for_service</h3>
+            <ul>
+              <li>Looks only at the VM's own IPv4 <code translate="no">127.0.0.1</code> (never another host, a URL or a proxy). <code translate="no">protocol: "tcp"</code> (default) is ready when a connection is accepted; <code translate="no">"http"</code> is ready when one <code translate="no">GET path</code> (<code translate="no">/</code> by default; a path, not a URL) answers <code translate="no">expected_status</code> (default 200). <code translate="no">path</code> and <code translate="no">expected_status</code> are HTTP-only and refused with <code translate="no">tcp</code>. Redirects are not followed, and no body, header or guest text is returned. Don't put credentials in <code translate="no">path</code>: it is echoed back and visible in the VM's process list.</li>
+              <li><code translate="no">timeout_seconds</code> is 1 to 120 (default 30) and bounds the waiting, not the wall clock: a call can run about 5 s past it while a last probe finishes.</li>
+              <li><code translate="no">state</code> is <code translate="no">ready</code>, <code translate="no">timed_out</code>, <code translate="no">job_failed</code>, <code translate="no">cancelled</code> or <code translate="no">error</code>, with the last <code translate="no">tcp</code> or <code translate="no">http_outcome</code> (<code translate="no">status_matched</code>, <code translate="no">redirect</code>, <code translate="no">status_mismatched</code>, <code translate="no">no_response</code>, <code translate="no">malformed</code>) and <code translate="no">http_status</code>. Anything but <code translate="no">ready</code> is an error and <code translate="no">timed_out</code> keeps the last observation. <code translate="no">probe_unsupported</code> means the guest's bash has no <code translate="no">/dev/tcp</code> or it has no <code translate="no">timeout</code> command.</li>
+              <li>With <code translate="no">job_id</code> the wait ends early (<code translate="no">job_failed</code>) only for a proven failure: a nonzero exit, a stopped job, or one that never started. A job that exited 0 (a server may outlive its wrapper), is queued, running, ended without a code, missing or unreadable is not failure.</li>
+              <li>Ready describes the endpoint, not a process: nothing checks who owns the port, so it doesn't prove the job started it. Waiting never stops or restarts the service or the job; cancelling it only stops probing. Each probe makes short-lived connections (and one GET), so it can consume a one-shot listener.</li>
             </ul>
             <h3>inspect_desktop</h3>
             <p>
@@ -574,7 +616,8 @@ get_job_status  { "name": "ubuntu-1", "id": 1, "cursor": "&lt;next_cursor&gt;", 
               Tools also carry MCP annotations, which some clients use to decide what to confirm:
               <code translate="no">list_vms</code>, <code translate="no">take_screenshot</code>,
               <code translate="no">list_desktop_tools</code>, <code translate="no">inspect_desktop</code>,
-              <code translate="no">get_job_status</code>,
+              <code translate="no">get_job_status</code>, <code translate="no">list_jobs</code>,
+              <code translate="no">wait_for_service</code>,
               <code translate="no">list_forwards</code> and <code translate="no">read_vm_log</code> are read-only.
               Tools that discard or overwrite state are marked destructive, including
               <code translate="no">download_file</code>, which writes to your Mac.
