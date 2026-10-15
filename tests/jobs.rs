@@ -751,11 +751,52 @@ async fn linux_a_wait_on_a_running_job_expires_and_leaves_it_alone() {
 // =============================================================================================
 // Windows (PowerShell), when this machine has pwsh
 
+/// `pwsh` with an `XDG_CACHE_HOME` of its own: a fresh temp dir, never the user's `~/.cache`,
+/// so concurrent children don't share PowerShell's startup-profile cache (a hardening, not a
+/// proven fix). Keep the dir until the child has ended; dropping it removes it.
+fn pwsh_command() -> (Command, TempDir) {
+    let cache = tempdir();
+    let mut cmd = Command::new("pwsh");
+    cmd.env("XDG_CACHE_HOME", &cache.0);
+    (cmd, cache)
+}
+
 fn have_pwsh() -> bool {
-    Command::new("pwsh")
-        .args(["-NoProfile", "-Command", "exit 0"])
+    let (mut cmd, _cache) = pwsh_command();
+    cmd.args(["-NoProfile", "-Command", "exit 0"])
         .output()
         .is_ok()
+}
+
+#[test]
+fn every_pwsh_child_gets_a_cache_dir_of_its_own() {
+    if !have_pwsh() {
+        eprintln!("no pwsh here; skipped");
+        return;
+    }
+    let real = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"));
+    let seen = || {
+        let (mut cmd, cache) = pwsh_command();
+        let out = cmd
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(r#"$d = $env:XDG_CACHE_HOME; "$([bool]$d -and (Test-Path -LiteralPath $d -PathType Container))|$d""#)
+            .output()
+            .unwrap();
+        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let (exists, dir) = line.split_once('|').unwrap_or_else(|| panic!("{line:?}"));
+        (exists == "True", std::path::PathBuf::from(dir), cache)
+    };
+    let (a_exists, a, a_cache) = seen();
+    let (b_exists, b, b_cache) = seen();
+    for (exists, dir) in [(a_exists, &a), (b_exists, &b)] {
+        assert!(exists && dir.is_absolute(), "{dir:?}");
+        if let Some(real) = &real {
+            assert!(!dir.starts_with(real), "{dir:?}");
+        }
+    }
+    assert_ne!(a, b);
+    drop((a_cache, b_cache));
+    assert!(!a.exists() && !b.exists(), "{a:?} {b:?}");
 }
 
 #[test]
@@ -784,16 +825,76 @@ fn the_generated_windows_scripts_parse() {
                 cap: REPLY_BYTES,
             },
         );
-        let out = Command::new("pwsh")
+        let (mut cmd, _cache) = pwsh_command();
+        let started = std::time::Instant::now();
+        let out = cmd
             .args(["-NoProfile", "-NonInteractive", "-Command", parse])
             .env("AGENTPC_PS", &script)
             .output()
             .unwrap();
+        let elapsed = started.elapsed();
         assert!(
             out.status.success(),
             "{}\n{script}",
-            String::from_utf8_lossy(&out.stdout)
+            pwsh_failure(&String::from_utf8_lossy(&out.stdout), &out, elapsed)
         );
+    }
+}
+
+/// What a failed pwsh run says about itself, for a panic message: the parser's complaint, how
+/// the child ended (exit code, or the signal that killed it and whether it dumped core), how
+/// long it took, and how many bytes it wrote. Never its output, script or environment: only
+/// metadata. The child's pid is not known here (`Command::output` does not return it).
+fn pwsh_failure(parse_error: &str, out: &std::process::Output, elapsed: Duration) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    let ended = match (out.status.code(), out.status.signal()) {
+        (Some(code), _) => format!("exit code {code}"),
+        (None, Some(sig)) => format!(
+            "killed by signal {sig} (core dumped: {})",
+            out.status.core_dumped()
+        ),
+        (None, None) => "no exit code or signal".to_string(),
+    };
+    format!(
+        "{parse_error}\npwsh {ended}; status: {}; elapsed: {} ms; stdout: {} bytes; stderr: {} bytes",
+        out.status,
+        elapsed.as_millis(),
+        out.stdout.len(),
+        out.stderr.len()
+    )
+}
+
+#[test]
+fn a_failed_pwsh_run_reports_how_it_ended_but_never_its_output() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+    let fake = |raw: i32| Output {
+        status: ExitStatus::from_raw(raw),
+        stdout: b"OUT-BODY-MARKER".to_vec(),
+        stderr: b"ERR-BODY-MARKER-longer".to_vec(),
+    };
+    let t = Duration::from_millis(1234);
+    // A normal non-zero exit (wait status: code in the high byte).
+    let m = pwsh_failure("cut off", &fake(3 << 8), t);
+    assert!(m.starts_with("cut off\n"), "{m}");
+    assert!(m.contains("exit code 3"), "{m}");
+    assert!(m.contains("elapsed: 1234 ms"), "{m}");
+    assert!(
+        m.contains("stdout: 15 bytes") && m.contains("stderr: 22 bytes"),
+        "{m}"
+    );
+    // Killed by SIGSEGV (11), no core; then SIGABRT (6) with the core-dump bit (0x80).
+    let m = pwsh_failure("cut off", &fake(11), t);
+    assert!(
+        m.contains("killed by signal 11 (core dumped: false)"),
+        "{m}"
+    );
+    let m = pwsh_failure("cut off", &fake(6 | 0x80), t);
+    assert!(m.contains("killed by signal 6 (core dumped: true)"), "{m}");
+    // Bodies are never echoed.
+    for raw in [0, 3 << 8, 11, 6 | 0x80] {
+        let m = pwsh_failure("cut off", &fake(raw), t);
+        assert!(!m.contains("BODY-MARKER"), "{m}");
     }
 }
 
@@ -853,19 +954,16 @@ impl Windows {
 
     fn run(&self, id: u64, q: &Query) -> GuestReport {
         let stub = self.stub();
-        let out = Command::new("pwsh")
+        let (mut cmd, _cache) = pwsh_command();
+        let started = std::time::Instant::now();
+        let out = cmd
             .args(["-NoProfile", "-NonInteractive", "-Command"])
             .arg(format!("{stub}{}", windows_script(id, q)))
             .env("USERPROFILE", &self.home.0)
             .output()
             .unwrap();
-        parse_report(&out.stdout).unwrap_or_else(|e| {
-            panic!(
-                "{e}\nstdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            )
-        })
+        let elapsed = started.elapsed();
+        parse_report(&out.stdout).unwrap_or_else(|e| panic!("{}", pwsh_failure(&e, &out, elapsed)))
     }
 
     fn snapshot(&self) -> Vec<(String, u64, std::time::SystemTime)> {
@@ -2516,8 +2614,8 @@ impl Windows {
     }
 
     fn list_raw(&self, q: &ListQuery) -> std::process::Output {
-        Command::new("pwsh")
-            .args(["-NoProfile", "-NonInteractive", "-Command"])
+        let (mut cmd, _cache) = pwsh_command();
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command"])
             .arg(format!(
                 "{}{}",
                 self.stub(),
@@ -2529,14 +2627,11 @@ impl Windows {
     }
 
     fn list(&self, q: &ListQuery) -> GuestList {
+        let started = std::time::Instant::now();
         let out = self.list_raw(q);
-        parse_list_report(&out.stdout, q).unwrap_or_else(|e| {
-            panic!(
-                "{e}\nstdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            )
-        })
+        let elapsed = started.elapsed();
+        parse_list_report(&out.stdout, q)
+            .unwrap_or_else(|e| panic!("{}", pwsh_failure(&e, &out, elapsed)))
     }
 }
 
@@ -2559,15 +2654,18 @@ fn the_generated_windows_list_script_parses() {
         },
     ] {
         let script = windows_list_script(&q);
-        let out = Command::new("pwsh")
+        let (mut cmd, _cache) = pwsh_command();
+        let started = std::time::Instant::now();
+        let out = cmd
             .args(["-NoProfile", "-NonInteractive", "-Command", parse])
             .env("AGENTPC_PS", &script)
             .output()
             .unwrap();
+        let elapsed = started.elapsed();
         assert!(
             out.status.success(),
             "{}\n{script}",
-            String::from_utf8_lossy(&out.stdout)
+            pwsh_failure(&String::from_utf8_lossy(&out.stdout), &out, elapsed)
         );
     }
 }

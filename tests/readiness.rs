@@ -1407,6 +1407,7 @@ struct Ran {
     stdout: String,
     stderr: String,
     elapsed: Duration,
+    status: std::process::ExitStatus,
 }
 
 fn run_linux(q: &Query, budget_secs: u64, env: &[(&str, &str)]) -> Option<Ran> {
@@ -1431,6 +1432,7 @@ fn run_linux(q: &Query, budget_secs: u64, env: &[(&str, &str)]) -> Option<Ran> {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         elapsed: started.elapsed(),
+        status: out.status,
     })
 }
 
@@ -1826,11 +1828,90 @@ fn bash_probe_reports_a_missing_timeout_command_as_unsupported_at_once() {
 // =============================================================================================
 // The Windows probe, run under pwsh when this machine has it
 
+/// A pwsh child's private cache dir; dropping it removes it.
+struct PwshCache(std::path::PathBuf);
+
+impl Drop for PwshCache {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `pwsh` with an `XDG_CACHE_HOME` of its own: a fresh temp dir, never the user's `~/.cache`,
+/// so concurrent children don't share PowerShell's startup-profile cache (a hardening, not a
+/// proven fix). Keep the dir until the child has ended.
+fn pwsh_command() -> (Command, PwshCache) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "agentpc-readiness-pwsh-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cmd = Command::new("pwsh");
+    cmd.env("XDG_CACHE_HOME", &dir);
+    (cmd, PwshCache(dir))
+}
+
+/// What a failed pwsh run says about itself, for a panic message: the complaint, how the child
+/// ended (exit code, or the signal that killed it and whether it dumped core), how long it
+/// took, and how many bytes it wrote (of its decoded output). Never its output, script or
+/// environment: only metadata.
+fn pwsh_failure(complaint: &str, ran: &Ran) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    let ended = match (ran.status.code(), ran.status.signal()) {
+        (Some(code), _) => format!("exit code {code}"),
+        (None, Some(sig)) => format!(
+            "killed by signal {sig} (core dumped: {})",
+            ran.status.core_dumped()
+        ),
+        (None, None) => "no exit code or signal".to_string(),
+    };
+    format!(
+        "{complaint}\npwsh {ended}; status: {}; elapsed: {} ms; stdout: {} bytes; stderr: {} bytes",
+        ran.status,
+        ran.elapsed.as_millis(),
+        ran.stdout.len(),
+        ran.stderr.len()
+    )
+}
+
 fn have_pwsh() -> bool {
-    Command::new("pwsh")
-        .args(["-NoProfile", "-Command", "exit 0"])
+    let (mut cmd, _cache) = pwsh_command();
+    cmd.args(["-NoProfile", "-Command", "exit 0"])
         .output()
         .is_ok()
+}
+
+#[test]
+fn every_pwsh_child_gets_a_cache_dir_of_its_own() {
+    if !have_pwsh() {
+        eprintln!("no pwsh here; skipped");
+        return;
+    }
+    let real = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"));
+    let seen = || {
+        let (mut cmd, cache) = pwsh_command();
+        let out = cmd
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(r#"$d = $env:XDG_CACHE_HOME; "$([bool]$d -and (Test-Path -LiteralPath $d -PathType Container))|$d""#)
+            .output()
+            .unwrap();
+        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let (exists, dir) = line.split_once('|').unwrap_or_else(|| panic!("{line:?}"));
+        (exists == "True", std::path::PathBuf::from(dir), cache)
+    };
+    let (a_exists, a, a_cache) = seen();
+    let (b_exists, b, b_cache) = seen();
+    for (exists, dir) in [(a_exists, &a), (b_exists, &b)] {
+        assert!(exists && dir.is_absolute(), "{dir:?}");
+        if let Some(real) = &real {
+            assert!(!dir.starts_with(real), "{dir:?}");
+        }
+    }
+    assert_ne!(a, b);
+    drop((a_cache, b_cache));
+    assert!(!a.exists() && !b.exists(), "{a:?} {b:?}");
 }
 
 fn run_windows(req: &Request, budget_secs: u64, env: &[(&str, &str)]) -> Option<Ran> {
@@ -1839,8 +1920,8 @@ fn run_windows(req: &Request, budget_secs: u64, env: &[(&str, &str)]) -> Option<
         return None;
     }
     let script = windows_probe_script(&query(req), Duration::from_secs(budget_secs));
+    let (mut cmd, _cache) = pwsh_command();
     let started = Instant::now();
-    let mut cmd = Command::new("pwsh");
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
     for (k, v) in env {
         cmd.env(k, v);
@@ -1850,13 +1931,14 @@ fn run_windows(req: &Request, budget_secs: u64, env: &[(&str, &str)]) -> Option<
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         elapsed: started.elapsed(),
+        status: out.status,
     })
 }
 
 fn windows(req: &Request, budget_secs: u64) -> Option<(GuestProbe, Ran)> {
     let ran = run_windows(req, budget_secs, &[])?;
     let p = parse_probe(ran.stdout.as_bytes(), req.protocol)
-        .unwrap_or_else(|e| panic!("{e}: {:?} {:?}", ran.stdout, ran.stderr));
+        .unwrap_or_else(|e| panic!("{}", pwsh_failure(&e, &ran)));
     Some((p, ran))
 }
 
@@ -1871,15 +1953,23 @@ fn the_generated_powershell_probe_parses() {
         if ($e.Count) { $e | ForEach-Object { $_.ToString() }; exit 1 }";
     for req in [tcp_to(80), http_to(80, "/a b?x=1&y='\"$(id)")] {
         let script = windows_probe_script(&query(&req), Duration::from_secs(3));
-        let out = Command::new("pwsh")
+        let (mut cmd, _cache) = pwsh_command();
+        let started = Instant::now();
+        let out = cmd
             .args(["-NoProfile", "-NonInteractive", "-Command", parse])
             .env("AGENTPC_PS", &script)
             .output()
             .unwrap();
+        let ran = Ran {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            elapsed: started.elapsed(),
+            status: out.status,
+        };
         assert!(
             out.status.success(),
             "{}\n{script}",
-            String::from_utf8_lossy(&out.stdout)
+            pwsh_failure(&ran.stdout, &ran)
         );
         assert!(!script.contains("Invoke-WebRequest") && !script.contains("Proxy"));
     }
@@ -1987,7 +2077,8 @@ fn powershell_http_failures_and_proxy_settings() {
     ) else {
         return;
     };
-    let p = parse_probe(ran.stdout.as_bytes(), Protocol::Http).unwrap();
+    let p = parse_probe(ran.stdout.as_bytes(), Protocol::Http)
+        .unwrap_or_else(|e| panic!("{}", pwsh_failure(&e, &ran)));
     assert_eq!(p.http, Some(HttpReply::Status(200)));
     assert_eq!(decoy.seen.connections.load(Ordering::SeqCst), 0);
 }
@@ -2274,11 +2365,19 @@ fn a_windows_job_read_with_no_log_cap_returns_no_log_text() {
         "function Get-ScheduledTask {{ [CmdletBinding()] param($TaskName) $null }}\n{}",
         jobs::windows_script(7, &req.query())
     );
-    let out = Command::new("pwsh")
+    let (mut cmd, _cache) = pwsh_command();
+    let started = Instant::now();
+    let out = cmd
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .env("USERPROFILE", &base)
         .output()
         .unwrap();
+    let ran = Ran {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        elapsed: started.elapsed(),
+        status: out.status,
+    };
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     // Control: with the ordinary cap the same script does return the log's bytes (base64).
     let full = jobs::Request::new("vm", 7, 50, Duration::ZERO, None, "gen".into());
@@ -2286,7 +2385,8 @@ fn a_windows_job_read_with_no_log_cap_returns_no_log_text() {
         "function Get-ScheduledTask {{ [CmdletBinding()] param($TaskName) $null }}\n{}",
         jobs::windows_script(7, &full.query())
     );
-    let ctl = Command::new("pwsh")
+    let (mut cmd, _cache) = pwsh_command();
+    let ctl = cmd
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .env("USERPROFILE", &base)
         .output()
@@ -2296,7 +2396,8 @@ fn a_windows_job_read_with_no_log_cap_returns_no_log_text() {
     let _ = std::fs::remove_file(rec("exit"));
     let _ = std::fs::remove_dir_all(&base);
     assert!(!text.contains("SECRET"), "{text}");
-    let rep = jobs::parse_report(&out.stdout).unwrap_or_else(|e| panic!("{e}: {text}"));
+    let rep =
+        jobs::parse_report(&out.stdout).unwrap_or_else(|e| panic!("{}", pwsh_failure(&e, &ran)));
     assert_eq!(
         (rep.state, rep.exit_code),
         (jobs::JobState::Exited, Some(3))

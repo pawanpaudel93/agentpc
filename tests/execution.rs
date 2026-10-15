@@ -45,7 +45,9 @@ fn job_scripts_parse() {
         windows_probe(42),
         windows_foreground(42, "Write-Output hi"),
     ] {
-        let Ok(out) = std::process::Command::new("pwsh")
+        let (mut cmd, _cache) = pwsh_command();
+        let started = std::time::Instant::now();
+        let Ok(out) = cmd
             .args(["-NoProfile", "-NonInteractive", "-Command", parse])
             .env("AGENTPC_PS", &script)
             .output()
@@ -53,10 +55,11 @@ fn job_scripts_parse() {
             eprintln!("no pwsh here; PowerShell parse skipped");
             return;
         };
+        let elapsed = started.elapsed();
         assert!(
             out.status.success(),
             "{}\n{script}",
-            String::from_utf8_lossy(&out.stdout)
+            pwsh_failure(&String::from_utf8_lossy(&out.stdout), &out, elapsed)
         );
     }
 }
@@ -67,7 +70,8 @@ fn job_scripts_parse() {
 /// land next to it as `agentpc-bg\<id>.*`-named files.
 #[test]
 fn windows_wrapper_runs_under_powershell_when_available() {
-    if std::process::Command::new("pwsh")
+    let (mut cmd, cache) = pwsh_command();
+    if cmd
         .args(["-NoProfile", "-Command", "exit 0"])
         .output()
         .is_err()
@@ -75,6 +79,7 @@ fn windows_wrapper_runs_under_powershell_when_available() {
         eprintln!("no pwsh here; skipped");
         return;
     }
+    drop(cache);
     let home = tempdir();
     let rec = |id: u64, ext: &str| {
         std::fs::read_to_string(home.parent().unwrap().join(format!(
@@ -84,7 +89,8 @@ fn windows_wrapper_runs_under_powershell_when_available() {
         .ok()
     };
     let run = |id: u64, script: &str| {
-        let out = std::process::Command::new("pwsh")
+        let (mut cmd, _cache) = pwsh_command();
+        let out = cmd
             .args(["-NoProfile", "-NonInteractive", "-Command"])
             .arg(windows_foreground(id, script))
             .env("USERPROFILE", &*home)
@@ -139,7 +145,8 @@ fn windows_wrapper_runs_under_powershell_when_available() {
         "the record comes before the check"
     );
     // The probe and the record-reading function parse and run too.
-    let probe = std::process::Command::new("pwsh")
+    let (mut cmd, _cache) = pwsh_command();
+    let probe = cmd
         .args(["-NoProfile", "-NonInteractive", "-Command"])
         .arg(windows_probe(101))
         .env("USERPROFILE", &*home)
@@ -149,7 +156,8 @@ fn windows_wrapper_runs_under_powershell_when_available() {
         Probe::parse(&String::from_utf8_lossy(&probe.stdout)),
         Probe::Exited(0)
     );
-    let probe = std::process::Command::new("pwsh")
+    let (mut cmd, _cache) = pwsh_command();
+    let probe = cmd
         .args(["-NoProfile", "-NonInteractive", "-Command"])
         .arg(windows_probe(102))
         .env("USERPROFILE", &*home)
@@ -160,7 +168,8 @@ fn windows_wrapper_runs_under_powershell_when_available() {
         Probe::parse(&String::from_utf8_lossy(&probe.stdout)),
         Probe::Exited(3)
     );
-    let probe = std::process::Command::new("pwsh")
+    let (mut cmd, _cache) = pwsh_command();
+    let probe = cmd
         .args(["-NoProfile", "-NonInteractive", "-Command"])
         .arg(windows_probe(105))
         .env("USERPROFILE", &*home)
@@ -178,7 +187,8 @@ fn windows_wrapper_runs_under_powershell_when_available() {
     );
 
     let probe = |id: u64| {
-        let out = std::process::Command::new("pwsh")
+        let (mut cmd, _cache) = pwsh_command();
+        let out = cmd
             .args(["-NoProfile", "-NonInteractive", "-Command"])
             .arg(windows_probe(id))
             .env("USERPROFILE", &*home)
@@ -187,7 +197,8 @@ fn windows_wrapper_runs_under_powershell_when_available() {
         Probe::parse(&String::from_utf8_lossy(&out.stdout))
     };
     // A running execution is recognised by its recorded pid and creation time...
-    let mut live = std::process::Command::new("pwsh")
+    let (mut live_cmd, _live_cache) = pwsh_command();
+    let mut live = live_cmd
         .args(["-NoProfile", "-NonInteractive", "-Command"])
         .arg(windows_foreground(106, "Start-Sleep 60"))
         .env("USERPROFILE", &*home)
@@ -565,8 +576,41 @@ fn unique() -> u64 {
     N.fetch_add(1, Ordering::SeqCst)
 }
 
+/// `pwsh` with an `XDG_CACHE_HOME` of its own: a fresh temp dir, never the user's `~/.cache`,
+/// so concurrent children don't share PowerShell's startup-profile cache (a hardening, not a
+/// proven fix). Keep the dir until the child has ended; dropping it removes it.
+fn pwsh_command() -> (std::process::Command, TempDir) {
+    let cache = tempdir();
+    let mut cmd = std::process::Command::new("pwsh");
+    cmd.env("XDG_CACHE_HOME", &*cache);
+    (cmd, cache)
+}
+
+/// What a failed pwsh run says about itself, for a panic message: the complaint, how the child
+/// ended (exit code, or the signal that killed it and whether it dumped core), how long it
+/// took, and how many bytes it wrote. Never its output, script or environment: only metadata.
+fn pwsh_failure(complaint: &str, out: &std::process::Output, elapsed: Duration) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    let ended = match (out.status.code(), out.status.signal()) {
+        (Some(code), _) => format!("exit code {code}"),
+        (None, Some(sig)) => format!(
+            "killed by signal {sig} (core dumped: {})",
+            out.status.core_dumped()
+        ),
+        (None, None) => "no exit code or signal".to_string(),
+    };
+    format!(
+        "{complaint}\npwsh {ended}; status: {}; elapsed: {} ms; stdout: {} bytes; stderr: {} bytes",
+        out.status,
+        elapsed.as_millis(),
+        out.stdout.len(),
+        out.stderr.len()
+    )
+}
+
 fn have_pwsh() -> bool {
-    let ok = std::process::Command::new("pwsh")
+    let (mut cmd, _cache) = pwsh_command();
+    let ok = cmd
         .args(["-NoProfile", "-Command", "exit 0"])
         .output()
         .is_ok();
@@ -574,6 +618,37 @@ fn have_pwsh() -> bool {
         eprintln!("no pwsh here; skipped");
     }
     ok
+}
+
+#[test]
+fn every_pwsh_child_gets_a_cache_dir_of_its_own() {
+    if !have_pwsh() {
+        eprintln!("no pwsh here; skipped");
+        return;
+    }
+    let real = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"));
+    let seen = || {
+        let (mut cmd, cache) = pwsh_command();
+        let out = cmd
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(r#"$d = $env:XDG_CACHE_HOME; "$([bool]$d -and (Test-Path -LiteralPath $d -PathType Container))|$d""#)
+            .output()
+            .unwrap();
+        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let (exists, dir) = line.split_once('|').unwrap_or_else(|| panic!("{line:?}"));
+        (exists == "True", std::path::PathBuf::from(dir), cache)
+    };
+    let (a_exists, a, a_cache) = seen();
+    let (b_exists, b, b_cache) = seen();
+    for (exists, dir) in [(a_exists, &a), (b_exists, &b)] {
+        assert!(exists && dir.is_absolute(), "{dir:?}");
+        if let Some(real) = &real {
+            assert!(!dir.starts_with(real), "{dir:?}");
+        }
+    }
+    assert_ne!(a, b);
+    drop((a_cache, b_cache));
+    assert!(!a.exists() && !b.exists(), "{a:?} {b:?}");
 }
 
 /// Off Windows, `[IO.File]` takes `\` as part of a file name while PowerShell's provider
@@ -587,8 +662,8 @@ fn record_path(home: &TempDir, id: u64, ext: &str) -> std::path::PathBuf {
 }
 
 fn pwsh(home: &TempDir, script: &str) -> std::process::Output {
-    std::process::Command::new("pwsh")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+    let (mut cmd, _cache) = pwsh_command();
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script])
         .env("USERPROFILE", &**home)
         .output()
         .unwrap()
@@ -653,7 +728,8 @@ fn a_windows_stop_that_cannot_list_processes_never_confirms() {
     }
     let home = tempdir();
     let id = 211;
-    let mut live = std::process::Command::new("pwsh")
+    let (mut live_cmd, _live_cache) = pwsh_command();
+    let mut live = live_cmd
         .args(["-NoProfile", "-NonInteractive", "-Command"])
         .arg(windows_foreground(id, "Start-Sleep 60"))
         .env("USERPROFILE", &*home)
