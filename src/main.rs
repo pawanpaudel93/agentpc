@@ -1,6 +1,7 @@
 //! agentpc: instant, resettable Windows, Ubuntu and Arch Linux ARM desktop VMs for AI agents on Apple Silicon Macs.
 
 mod execution;
+mod guest;
 mod image;
 mod instance;
 mod jobs;
@@ -43,12 +44,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a VM from an image and boot it (default name: <os>-<n>); gets the image if missing
+    /// Create a VM from an image and boot it (default name: <os>-<n>); gets the image if
+    /// missing. With --from, from a checkpoint of another VM instead (it boots cold)
     Create {
-        /// ubuntu, windows, arch, or a version: ubuntu-22.04, ubuntu-x86apps, arch-x86apps, windows-11-23h2 (see image build --help)
-        image: String,
+        /// ubuntu, windows, arch, or a version: ubuntu-22.04, ubuntu-x86apps, arch-x86apps, windows-11-23h2 (see image build --help). Optional with --from (then it must be the source's image)
+        #[arg(required_unless_present = "from")]
+        image: Option<String>,
         /// VM name: up to 64 letters, digits, . - _ (default: <os>-<n>)
         name: Option<String>,
+        /// VM name, as a flag (instead of the second argument)
+        #[arg(long = "name", value_name = "NAME", conflicts_with = "name")]
+        name_flag: Option<String>,
+        /// Make the VM from checkpoint <vm>/<label>: a copy of its disk, booted cold; its memory, port forwards and job records are not carried over
+        #[arg(long, value_name = "VM/LABEL")]
+        from: Option<String>,
         /// Memory in GB (default 8 Windows, 4 Ubuntu and Arch); a non-default size cold-boots
         #[arg(long)]
         memory: Option<u32>,
@@ -297,21 +306,40 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Create {
             image,
             name,
+            name_flag,
+            from,
             memory,
             cpus,
             offline,
             open,
-        } => out(viewer::open_created(
-            ops::create(
-                &Image::resolve(&image)?,
-                name.as_deref(),
-                memory,
-                cpus,
-                offline,
-                None,
-            ),
-            open,
-        )),
+        } => {
+            let name = name.or(name_flag);
+            let made = match from {
+                Some(from) => ops::create_from_checkpoint(
+                    &ops::CheckpointRef::parse(&from)?,
+                    image.as_deref(),
+                    name.as_deref(),
+                    memory,
+                    cpus,
+                    offline,
+                    None,
+                ),
+                None => {
+                    let image = image.context(
+                        "an image is required (ubuntu, windows, arch, ...) unless --from is given",
+                    )?;
+                    ops::create(
+                        &Image::resolve(&image)?,
+                        name.as_deref(),
+                        memory,
+                        cpus,
+                        offline,
+                        None,
+                    )
+                }
+            };
+            out(viewer::open_created(made, open))
+        }
         Cmd::List { json } => out(if json {
             ops::list_json()
         } else {
@@ -524,5 +552,51 @@ mod cli_tests {
             };
             assert_eq!(open, expected);
         }
+    }
+
+    fn create(args: &[&str]) -> Result<Cmd, clap::Error> {
+        let mut argv = vec!["agentpc", "create"];
+        argv.extend(args);
+        Cli::try_parse_from(argv).map(|c| c.cmd)
+    }
+
+    #[test]
+    fn create_takes_a_checkpoint_instead_of_an_image() {
+        let Cmd::Create {
+            image,
+            name,
+            name_flag,
+            from,
+            ..
+        } = create(&["--from", "src/clean", "--name", "copy"]).unwrap()
+        else {
+            panic!("not create")
+        };
+        assert_eq!(image, None);
+        assert_eq!(name, None);
+        assert_eq!(name_flag.as_deref(), Some("copy"));
+        assert_eq!(from.as_deref(), Some("src/clean"));
+        // An image may still be named; it must then be the source's (checked by ops).
+        let Cmd::Create { image, from, .. } = create(&["ubuntu", "--from", "src/clean"]).unwrap()
+        else {
+            panic!("not create")
+        };
+        assert_eq!(
+            (image.as_deref(), from.as_deref()),
+            (Some("ubuntu"), Some("src/clean"))
+        );
+    }
+
+    #[test]
+    fn create_needs_an_image_or_a_checkpoint_and_one_name() {
+        assert!(create(&[]).is_err(), "no image and no --from");
+        assert!(
+            create(&["ubuntu", "vm1", "--name", "vm2"]).is_err(),
+            "two names"
+        );
+        let Cmd::Create { name_flag, .. } = create(&["ubuntu", "--name", "vm1"]).unwrap() else {
+            panic!("not create")
+        };
+        assert_eq!(name_flag.as_deref(), Some("vm1"));
     }
 }

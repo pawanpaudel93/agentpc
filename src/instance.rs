@@ -697,7 +697,7 @@ pub fn image_lock(image: &Image) -> Result<std::fs::File> {
     )
 }
 
-fn image_lock_path(image: &Image) -> PathBuf {
+pub(crate) fn image_lock_path(image: &Image) -> PathBuf {
     images_dir().join(format!(".{image}.lock"))
 }
 

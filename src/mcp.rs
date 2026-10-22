@@ -40,7 +40,10 @@ list, your tool definitions predate an agentpc update: reconnect the agentpc MCP
 Flow: list_vms -> create_vm (or start_vm on one you created) -> take_screenshot -> list_desktop_tools ->
 use_desktop_tool(...) (inspect_desktop(...) to only look) -> take_screenshot to verify. reset_vm returns an instance to a clean
 install; checkpoint_vm/restore_vm save and return to any point in seconds (disk and memory) --
-checkpoint before a risky or slow-to-redo step. run_command runs PowerShell on Windows and bash
+checkpoint before a risky or slow-to-redo step. To set up once and start many VMs,
+create_vm(from_checkpoint: \"<vm>/<label>\", name: ...) makes a new, independent VM from a
+checkpoint's disk; it boots cold, and memory, port forwards, offline and job records are not
+carried over. run_command runs PowerShell on Windows and bash
 on Ubuntu and Arch; the guest login is agent/agent (SSH
 takes only agentpc's key). create_vm takes an optional version (Ubuntu
 release like \"22.04\"; Windows \"11-25h2\", \"11-24h2\", \"11-23h2\"; Arch is rolling: no version,
@@ -433,7 +436,7 @@ struct NameArgs {
     name: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "lowercase")]
 #[schemars(inline)]
 enum OsArg {
@@ -442,9 +445,21 @@ enum OsArg {
     Arch,
 }
 
+impl From<OsArg> for Os {
+    fn from(o: OsArg) -> Os {
+        match o {
+            OsArg::Windows => Os::Windows,
+            OsArg::Ubuntu => Os::Ubuntu,
+            OsArg::Arch => Os::Arch,
+        }
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct CreateArgs {
-    os: OsArg,
+    /// ubuntu, windows or arch. Optional with from_checkpoint; if given there, it (and version)
+    /// must name the source VM's image.
+    os: Option<OsArg>,
     /// Default: ubuntu 24.04, windows 11, arch rolling. Ubuntu: any release, e.g. "22.04", "26.04";
     /// "x86apps" (or "22.04-x86apps"; x86apps is for 22.04 and 24.04 only) is Ubuntu that also runs
     /// x86_64 and i386 Linux programs; "24.04-YYYYMMDD" pins a published build (download-only).
@@ -471,6 +486,57 @@ struct CreateArgs {
     /// Default false. Per-call only; a launch failure warns without failing VM creation.
     #[serde(default)]
     open_in_browser: bool,
+    /// "<vm>/<label>": make the new VM from that checkpoint's disk instead of a fresh image.
+    /// It boots cold (the checkpoint's memory is never used), so memory_gb and cpus are free;
+    /// offline and the owner come from this call; port forwards and job records are not
+    /// carried over. The source may be running or stopped.
+    from_checkpoint: Option<String>,
+}
+
+/// What a create_vm call asks for, checked before any VM work.
+#[derive(Debug, PartialEq)]
+enum CreatePlan {
+    /// A fresh clone of this image (`<os>` or `<os>-<version>`).
+    Image(String),
+    /// A copy of a checkpoint's disk; `image`, when os was given, must be the source's.
+    Checkpoint {
+        from: ops::CheckpointRef,
+        image: Option<String>,
+    },
+}
+
+fn create_plan(os: Option<OsArg>, version: Option<&str>, from: Option<&str>) -> Result<CreatePlan> {
+    let image = match (os.map(Os::from), version) {
+        (Some(os), Some(v)) => Some(format!("{os}-{v}")),
+        (Some(os), None) => Some(os.to_string()),
+        (None, Some(_)) => bail!("version needs os"),
+        (None, None) => None,
+    };
+    match (from, image) {
+        (Some(f), image) => Ok(CreatePlan::Checkpoint {
+            from: ops::CheckpointRef::parse(f)?,
+            image,
+        }),
+        (None, Some(image)) => Ok(CreatePlan::Image(image)),
+        (None, None) => {
+            bail!("os is required (ubuntu, windows or arch) unless from_checkpoint is given")
+        }
+    }
+}
+
+impl CreatePlan {
+    /// Whether `inst` is what this plan makes, so a same-session retry returns it: the same
+    /// image and no checkpoint, or the same checkpoint (and image, when os was given).
+    fn made(&self, inst: &Instance) -> bool {
+        let same_image = |i: &str| Image::resolve(i).is_ok_and(|i| i == inst.image);
+        match self {
+            CreatePlan::Image(image) => ops::created_from(inst).is_none() && same_image(image),
+            CreatePlan::Checkpoint { from, image } => {
+                ops::created_from(inst).as_ref() == Some(from)
+                    && image.as_deref().is_none_or(same_image)
+            }
+        }
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -695,7 +761,12 @@ impl Gateway {
         title = "Create VM",
         description = "Create and boot a new instance cloned from its image, and return once its desktop and\n\
                           control server are ready. Usually seconds; the FIRST create of an image can take\n\
-                          minutes while it is downloaded or built. Give it your own unique name.",
+                          minutes while it is downloaded or built. Give it your own unique name.\n\
+                          from_checkpoint \"<vm>/<label>\" instead makes a new, independent VM from that\n\
+                          checkpoint's disk (os/version optional; if given they must be the source's image).\n\
+                          It boots cold (~15 s Ubuntu and Arch, ~25 s Windows), so memory_gb and cpus are free;\n\
+                          the checkpoint's memory, port forwards, owner, offline and job records are not carried\n\
+                          over, and deleting the source or the checkpoint later doesn't affect it.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -707,26 +778,22 @@ impl Gateway {
         Parameters(a): Parameters<CreateArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let os = match a.os {
-            OsArg::Windows => Os::Windows,
-            OsArg::Ubuntu => Os::Ubuntu,
-            OsArg::Arch => Os::Arch,
+        let plan = match create_plan(a.os, a.version.as_deref(), a.from_checkpoint.as_deref()) {
+            Ok(plan) => plan,
+            Err(e) => return text(Err(e)),
         };
         let owner = self.owner_tag(&ctx);
         let open_in_browser = a.open_in_browser;
-        let image = match a.version {
-            Some(v) => format!("{os}-{v}"),
-            None => os.to_string(),
-        };
         // Idempotent retry: a create re-sent after a client timeout finds its own VM already
-        // there (of the image asked for) and returns it, booted, rather than erroring or
-        // making a second one. The same goes for a VM whose owning server has exited (a
-        // session restarted): its creator adopts it by asking for it again.
+        // there (made the way this call asks: the same image, or the same checkpoint) and
+        // returns it, booted, rather than erroring or making a second one. The same goes for a
+        // VM whose owning server has exited (a session restarted): its creator adopts it by
+        // asking for it again. Any other VM of that name is the "exists" error below.
         if let Some(name) = &a.name
             && let Ok(inst) = load(name)
             && (ops::owner(&inst).as_deref() == Some(owner.as_str())
                 || ops::owner_alive(&inst) == Some(false))
-            && Image::resolve(&image).is_ok_and(|i| i == inst.image)
+            && plan.made(&inst)
         {
             // Settings asked for again must match: an `offline: true` retry must never come
             // back with an online VM.
@@ -752,10 +819,11 @@ impl Gateway {
                 return text(Err(error));
             }
             // Through boot even when QEMU runs: a VM that never became ready is waited for
-            // again (and a paused one resumed), rather than reported ready.
+            // again (and a paused one resumed), rather than reported ready; a checkpoint-made
+            // VM whose job records weren't deleted yet gets that step again.
             return text(
                 with_progress(&ctx, move || {
-                    crate::viewer::open_created(ops::boot(&inst), open_in_browser)
+                    crate::viewer::open_created(ops::boot_created(&inst), open_in_browser)
                 })
                 .await,
             );
@@ -770,18 +838,28 @@ impl Gateway {
             self.owned.lock().unwrap().insert(n.clone());
         }
         let tag = owner.clone();
+        let (name, memory_gb, cpus, offline) = (a.name, a.memory_gb, a.cpus, a.offline);
         let res = with_progress(&ctx, move || {
-            crate::viewer::open_created(
-                ops::create(
-                    &Image::resolve(&image)?,
-                    a.name.as_deref(),
-                    a.memory_gb,
-                    a.cpus,
-                    a.offline,
+            let made = match &plan {
+                CreatePlan::Image(image) => ops::create(
+                    &Image::resolve(image)?,
+                    name.as_deref(),
+                    memory_gb,
+                    cpus,
+                    offline,
                     Some(&tag),
                 ),
-                open_in_browser,
-            )
+                CreatePlan::Checkpoint { from, image } => ops::create_from_checkpoint(
+                    from,
+                    image.as_deref(),
+                    name.as_deref(),
+                    memory_gb,
+                    cpus,
+                    offline,
+                    Some(&tag),
+                ),
+            };
+            crate::viewer::open_created(made, open_in_browser)
         })
         .await;
         // Track it for auto-stop (ops::create recorded the owner before booting), also when
@@ -888,8 +966,10 @@ impl Gateway {
     #[tool(
         title = "Checkpoint VM",
         description = "Save the instance's disk and memory under a label (replacing an older one of that\n\
-                          name). A running VM pauses for a few seconds and carries on. Use before a risky\n\
-                          step; restore_vm returns to it in seconds.",
+                          name). A running VM's guest first writes its pending data to disk (at most about\n\
+                          10 s; if that fails the reply says \"not flushed\" and the checkpoint is still saved),\n\
+                          then pauses for a few seconds and carries on. Use before a risky step; restore_vm\n\
+                          returns to it in seconds, and create_vm(from_checkpoint) starts new VMs from it.",
         annotations(
             read_only_hint = false,
             // Overwrites any checkpoint already stored under this label.
@@ -2708,6 +2788,126 @@ fn reply(r: Result<Vec<ContentBlock>>) -> CallToolResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn create_plans_come_from_os_version_or_a_checkpoint() {
+        use super::{CreatePlan, OsArg, create_plan};
+        use crate::ops::CheckpointRef;
+        let cp = |s: &str| CheckpointRef::parse(s).unwrap();
+        assert_eq!(
+            create_plan(Some(OsArg::Ubuntu), None, None).unwrap(),
+            CreatePlan::Image("ubuntu".into())
+        );
+        assert_eq!(
+            create_plan(Some(OsArg::Ubuntu), Some("22.04"), None).unwrap(),
+            CreatePlan::Image("ubuntu-22.04".into())
+        );
+        assert_eq!(
+            create_plan(None, None, Some("src/clean")).unwrap(),
+            CreatePlan::Checkpoint {
+                from: cp("src/clean"),
+                image: None
+            }
+        );
+        assert_eq!(
+            create_plan(Some(OsArg::Ubuntu), Some("24.04"), Some("src/clean")).unwrap(),
+            CreatePlan::Checkpoint {
+                from: cp("src/clean"),
+                image: Some("ubuntu-24.04".into())
+            }
+        );
+        let err = |os, v, f| format!("{:#}", create_plan(os, v, f).unwrap_err());
+        assert!(err(None, None, None).contains("os is required"));
+        assert!(err(None, Some("22.04"), Some("src/clean")).contains("version needs os"));
+        assert!(err(Some(OsArg::Ubuntu), None, Some("bad")).starts_with("invalid_checkpoint_ref"));
+    }
+
+    /// A same-session retry returns an existing VM only if this call would have made it.
+    #[test]
+    fn a_retry_matches_only_the_same_source() {
+        use super::{CreatePlan, create_plan};
+        let root = std::env::temp_dir().join(format!(
+            "agentpc-made-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let inst = crate::instance::Instance {
+            name: "vm".into(),
+            os: crate::instance::Os::Ubuntu,
+            image: "ubuntu-24.04".parse().unwrap(),
+            slot: 9,
+            dir: root.clone(),
+        };
+        let image = |s: &str| CreatePlan::Image(s.into());
+        let from = |os, v, f| create_plan(os, v, Some(f)).unwrap();
+        assert!(image("ubuntu").made(&inst));
+        assert!(!image("ubuntu-22.04").made(&inst));
+        assert!(!from(None, None, "src/clean").made(&inst));
+        std::fs::write(root.join("from_checkpoint"), "src/clean").unwrap();
+        assert!(!image("ubuntu").made(&inst), "not made from the image");
+        assert!(from(None, None, "src/clean").made(&inst));
+        assert!(!from(None, None, "src/other").made(&inst));
+        assert!(!from(None, None, "other/clean").made(&inst));
+        assert!(from(Some(super::OsArg::Ubuntu), None, "src/clean").made(&inst));
+        assert!(!from(Some(super::OsArg::Ubuntu), Some("22.04"), "src/clean").made(&inst));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_vm_takes_from_checkpoint_and_no_longer_requires_os() {
+        let schema = serde_json::to_value(schemars::schema_for!(super::CreateArgs)).unwrap();
+        // schemars renders an Option<String> as ["string", "null"], as it does `version`.
+        let ty = &schema["properties"]["from_checkpoint"]["type"];
+        assert!(
+            ty == "string" || ty.as_array().is_some_and(|t| t.contains(&"string".into())),
+            "{ty}"
+        );
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.contains(&serde_json::json!("os")));
+        assert!(!required.contains(&serde_json::json!("from_checkpoint")));
+        let a: super::CreateArgs =
+            serde_json::from_value(serde_json::json!({"from_checkpoint": "src/clean"})).unwrap();
+        assert!(a.os.is_none() && a.from_checkpoint.as_deref() == Some("src/clean"));
+    }
+
+    #[test]
+    fn instructions_and_descriptions_explain_vms_from_checkpoints() {
+        let tools = super::Gateway::tool_router().list_all();
+        let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let desc = |n: &str| {
+            norm(
+                tools
+                    .iter()
+                    .find(|t| t.name == n)
+                    .unwrap()
+                    .description
+                    .as_deref()
+                    .unwrap(),
+            )
+        };
+        let ins = norm(super::INSTRUCTIONS);
+        for term in ["from_checkpoint", "boots cold", "job records"] {
+            assert!(ins.contains(term), "INSTRUCTIONS lack {term}");
+        }
+        let create = desc("create_vm");
+        for term in [
+            "from_checkpoint",
+            "boots cold",
+            "independent",
+            "job records",
+            "port forwards",
+        ] {
+            assert!(create.contains(term), "create_vm lacks {term}");
+        }
+        let checkpoint = desc("checkpoint_vm");
+        for term in ["not flushed", "from_checkpoint"] {
+            assert!(checkpoint.contains(term), "checkpoint_vm lacks {term}");
+        }
+    }
+
     /// The largest Linux foreground command agentpc accepts still fits the kernel's 128 KiB
     /// cap on one argument or environment string (MAX_ARG_STRLEN, counting its NUL) as the
     /// whole wrapper SSH runs, with the real session environment and the longest id.
@@ -2778,10 +2978,13 @@ mod tests {
         );
         let schema = serde_json::to_value(schemars::schema_for!(super::CreateArgs)).unwrap();
         assert_eq!(schema["properties"]["open_in_browser"]["type"], "boolean");
+        // No argument is required any more (os is optional with from_checkpoint), so the
+        // schema may leave "required" out.
         assert!(
             !schema["required"]
                 .as_array()
-                .unwrap()
+                .cloned()
+                .unwrap_or_default()
                 .contains(&serde_json::json!("open_in_browser"))
         );
     }

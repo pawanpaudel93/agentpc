@@ -444,6 +444,7 @@ pub fn clone_disk(inst: &Instance) -> Result<()> {
     let base_name = base.file_name().unwrap().to_string_lossy();
     let _ = std::fs::remove_file(inst.disk());
     let _ = std::fs::remove_file(inst.dir.join("tz"));
+    forget_checkpoint_origin(inst);
     run(
         "qemu-img",
         &[
@@ -594,9 +595,27 @@ pub fn create(
     offline: bool,
     owner: Option<&str>,
 ) -> Result<String> {
-    let os = image.os;
     // Checked before a download or build that can take minutes; rechecked below for races.
     Instance::check_size(memory, cpus)?;
+    precheck(image.os, name, memory)?;
+    if !image.exists() {
+        provision_image(image)?;
+    }
+    let (inst, _instance_lock) = reserve(image, name, memory, cpus, offline)?;
+    fill_or_discard(&inst, || {
+        clone_image_disk(&inst)?;
+        // Before the first boot, so a VM that never becomes ready is still its owner's: a
+        // retried create_vm boots it again, and the owner's exit stops it.
+        owner.map_or(Ok(()), |o| set_owner(&inst, o))
+    })?;
+    let note = crate::image::outdated(image).map(|h| format!("\n  note: the {image} image: {h}"));
+    boot_locked(&inst)
+        .map(|s| s + &note.unwrap_or_default())
+        .map_err(|e| not_ready(e, &inst))
+}
+
+/// What every create checks before any work: the name, and the Mac's memory and disk.
+fn precheck(os: Os, name: Option<&str>, memory: Option<u32>) -> Result<()> {
     if let Some(n) = name {
         check_name(n)?;
         if crate::instance::instances_dir().join(n).exists() {
@@ -604,12 +623,23 @@ pub fn create(
         }
     }
     check_memory(memory.unwrap_or(os.default_size().0))?;
-    ensure_free_space(4, "create a VM")?;
-    if !image.exists() {
-        provision_image(image)?;
-    }
+    ensure_free_space(4, "create a VM")
+}
+
+/// Reserve a new instance of `image`: a free slot and its name under `creation_lock`, which
+/// is released before this returns (image builds hold their image lock before reserving a
+/// scratch slot, so a caller must not hold creation_lock while taking an image lock), then
+/// its size and offline flag. Returns it with its own lock, to hold through the first boot.
+fn reserve(
+    image: &Image,
+    name: Option<&str>,
+    memory: Option<u32>,
+    cpus: Option<u32>,
+    offline: bool,
+) -> Result<(Instance, std::fs::File)> {
     let lock = crate::instance::creation_lock()?;
     let slot = Instance::free_slot()?;
+    let os = image.os;
     let name = match name {
         Some(n) => n.to_string(),
         None => (1..)
@@ -620,37 +650,221 @@ pub fn create(
     if crate::instance::instances_dir().join(&name).exists() {
         bail!("instance '{name}' exists");
     }
-    let (inst, _instance_lock) = Instance::create_locked(&name, image, slot)?;
-    // Image builds hold their image lock before reserving a scratch slot: don't retain
-    // creation_lock while taking that image lock below.
+    let (inst, instance_lock) = Instance::create_locked(&name, image, slot)?;
     drop(lock);
-    let made = inst
-        .set_size(memory, cpus)
-        .and_then(|()| {
-            if offline {
-                std::fs::write(inst.dir.join("offline"), "")?;
-            }
-            Ok(())
-        })
-        .and_then(|()| clone_image_disk(&inst))
-        // Before the first boot, so a VM that never becomes ready is still its owner's: a
-        // retried create_vm boots it again, and the owner's exit stops it.
-        .and_then(|()| owner.map_or(Ok(()), |o| set_owner(&inst, o)));
-    if let Err(e) = made {
-        let _ = std::fs::remove_dir_all(&inst.dir);
-        return Err(e);
+    fill_or_discard(&inst, || {
+        inst.set_size(memory, cpus)?;
+        if offline {
+            std::fs::write(inst.dir.join("offline"), "")?;
+        }
+        Ok(())
+    })?;
+    Ok((inst, instance_lock))
+}
+
+/// A create whose VM was made but didn't become ready: the VM stays.
+fn not_ready(e: anyhow::Error, inst: &Instance) -> anyhow::Error {
+    let from = created_from(inst).map_or_else(String::new, |f| format!(" and from_checkpoint {f}"));
+    anyhow::anyhow!(
+        "{e:#}\nThe VM '{}' was created but didn't become ready (read_vm_log, or {}, shows why). \
+         Starting it again retries, as does create_vm with the same name{from} from the same \
+         session; deleting it starts over.",
+        inst.name,
+        inst.dir.join("qemu.log").display()
+    )
+}
+
+/// Instance file recording the checkpoint a VM was made from (`<vm>/<label>`).
+const FROM_CHECKPOINT: &str = "from_checkpoint";
+/// Instance file present while the job records a VM's disk came with may still be in its
+/// guest. Every boot (`boot`) retries their deletion until it succeeds; a fresh disk
+/// (`clone_disk`) removes it. `restore` does not run the cleanup (a later boot does), and a
+/// checkpoint of the VM taken while it is pending keeps those records.
+const RECORDS_PENDING: &str = "records-pending";
+/// How long the guest gets to delete its job records, all attempts together.
+const RECORDS_LIMIT: Duration = Duration::from_secs(60);
+/// Attempts at the cleanup when the guest answers without confirming it: a Windows guest just
+/// booted cold may not have its Task Scheduler answering yet, and its script then fails closed.
+const RECORDS_ATTEMPTS: u32 = 4;
+/// The pause between those attempts.
+const RECORDS_RETRY_PAUSE: Duration = Duration::from_secs(3);
+
+/// A new VM whose disk and firmware vars are APFS clones of checkpoint `from`. The checkpoint's
+/// memory is never used: the VM boots cold, so its size is free, and offline, size and owner
+/// come from this call. It depends on the image only: deleting the source VM or the
+/// checkpoint later doesn't affect it. Its guest's agentpc job records (which came with the
+/// disk) are deleted before this returns. Errors before any work start with
+/// `invalid_checkpoint_ref` (from `CheckpointRef::parse`), `no_such_vm`, `no_such_checkpoint`
+/// or `image_mismatch`.
+pub fn create_from_checkpoint(
+    from: &CheckpointRef,
+    want_image: Option<&str>,
+    name: Option<&str>,
+    memory: Option<u32>,
+    cpus: Option<u32>,
+    offline: bool,
+    owner: Option<&str>,
+) -> Result<String> {
+    Instance::check_size(memory, cpus)?;
+    let source = Instance::load(&from.vm).map_err(|_| {
+        anyhow::anyhow!(
+            "no_such_vm: no VM '{}' to take checkpoint {from} from (see list_vms)",
+            from.vm
+        )
+    })?;
+    let cp = validate_source(&source, &from.label, want_image)?;
+    precheck(source.os, name, memory)?;
+    let (inst, _instance_lock) = reserve(&source.image, name, memory, cpus, offline)?;
+    fill_or_discard(&inst, || {
+        copy_checkpoint_locked(
+            &source.lock_path(),
+            &crate::instance::image_lock_path(&inst.image),
+            || source.dir.is_dir(),
+            || clone_checkpoint_files(&cp, &inst),
+        )?;
+        record_checkpoint_origin(&inst, from)?;
+        // Before the first boot, as in `create`.
+        owner.map_or(Ok(()), |o| set_owner(&inst, o))
+    })?;
+    log!(
+        "{}: made from checkpoint {from}; booting it fresh",
+        inst.name
+    );
+    let ready = boot_locked(&inst).map_err(|e| not_ready(e, &inst))?;
+    clear_pending_records(&inst)?;
+    let note = crate::image::outdated(&inst.image)
+        .map(|h| format!("\n  note: the {} image: {h}", inst.image))
+        .unwrap_or_default();
+    Ok(ready + &from_note(&inst) + &note)
+}
+
+/// Record that `inst` was made from checkpoint `from`, and that the job records its disk came
+/// with are still to be deleted.
+fn record_checkpoint_origin(inst: &Instance, from: &CheckpointRef) -> Result<()> {
+    std::fs::write(inst.dir.join(FROM_CHECKPOINT), from.to_string())?;
+    std::fs::write(inst.dir.join(RECORDS_PENDING), "")?;
+    Ok(())
+}
+
+/// For a fresh image disk (`clone_disk`, so reset_vm): a clean install did not come from a
+/// checkpoint, and has no records from one to delete.
+fn forget_checkpoint_origin(inst: &Instance) {
+    let _ = std::fs::remove_file(inst.dir.join(FROM_CHECKPOINT));
+    let _ = std::fs::remove_file(inst.dir.join(RECORDS_PENDING));
+}
+
+/// The checkpoint `inst` was made from, if any.
+pub fn created_from(inst: &Instance) -> Option<CheckpointRef> {
+    crate::instance::read_trimmed(&inst.dir.join(FROM_CHECKPOINT))
+        .ok()
+        .and_then(|s| CheckpointRef::parse(&s).ok())
+}
+
+/// The reply line saying where a checkpoint-made VM came from; empty for others.
+fn from_note(inst: &Instance) -> String {
+    created_from(inst).map_or_else(String::new, |f| {
+        format!(
+            "\n  from checkpoint {f}: booted fresh; its memory, port forwards and job records \
+             were not carried over"
+        )
+    })
+}
+
+/// `boot` for create_vm's same-session retry: the VM, plus where it came from.
+pub fn boot_created(inst: &Instance) -> Result<String> {
+    boot(inst).map(|s| s + &from_note(inst))
+}
+
+/// Delete the job records a checkpoint-made VM's disk came with, if not done yet. A VM
+/// without the marker (any VM made from an image) is never sent anything.
+fn clear_pending_records(inst: &Instance) -> Result<()> {
+    let marker = inst.dir.join(RECORDS_PENDING);
+    if !marker.exists() {
+        return Ok(());
     }
-    let note = crate::image::outdated(image).map(|h| format!("\n  note: the {image} image: {h}"));
-    boot_locked(&inst)
-        .map(|s| s + &note.unwrap_or_default())
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "{e:#}\nThe VM '{name}' was created but didn't become ready (read_vm_log, or \
-             {}, shows why). Starting it again retries, as does create_vm with the same name \
-             from the same session; deleting it starts over.",
-                inst.dir.join("qemu.log").display()
-            )
-        })
+    let from = created_from(inst)
+        .map_or_else(|| "a checkpoint".to_string(), |f| format!("checkpoint {f}"));
+    log!("{}: deleting the job records copied from {from}", inst.name);
+    clear_job_records(inst).map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#}\nThe VM '{}' was made from {from} and is running, but agentpc could not \
+             delete the job records it copied from there, so list_jobs and get_job_status may \
+             still show the source's jobs. Starting it again (start_vm, or create_vm with the \
+             same name and from_checkpoint from the same session) retries; delete_vm removes it.",
+            inst.name
+        )
+    })?;
+    std::fs::remove_file(&marker).with_context(|| {
+        format!(
+            "the job records copied from {from} were deleted, but agentpc could not remove its \
+             marker {} (the next start of '{}' deletes them again, harmlessly)",
+            marker.display(),
+            inst.name
+        )
+    })
+}
+
+/// Run the guest's job-record cleanup (crate::guest) over SSH, within RECORDS_LIMIT. An
+/// answer without the confirmation is retried a few times (RECORDS_ATTEMPTS), since the
+/// script fails closed while a cold-booted guest's services are still starting; no answer at
+/// all is not.
+fn clear_job_records(inst: &Instance) -> Result<()> {
+    let cmd = match inst.os {
+        Os::Windows => windows_command(crate::guest::WINDOWS_CLEAR_RECORDS),
+        Os::Ubuntu | Os::Arch => crate::guest::LINUX_CLEAR_RECORDS.to_string(),
+    };
+    let deadline = Instant::now() + RECORDS_LIMIT;
+    let mut attempt = 1;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Some(out) = ssh_within(inst, &cmd, left) else {
+            // An earlier attempt was answered: the guest is up but never confirmed.
+            if attempt > 1 {
+                bail!(
+                    "the guest did not confirm that its job records were deleted (after {attempt} \
+                     attempts within {} s; the last got no answer)",
+                    RECORDS_LIMIT.as_secs()
+                );
+            }
+            bail!(
+                "the guest did not answer within {} s",
+                RECORDS_LIMIT.as_secs()
+            );
+        };
+        match records_cleared(&out) {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if attempt >= RECORDS_ATTEMPTS
+                    || deadline.saturating_duration_since(Instant::now())
+                        <= RECORDS_RETRY_PAUSE =>
+            {
+                return Err(e.context(format!("after {attempt} attempts")));
+            }
+            Err(e) => {
+                log!(
+                    "{}: job-record cleanup not confirmed ({e:#}); retrying",
+                    inst.name
+                );
+                std::thread::sleep(RECORDS_RETRY_PAUSE);
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Cleared only on exit 0 with the script's own CLEARED line (a login banner may precede it,
+/// and Windows PowerShell may start its output with a UTF-8 byte-order mark).
+fn records_cleared(out: &Output) -> Result<()> {
+    let said = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| l.trim_start_matches('\u{feff}').trim() == crate::guest::CLEARED);
+    if out.status.success() && said {
+        return Ok(());
+    }
+    bail!(
+        "the guest did not confirm that its job records were deleted ({})",
+        out.status
+    )
 }
 
 /// `clone_disk` under the image lock, so a build, pull or snapshot can't replace the files
@@ -718,10 +932,13 @@ pub(crate) fn fetch_image_locked(image: &Image) -> Result<()> {
     Ok(())
 }
 
-/// Start a stopped instance and wait until it's usable.
+/// Start a stopped instance and wait until it's usable. A VM made from a checkpoint whose
+/// job-record cleanup hasn't succeeded yet gets it now.
 pub fn boot(inst: &Instance) -> Result<String> {
     let _lock = inst.lock()?;
-    boot_locked(inst)
+    let ready = boot_locked(inst)?;
+    clear_pending_records(inst)?;
+    Ok(ready)
 }
 
 /// `boot`, for a caller already holding this instance's lock (reset).
@@ -788,7 +1005,9 @@ fn set_fex_memory_model(inst: &Instance) {
     }
 }
 
-fn checkpoint_dir(inst: &Instance, label: &str) -> Result<PathBuf> {
+/// A checkpoint label: letters, digits, `.` `-` `_`, not starting with a dot (in-progress
+/// `.partial-*` siblings do).
+fn check_label(label: &str) -> Result<()> {
     if label.is_empty()
         || label.starts_with('.')
         || !label
@@ -797,7 +1016,174 @@ fn checkpoint_dir(inst: &Instance, label: &str) -> Result<PathBuf> {
     {
         bail!("invalid checkpoint label '{label}' (letters, digits, . - _)");
     }
+    Ok(())
+}
+
+fn checkpoint_dir(inst: &Instance, label: &str) -> Result<PathBuf> {
+    check_label(label)?;
     Ok(inst.dir.join("checkpoints").join(label))
+}
+
+/// A checkpoint of a VM, `<vm>/<label>`: what create_vm's from_checkpoint names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointRef {
+    pub vm: String,
+    pub label: String,
+}
+
+impl CheckpointRef {
+    /// `<vm>/<label>`, each part valid by the rules for VM names and checkpoint labels. Errors
+    /// start with `invalid_checkpoint_ref`.
+    pub fn parse(s: &str) -> Result<Self> {
+        let bad = || {
+            anyhow::anyhow!(
+                "invalid_checkpoint_ref: '{s}' is not <vm>/<label> (a VM name, then one of its \
+                 checkpoint labels)"
+            )
+        };
+        let (vm, label) = s.split_once('/').ok_or_else(bad)?;
+        if label.contains('/') {
+            return Err(bad());
+        }
+        check_name(vm).map_err(|e| anyhow::anyhow!("invalid_checkpoint_ref: {e:#}"))?;
+        check_label(label).map_err(|e| anyhow::anyhow!("invalid_checkpoint_ref: {e:#}"))?;
+        Ok(Self {
+            vm: vm.to_string(),
+            label: label.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for CheckpointRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.vm, self.label)
+    }
+}
+
+/// The directory of `source`'s checkpoint `label`, checked before any work: it holds both
+/// disk.qcow2 and vars.fd, and `want_image` (create_vm's os/version, when given) is the
+/// source's image.
+fn validate_source(source: &Instance, label: &str, want_image: Option<&str>) -> Result<PathBuf> {
+    let dir = checkpoint_dir(source, label)?;
+    if !(dir.join("disk.qcow2").is_file() && dir.join("vars.fd").is_file()) {
+        // Only complete ones: the label just refused may have a disk without its vars.
+        let have: Vec<String> = checkpoints(source)
+            .into_iter()
+            .filter(|l| {
+                source
+                    .dir
+                    .join("checkpoints")
+                    .join(l)
+                    .join("vars.fd")
+                    .is_file()
+            })
+            .collect();
+        bail!(
+            "no_such_checkpoint: {} has no checkpoint '{label}' ({})",
+            source.name,
+            if have.is_empty() {
+                "it has none".to_string()
+            } else {
+                format!("it has: {}", have.join(", "))
+            }
+        );
+    }
+    if let Some(want) = want_image
+        && !Image::resolve(want).is_ok_and(|i| i == source.image)
+    {
+        bail!(
+            "image_mismatch: checkpoint {}/{label} is of {}, not {want}; omit os and version, or \
+             give the source's",
+            source.name,
+            source.image
+        );
+    }
+    Ok(dir)
+}
+
+/// The backing file a qcow2 disk records (relative to the disk's directory), or None for a
+/// standalone disk.
+fn qcow2_backing(path: &Path) -> Result<Option<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut h = [0u8; 20];
+    f.read_exact(&mut h)
+        .with_context(|| format!("read the qcow2 header of {}", path.display()))?;
+    if &h[0..4] != b"QFI\xfb" {
+        bail!("{} is not a qcow2 disk", path.display());
+    }
+    let offset = u64::from_be_bytes(h[8..16].try_into()?);
+    let size = u32::from_be_bytes(h[16..20].try_into()?);
+    if offset == 0 || size == 0 {
+        return Ok(None);
+    }
+    if size > 1023 {
+        bail!("{} names a backing file of {size} bytes", path.display());
+    }
+    let mut name = vec![0u8; size as usize];
+    f.seek(SeekFrom::Start(offset))
+        .and_then(|_| f.read_exact(&mut name))
+        .with_context(|| format!("read the backing file name of {}", path.display()))?;
+    Ok(Some(
+        String::from_utf8(name).context("the backing file name is not UTF-8")?,
+    ))
+}
+
+/// Clone checkpoint `cp`'s disk and firmware vars into a new instance (`fs::copy` is an APFS
+/// clone here), owner-writable. The disk keeps its relative backing path
+/// (`../../images/<base>`), which resolves from the instance directory; that is checked. No
+/// resume marker: a VM made from a checkpoint always boots cold.
+fn clone_checkpoint_files(cp: &Path, inst: &Instance) -> Result<()> {
+    let (disk, vars) = (cp.join("disk.qcow2"), cp.join("vars.fd"));
+    if !(disk.is_file() && vars.is_file()) {
+        bail!("no_such_checkpoint: the checkpoint was deleted before it could be copied");
+    }
+    let _ = std::fs::remove_file(inst.resume_marker());
+    let _ = std::fs::remove_file(inst.dir.join("tz"));
+    std::fs::copy(&disk, inst.disk()).context("copy the checkpoint's disk")?;
+    set_writable(&inst.disk())?;
+    std::fs::copy(&vars, inst.vars()).context("copy the checkpoint's firmware vars")?;
+    set_writable(&inst.vars())?;
+    if let Some(backing) = qcow2_backing(&inst.disk())?
+        && !inst.dir.join(&backing).is_file()
+    {
+        bail!("the checkpoint's disk is backed by {backing}, which is missing");
+    }
+    std::fs::write(inst.dir.join("base"), "checkpoint")?;
+    Ok(())
+}
+
+/// Run `copy` holding the source VM's lock (so checkpoint_vm replacing that label, or
+/// delete_checkpoint, can't hand over a half-written pair), then the image lock (as
+/// `clone_image_disk` takes it, so a build, pull or snapshot can't replace the backing files
+/// mid-copy). The order matches reset's (instance lock, then image lock); builds take the
+/// image lock and then creation_lock, which this never takes.
+fn copy_checkpoint_locked(
+    source_lock: &Path,
+    image_lock: &Path,
+    source_exists: impl FnOnce() -> bool,
+    copy: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let _source = crate::instance::lock(
+        source_lock,
+        Some("waiting for another operation on the source VM to finish"),
+    )?;
+    if !source_exists() {
+        bail!("no_such_vm: the source VM was deleted before its checkpoint could be copied");
+    }
+    let _image = crate::instance::lock(
+        image_lock,
+        Some("waiting for another build or download of this image to finish"),
+    )?;
+    copy()
+}
+
+/// Run `fill` on a just-reserved instance; if it fails, remove the instance's directory so
+/// nothing half-made remains.
+fn fill_or_discard(inst: &Instance, fill: impl FnOnce() -> Result<()>) -> Result<()> {
+    fill().inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&inst.dir);
+    })
 }
 
 /// Checkpoint labels of an instance, oldest first.
@@ -822,15 +1208,82 @@ pub fn checkpoints(inst: &Instance) -> Vec<String> {
     found.into_iter().map(|(_, n)| n).collect()
 }
 
+/// How long checkpoint_vm waits for a running guest to write its pending data before pausing it.
+const FLUSH_LIMIT: Duration = Duration::from_secs(10);
+
+/// Whether checkpoint_vm got the guest's pending writes onto its disk first.
+#[derive(Debug, PartialEq)]
+enum Flush {
+    /// The VM was stopped: nothing to flush, and the guest is not touched.
+    Stopped,
+    Flushed,
+    /// It failed or timed out (why); the checkpoint is still taken.
+    NotFlushed(String),
+}
+
+/// Flush only a running VM, and never fail on it.
+fn flush_step(running: bool, flush: impl FnOnce() -> Result<()>) -> Flush {
+    if !running {
+        return Flush::Stopped;
+    }
+    match flush() {
+        Ok(()) => Flush::Flushed,
+        Err(e) => Flush::NotFlushed(format!("{e:#}")),
+    }
+}
+
+fn flush_command(os: Os) -> String {
+    match os {
+        Os::Ubuntu | Os::Arch => crate::guest::LINUX_FLUSH.to_string(),
+        Os::Windows => windows_command(crate::guest::WINDOWS_FLUSH),
+    }
+}
+
+/// Ask the guest over SSH to write its pending data to disk, within FLUSH_LIMIT.
+fn flush_guest(inst: &Instance) -> Result<()> {
+    let out = ssh_within(inst, &flush_command(inst.os), FLUSH_LIMIT).with_context(|| {
+        format!(
+            "the guest did not finish within {} s",
+            FLUSH_LIMIT.as_secs()
+        )
+    })?;
+    if !out.status.success() {
+        bail!("the guest's flush failed ({})", out.status);
+    }
+    Ok(())
+}
+
+fn checkpoint_saved_text(label: &str, name: &str, kind: &str, flush: &Flush) -> String {
+    let saved = format!("checkpoint {label} of {name} saved ({kind})");
+    match flush {
+        Flush::NotFlushed(why) => format!(
+            "{saved}; not flushed: {why}. The guest's latest writes may be missing from its disk, \
+             so a VM made from this checkpoint with create_vm(from_checkpoint) could lack them; \
+             restore_vm is unaffected (it resumes the saved memory)."
+        ),
+        Flush::Stopped | Flush::Flushed => saved,
+    }
+}
+
 /// Save the instance's disk and, if it's running, its RAM under `label` (replacing an
-/// older checkpoint of that name). A running VM pauses for a few seconds and carries on.
-/// Disk copies are APFS clones, so they take no space until the VM writes more.
+/// older checkpoint of that name). A running VM first writes its pending data to disk (bounded
+/// by FLUSH_LIMIT; a failure is reported, not fatal), then pauses for a few seconds and carries
+/// on. Disk copies are APFS clones, so they take no space until the VM writes more.
 pub fn checkpoint(inst: &Instance, label: &str) -> Result<String> {
     let _lock = inst.lock()?;
     let dir = checkpoint_dir(inst, label)?;
     // A checkpoint clones the disk and, for a running VM, writes a RAM-sized state file.
     let (mem_gb, _) = inst.size();
     ensure_free_space(u64::from(mem_gb) + 2, "checkpoint")?;
+    // Before the pause: a VM made from this checkpoint (create_vm from_checkpoint) boots cold
+    // from its disk, which then has to hold what the guest still kept in its page cache.
+    let flush = flush_step(inst.running(), || flush_guest(inst));
+    if let Flush::NotFlushed(why) = &flush {
+        log!(
+            "{}: the guest did not flush its writes ({why}); checkpointing anyway",
+            inst.name
+        );
+    }
     // Sibling that can't be a valid label (labels never start with a dot), so `v1` and
     // `v1.2` get distinct temps — `with_extension("partial")` would collide them.
     let tmp = inst
@@ -860,10 +1313,7 @@ pub fn checkpoint(inst: &Instance, label: &str) -> Result<String> {
     } else {
         "disk"
     };
-    Ok(format!(
-        "checkpoint {label} of {} saved ({kind})",
-        inst.name
-    ))
+    Ok(checkpoint_saved_text(label, &inst.name, kind, &flush))
 }
 
 /// Put the instance back exactly as it was at checkpoint `label` and start it: it resumes
@@ -1434,17 +1884,98 @@ unsafe extern "C" {
 mod tests {
     use super::*;
 
+    #[test]
+    fn checkpoint_flushes_only_a_running_guest_and_never_fails_on_it() {
+        let mut called = false;
+        assert_eq!(
+            flush_step(false, || {
+                called = true;
+                Ok(())
+            }),
+            Flush::Stopped
+        );
+        assert!(!called, "a stopped VM is not touched");
+        assert_eq!(flush_step(true, || Ok(())), Flush::Flushed);
+        assert_eq!(
+            flush_step(true, || Err(anyhow::anyhow!(
+                "the guest did not finish within 10 s"
+            ))),
+            Flush::NotFlushed("the guest did not finish within 10 s".into())
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_that_was_not_flushed_says_so() {
+        assert_eq!(
+            checkpoint_saved_text("v1", "vm", "disk and memory", &Flush::Flushed),
+            "checkpoint v1 of vm saved (disk and memory)"
+        );
+        assert_eq!(
+            checkpoint_saved_text("v1", "vm", "disk", &Flush::Stopped),
+            "checkpoint v1 of vm saved (disk)"
+        );
+        let t = checkpoint_saved_text(
+            "v1",
+            "vm",
+            "disk and memory",
+            &Flush::NotFlushed("timed out".into()),
+        );
+        assert!(
+            t.starts_with("checkpoint v1 of vm saved (disk and memory); not flushed: timed out"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn the_flush_command_matches_the_guest() {
+        assert_eq!(flush_command(Os::Ubuntu), "sync");
+        assert_eq!(flush_command(Os::Arch), "sync");
+        assert_eq!(
+            flush_command(Os::Windows),
+            windows_command(crate::guest::WINDOWS_FLUSH)
+        );
+        assert_eq!(FLUSH_LIMIT, Duration::from_secs(10));
+    }
+
+    /// A fresh directory under the system temp dir. The counter keeps roots apart within a
+    /// process (the clock alone ticks once per microsecond on macOS, so parallel tests collided);
+    /// the time keeps them apart across runs that reuse a pid.
     fn shutdown_fixture() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "agentpc-shutdown-test-{}-{unique}",
+            "agentpc-shutdown-test-{}-{unique}-{n}",
             std::process::id()
         ));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// Parallel tests each get their own root, even ones that start in the same clock tick.
+    #[test]
+    fn fixture_roots_are_unique_within_a_process() {
+        let start = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let roots: Vec<PathBuf> = (0..16)
+            .map(|_| {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    shutdown_fixture()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        let distinct: std::collections::HashSet<&PathBuf> = roots.iter().collect();
+        for r in &roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+        assert_eq!(distinct.len(), roots.len(), "fixture roots collide");
     }
 
     #[test]
@@ -1583,5 +2114,403 @@ mod tests {
         ] {
             assert!(check_name(bad).is_err(), "{bad}");
         }
+    }
+
+    /// A qcow2 header (version 3) recording `backing` as its backing file, as qemu-img writes it.
+    fn fake_qcow2(path: &Path, backing: Option<&str>) {
+        let mut h = vec![0u8; 512];
+        h[0..4].copy_from_slice(b"QFI\xfb");
+        h[4..8].copy_from_slice(&3u32.to_be_bytes());
+        if let Some(b) = backing {
+            h[8..16].copy_from_slice(&512u64.to_be_bytes());
+            h[16..20].copy_from_slice(&(b.len() as u32).to_be_bytes());
+            h.extend_from_slice(b.as_bytes());
+        }
+        std::fs::write(path, h).unwrap();
+    }
+
+    /// `<root>/images/ubuntu-24.04.qcow2`, source VM `src` with checkpoint `clean` (a disk backed
+    /// by `../../images/ubuntu-24.04.qcow2` and read-only vars, as image files are) and a new,
+    /// empty instance `new`, laid out as under $AGENTPC_HOME. Returns (root, source, new, cp).
+    fn checkpoint_fixture() -> (PathBuf, Instance, Instance, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = shutdown_fixture();
+        std::fs::create_dir_all(root.join("images")).unwrap();
+        std::fs::write(root.join("images/ubuntu-24.04.qcow2"), b"base").unwrap();
+        let cp = root.join("instances/src/checkpoints/clean");
+        std::fs::create_dir_all(&cp).unwrap();
+        fake_qcow2(
+            &cp.join("disk.qcow2"),
+            Some("../../images/ubuntu-24.04.qcow2"),
+        );
+        std::fs::write(cp.join("vars.fd"), b"vars").unwrap();
+        std::fs::set_permissions(cp.join("vars.fd"), std::fs::Permissions::from_mode(0o444))
+            .unwrap();
+        let image: Image = "ubuntu".parse().unwrap();
+        let at = |name: &str, slot| Instance {
+            name: name.into(),
+            os: Os::Ubuntu,
+            image: image.clone(),
+            slot,
+            dir: root.join("instances").join(name),
+        };
+        let (source, new) = (at("src", 8), at("new", 9));
+        std::fs::create_dir_all(&new.dir).unwrap();
+        (root, source, new, cp)
+    }
+
+    #[test]
+    fn checkpoint_refs_are_a_vm_and_a_label() {
+        let r = CheckpointRef::parse("my.vm_2/v1.2").unwrap();
+        assert_eq!((r.vm.as_str(), r.label.as_str()), ("my.vm_2", "v1.2"));
+        assert_eq!(r.to_string(), "my.vm_2/v1.2");
+        for bad in [
+            "",
+            "src",
+            "src/",
+            "/clean",
+            "a/b/c",
+            "_build/clean",
+            ".hidden/clean",
+            "src/.partial-x",
+            "src/has space",
+            "../x/clean",
+            &format!("{}/clean", "x".repeat(65)),
+        ] {
+            let e = CheckpointRef::parse(bad).unwrap_err();
+            assert!(
+                format!("{e:#}").starts_with("invalid_checkpoint_ref"),
+                "{bad}: {e:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn labels_follow_the_checkpoint_rules() {
+        for ok in ["clean", "deps-installed", "v1.2", "a_b"] {
+            assert!(check_label(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", ".x", "a/b", "a b", "ü"] {
+            assert!(check_label(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_source_checkpoint_and_image_are_checked_before_any_work() {
+        let (root, source, _new, cp) = checkpoint_fixture();
+        assert_eq!(validate_source(&source, "clean", None).unwrap(), cp);
+        assert_eq!(
+            validate_source(&source, "clean", Some("ubuntu")).unwrap(),
+            cp
+        );
+        assert_eq!(
+            validate_source(&source, "clean", Some("ubuntu-24.04")).unwrap(),
+            cp
+        );
+        let e = format!(
+            "{:#}",
+            validate_source(&source, "absent", None).unwrap_err()
+        );
+        assert!(
+            e.starts_with("no_such_checkpoint") && e.contains("clean"),
+            "{e}"
+        );
+        // A disk without its vars is no checkpoint to copy.
+        let half = source.dir.join("checkpoints/half");
+        std::fs::create_dir_all(&half).unwrap();
+        fake_qcow2(&half.join("disk.qcow2"), None);
+        let e = format!("{:#}", validate_source(&source, "half", None).unwrap_err());
+        assert!(e.starts_with("no_such_checkpoint"), "{e}");
+        assert!(
+            e.contains("it has: clean)"),
+            "only complete checkpoints are offered: {e}"
+        );
+        for other in ["ubuntu-22.04", "windows-11-24h2", "arch", "nonsense!!"] {
+            let e = format!(
+                "{:#}",
+                validate_source(&source, "clean", Some(other)).unwrap_err()
+            );
+            assert!(e.starts_with("image_mismatch"), "{other}: {e}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_a_qcow2_backing_file_name() {
+        let root = shutdown_fixture();
+        fake_qcow2(&root.join("a.qcow2"), Some("../../images/x.qcow2"));
+        fake_qcow2(&root.join("b.qcow2"), None);
+        std::fs::write(root.join("c.raw"), vec![0u8; 64]).unwrap();
+        assert_eq!(
+            qcow2_backing(&root.join("a.qcow2")).unwrap().as_deref(),
+            Some("../../images/x.qcow2")
+        );
+        assert_eq!(qcow2_backing(&root.join("b.qcow2")).unwrap(), None);
+        assert!(qcow2_backing(&root.join("c.raw")).is_err());
+        // A backing name past the end of a truncated disk is refused with a reason.
+        let mut cut = std::fs::read(root.join("a.qcow2")).unwrap();
+        cut.truncate(512);
+        std::fs::write(root.join("d.qcow2"), cut).unwrap();
+        let e = format!("{:#}", qcow2_backing(&root.join("d.qcow2")).unwrap_err());
+        assert!(e.contains("read the backing file name of"), "{e}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clones_a_checkpoint_into_a_new_instance_that_boots_cold() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (root, _source, new, cp) = checkpoint_fixture();
+        // Left by nothing in practice; a cold boot must not find them.
+        std::fs::write(new.resume_marker(), "").unwrap();
+        std::fs::write(new.dir.join("tz"), "Europe/Berlin").unwrap();
+        clone_checkpoint_files(&cp, &new).unwrap();
+        assert_eq!(
+            std::fs::read(new.disk()).unwrap(),
+            std::fs::read(cp.join("disk.qcow2")).unwrap()
+        );
+        assert_eq!(std::fs::read(new.vars()).unwrap(), b"vars");
+        for f in [new.disk(), new.vars()] {
+            let mode = std::fs::metadata(&f).unwrap().permissions().mode();
+            assert!(mode & 0o200 != 0, "{} writable", f.display());
+        }
+        assert_ne!(
+            std::fs::metadata(new.disk()).unwrap().ino(),
+            std::fs::metadata(cp.join("disk.qcow2")).unwrap().ino(),
+            "a copy, not the checkpoint's own file"
+        );
+        let backing = qcow2_backing(&new.disk()).unwrap().unwrap();
+        assert!(new.dir.join(&backing).is_file(), "{backing} resolves");
+        assert!(!new.resume_marker().exists());
+        assert!(!new.dir.join("tz").exists());
+        assert_eq!(
+            std::fs::read_to_string(new.dir.join("base")).unwrap(),
+            "checkpoint"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_checkpoint_whose_backing_file_is_gone_is_refused() {
+        let (root, _source, new, cp) = checkpoint_fixture();
+        std::fs::remove_file(root.join("images/ubuntu-24.04.qcow2")).unwrap();
+        let e = format!("{:#}", clone_checkpoint_files(&cp, &new).unwrap_err());
+        assert!(e.contains("missing"), "{e}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_vanished_checkpoint_leaves_no_half_made_instance() {
+        let (root, _source, new, cp) = checkpoint_fixture();
+        std::fs::remove_dir_all(&cp).unwrap();
+        let e = fill_or_discard(&new, || clone_checkpoint_files(&cp, &new)).unwrap_err();
+        assert!(format!("{e:#}").starts_with("no_such_checkpoint"), "{e:#}");
+        assert!(!new.dir.exists(), "the new instance directory is removed");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_successful_fill_keeps_the_instance() {
+        let (root, _source, new, _cp) = checkpoint_fixture();
+        fill_or_discard(&new, || Ok(())).unwrap();
+        assert!(new.dir.is_dir());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_checkpoint_copy_holds_the_source_lock_then_the_image_lock() {
+        use crate::instance::try_lock;
+        let root = shutdown_fixture();
+        let (src, img) = (root.join("src.lock"), root.join("img.lock"));
+        copy_checkpoint_locked(
+            &src,
+            &img,
+            || {
+                assert!(try_lock(&src).is_none(), "the source lock is taken first");
+                assert!(
+                    try_lock(&img).is_some(),
+                    "the image lock only after the source check"
+                );
+                true
+            },
+            || {
+                assert!(try_lock(&src).is_none() && try_lock(&img).is_none());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(
+            try_lock(&src).is_some() && try_lock(&img).is_some(),
+            "both released"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_source_deleted_while_waiting_is_not_copied() {
+        let root = shutdown_fixture();
+        let e = copy_checkpoint_locked(
+            &root.join("src.lock"),
+            &root.join("img.lock"),
+            || false,
+            || panic!("must not copy from a deleted VM"),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").starts_with("no_such_vm"), "{e:#}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// reset_vm takes the instance lock, then the image lock; the copy takes the same order, so
+    /// a reset of the source and a create from its checkpoint can't deadlock.
+    #[test]
+    fn the_checkpoint_copy_and_a_reset_of_the_source_never_deadlock() {
+        use std::sync::mpsc;
+        let root = shutdown_fixture();
+        let (src, img) = (root.join("src.lock"), root.join("img.lock"));
+        let (done, finished) = mpsc::channel();
+        let (s, i, d) = (src.clone(), img.clone(), done.clone());
+        let reset = std::thread::spawn(move || {
+            for _ in 0..50 {
+                let _a = crate::instance::lock(&s, None).unwrap();
+                let _b = crate::instance::lock(&i, None).unwrap();
+            }
+            d.send(()).unwrap();
+        });
+        let (s, i) = (src.clone(), img.clone());
+        let copy = std::thread::spawn(move || {
+            for _ in 0..50 {
+                copy_checkpoint_locked(&s, &i, || true, || Ok(())).unwrap();
+            }
+            done.send(()).unwrap();
+        });
+        for _ in 0..2 {
+            finished
+                .recv_timeout(Duration::from_secs(10))
+                .expect("deadlock: lock order differs from reset's");
+        }
+        reset.join().unwrap();
+        copy.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn output(code: i32, stdout: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn job_records_count_as_cleared_only_when_the_guest_says_so() {
+        assert!(records_cleared(&output(0, "AGENTPC_CLEARED\n")).is_ok());
+        assert!(records_cleared(&output(0, "login banner\r\nAGENTPC_CLEARED\r\n")).is_ok());
+        assert!(records_cleared(&output(0, "")).is_err(), "no proof");
+        assert!(records_cleared(&output(1, "AGENTPC_CLEARED\n")).is_err());
+        assert!(records_cleared(&output(0, "not AGENTPC_CLEARED\n")).is_err());
+    }
+
+    #[test]
+    fn a_vm_without_pending_records_is_never_sent_the_cleanup() {
+        let (root, _source, new, _cp) = checkpoint_fixture();
+        // No marker: Ok at once, with no SSH to the (absent) guest.
+        clear_pending_records(&new).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_vm_records_the_checkpoint_it_was_made_from() {
+        let (root, _source, new, _cp) = checkpoint_fixture();
+        assert_eq!(created_from(&new), None);
+        assert_eq!(from_note(&new), "");
+        std::fs::write(new.dir.join(FROM_CHECKPOINT), "src/clean").unwrap();
+        assert_eq!(
+            created_from(&new),
+            Some(CheckpointRef::parse("src/clean").unwrap())
+        );
+        let note = from_note(&new);
+        assert!(
+            note.contains("from checkpoint src/clean") && note.contains("booted fresh"),
+            "{note}"
+        );
+        std::fs::write(new.dir.join(FROM_CHECKPOINT), "garbage").unwrap();
+        assert_eq!(created_from(&new), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Reads the instances directory (no VM by that name exists) and creates nothing.
+    #[test]
+    fn create_from_checkpoint_refuses_an_absent_source_before_any_work() {
+        let from = CheckpointRef::parse("agentpc-test-absent-source-7f3c/clean").unwrap();
+        let e = create_from_checkpoint(
+            &from,
+            None,
+            Some("agentpc-test-never-made-7f3c"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").starts_with("no_such_vm"), "{e:#}");
+        assert!(
+            !crate::instance::instances_dir()
+                .join("agentpc-test-never-made-7f3c")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn create_from_checkpoint_checks_the_size_first() {
+        let from = CheckpointRef::parse("agentpc-test-absent-source-7f3c/clean").unwrap();
+        let e = create_from_checkpoint(&from, None, None, Some(1), None, false, None).unwrap_err();
+        assert_eq!(format!("{e:#}"), "memory must be 2-64 GB");
+    }
+
+    #[test]
+    fn a_byte_order_mark_before_the_confirmation_is_ignored() {
+        // Windows PowerShell 5.1 may start its UTF-8 output with U+FEFF.
+        assert!(records_cleared(&output(0, "\u{feff}AGENTPC_CLEARED\r\n")).is_ok());
+        assert!(records_cleared(&output(0, "\u{feff}\r\n")).is_err());
+    }
+
+    /// The step that runs before the first boot records both the origin and the pending cleanup.
+    #[test]
+    fn a_vm_made_from_a_checkpoint_records_its_origin_and_pending_cleanup() {
+        let (root, _source, new, _cp) = checkpoint_fixture();
+        let from = CheckpointRef::parse("src/clean").unwrap();
+        record_checkpoint_origin(&new, &from).unwrap();
+        assert!(new.dir.join(RECORDS_PENDING).is_file());
+        assert_eq!(created_from(&new), Some(from));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// reset_vm (clone_disk) makes a clean image install: it no longer came from a checkpoint.
+    /// This tests the step clone_disk runs (calling clone_disk itself would spawn qemu-img,
+    /// whose fork briefly holds other tests' lock descriptors).
+    #[test]
+    fn a_fresh_image_disk_forgets_the_checkpoint_it_replaces() {
+        let (root, _source, new, _cp) = checkpoint_fixture();
+        record_checkpoint_origin(&new, &CheckpointRef::parse("src/clean").unwrap()).unwrap();
+        forget_checkpoint_origin(&new);
+        assert!(!new.dir.join(RECORDS_PENDING).exists());
+        assert!(!new.dir.join(FROM_CHECKPOINT).exists());
+        assert_eq!(created_from(&new), None);
+        assert_eq!(from_note(&new), "");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_a_checkpoint_made_vm_is_told_to_retry_with_from_checkpoint() {
+        let (root, _source, new, _cp) = checkpoint_fixture();
+        let e = format!("{:#}", not_ready(anyhow::anyhow!("boom"), &new));
+        assert!(
+            e.starts_with("boom") && !e.contains("from_checkpoint"),
+            "{e}"
+        );
+        std::fs::write(new.dir.join(FROM_CHECKPOINT), "src/clean").unwrap();
+        let e = format!("{:#}", not_ready(anyhow::anyhow!("boom"), &new));
+        assert!(e.contains("from_checkpoint src/clean"), "{e}");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
