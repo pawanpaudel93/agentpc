@@ -200,6 +200,12 @@ tool_timeout_sec = 900</code></pre>
                     This is a per-call action, not a saved setting; a browser-launch failure warns without failing creation.
                     A non-default size boots cold (~25 s Windows, ~15 s Ubuntu and Arch). Retrying with the same name and image in the same
                     session returns the VM it already made, booting it if it was stopped.
+                    <code translate="no">from_checkpoint</code> (<code translate="no">"&lt;vm&gt;/&lt;label&gt;"</code>) makes a new,
+                    independent VM from a checkpoint's disk instead: it boots cold, <code translate="no">os</code>/<code translate="no">version</code>
+                    may be omitted (if given, they must be the source's image), and the checkpoint's memory, port forwards,
+                    owner, <code translate="no">offline</code> and job records are not carried over. Errors before any work:
+                    <code translate="no">invalid_checkpoint_ref</code>, <code translate="no">no_such_vm</code>,
+                    <code translate="no">no_such_checkpoint</code>, <code translate="no">image_mismatch</code>.
                   </td>
                 </tr>
                 <tr>
@@ -225,7 +231,7 @@ tool_timeout_sec = 900</code></pre>
               <tbody>
                 <tr>
                   <td><code translate="no">checkpoint_vm</code></td>
-                  <td>Save a VM's disk and memory under a label (replacing an older one of that name) before a risky step. A running VM pauses for a few seconds.</td>
+                  <td>Save a VM's disk and memory under a label (replacing an older one of that name) before a risky step. A running VM's guest first writes its pending data to disk (at most ~10 s; otherwise the reply says "not flushed"), then pauses for a few seconds. New VMs can start from a checkpoint with <code translate="no">create_vm</code>'s <code translate="no">from_checkpoint</code>.</td>
                 </tr>
                 <tr>
                   <td><code translate="no">restore_vm</code></td>

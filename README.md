@@ -175,10 +175,10 @@ pick the server up automatically.
 | Tool | Description |
 | --- | --- |
 | `list_vms` | VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, `x86_tso`) and the available images with their OS versions |
-| `create_vm` | Create a VM (optionally of a given version, size, or offline) and wait until its desktop is ready. Retrying it with the same `name` and image in the same session returns the VM already created, booting it if it was stopped. `open_in_browser: true` opens its viewer in the Mac’s default browser after readiness (default false; per-call only). Browser-launch failure warns without failing creation |
+| `create_vm` | Create a VM (optionally of a given version, size, or offline) and wait until its desktop is ready. Retrying it with the same `name` and image in the same session returns the VM already created, booting it if it was stopped. `open_in_browser: true` opens its viewer in the Mac’s default browser after readiness (default false; per-call only). Browser-launch failure warns without failing creation. `from_checkpoint: "<vm>/<label>"` makes a new, independent VM from a checkpoint's disk instead: it boots cold, `os`/`version` may be omitted (if given, they must be the source's image), and the checkpoint's memory, port forwards, owner, `offline` and job records are not carried over. Errors before any work: `invalid_checkpoint_ref`, `no_such_vm`, `no_such_checkpoint`, `image_mismatch` |
 | `start_vm` / `stop_vm` | Boot a stopped VM / shut one down cleanly |
 | `reset_vm` | Discard all changes: back to a fresh copy of the image |
-| `checkpoint_vm` / `restore_vm` | Save a VM's disk and memory under a label; go back to it in seconds |
+| `checkpoint_vm` / `restore_vm` | Save a VM's disk and memory under a label; go back to it in seconds. A running VM's guest first writes its pending data to disk (at most ~10 s; otherwise the reply says "not flushed") |
 | `delete_checkpoint` | Delete one checkpoint by label; the VM is untouched |
 | `delete_vm` | Delete a VM with its disk and checkpoints |
 | `take_screenshot` | PNG screenshot from the hypervisor; `save_to` also writes it to a path on your Mac |
@@ -329,6 +329,7 @@ doing anything, and carry on past a failure (exit status 1 if any failed). Every
 | Command | Description |
 | --- | --- |
 | `agentpc create <image> [name] [--memory GB] [--cpus N] [--offline] [--open]` | Create a VM from `ubuntu`, `windows`, `arch` or a version such as `ubuntu-22.04`; fetches Ubuntu and Arch images if missing. A name is up to 64 letters, digits, `.` `-` `_`. `--memory` is 2–64 GB, `--cpus` 1–16 (default 4); a non-default size boots cold instead of resuming. `--offline`: no internet or access to this Mac. `--open` (alias `--open-in-browser`): open the ready VM’s viewer in the Mac’s default browser; off by default |
+| `agentpc create --from <vm>/<label> [--name NAME] [image] [--memory GB] [--cpus N] [--offline] [--open]` | Create a VM from a checkpoint of another VM (running or stopped): a copy of its disk and firmware vars, booted cold, so `--memory`/`--cpus` are free. An image, if given, must be the source's. Its memory, port forwards and agentpc job records are not carried over; deleting the source or the checkpoint later doesn't affect it (deleting the source VM deletes its checkpoints, so create first). MCP: `create_vm` with `from_checkpoint` |
 | `agentpc list [--json]` (`ls`) | VMs and images; `--json` gives the same data as the MCP `list_vms` tool |
 | `agentpc info <name>` | Viewer URL (with the VNC password), SSH and VNC details, checkpoints, and on x86apps VMs how x86 programs run (`x86 programs: FEX, hardware\|emulated TSO`) |
 | `agentpc start <name>… \| --all` | Boot stopped VMs |
@@ -488,6 +489,12 @@ The guest login is `agent` / `agent` for the desktop and `sudo`; SSH takes only 
   more). Restoring resumes from them like a new VM does. Each checkpoint of a running VM
   takes disk space about equal to the memory in use (3–4 GB for Windows); `agentpc checkpoint
   <name> <label> --delete` removes one, and deleting the VM removes all of them.
+- **VMs from a checkpoint.** `create --from <vm>/<label>` (MCP `from_checkpoint`) clones the
+  checkpoint's disk and firmware vars (APFS clones) into a new VM, under the source VM's lock
+  and the image lock, and boots it cold; the new disk is backed by the image only. Before it
+  returns, agentpc deletes its own job records in the guest (`~/agentpc-bg`; on Windows also its
+  `agentpc-bg-<id>` scheduled tasks), so `list_jobs` starts empty. A checkpoint of a running VM
+  first has the guest flush its writes, so the copied disk holds them.
 - **Snapshots stay local.** A memory snapshot depends on the Mac's chip and QEMU version, so
   only the disk is published; the snapshot is recaptured after each pull (about a minute). Each
   snapshot records the QEMU machine type, so it still resumes after a QEMU upgrade.

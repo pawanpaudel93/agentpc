@@ -158,7 +158,7 @@ def check():
     # source (so a typo here is caught) and in every document an agent or user reads.
     vocabulary = ["list_jobs", "wait_for_service", "request_cancelled", "cursor_stale",
                   "scan_truncated", "job_failed", "probe_unsupported", "status_matched",
-                  "timeout_seconds", "notifications/cancelled"]
+                  "timeout_seconds", "notifications/cancelled", "from_checkpoint"]
     source_text = "".join((ROOT / "src" / f).read_text() for f in ("mcp.rs", "jobs.rs", "readiness.rs", "execution.rs"))
     documents = {
         "AGENTS.md": (ROOT / "AGENTS.md").read_text(),
@@ -175,6 +175,7 @@ def check():
             require(term in text, f"{doc} must document {term}")
     require("list_jobs" in (SITE / "llms.txt").read_text() and "wait_for_service" in (SITE / "llms.txt").read_text(),
             "llms.txt must mention list_jobs and wait_for_service")
+    require("from_checkpoint" in (SITE / "llms.txt").read_text(), "llms.txt must mention from_checkpoint")
     if errors:
         for error in errors:
             print(f"FAIL: {error}")

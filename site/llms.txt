@@ -6,7 +6,7 @@ The VMs are ARM64. x64 Windows apps run through Prism; x86_64 and i386 Linux pro
 
 ## VM Creation and Viewing
 
-`create_vm` returns once the desktop is ready. A named create retried in the same session returns the same VM; use a unique name per task. `open_in_browser: true` opens the ready VM's viewer in the Mac's default browser, not a browser inside the guest. It defaults to false and is a per-call action, not a saved VM setting; a browser-launch failure warns without failing creation. Use it when the user asks to watch the VM. CLI equivalent: `agentpc create ubuntu --open` (alias `--open-in-browser`).
+`create_vm` returns once the desktop is ready. A named create retried in the same session returns the same VM; use a unique name per task. `open_in_browser: true` opens the ready VM's viewer in the Mac's default browser, not a browser inside the guest. It defaults to false and is a per-call action, not a saved VM setting; a browser-launch failure warns without failing creation. Use it when the user asks to watch the VM. CLI equivalent: `agentpc create ubuntu --open` (alias `--open-in-browser`). `create_vm` with `from_checkpoint: "<vm>/<label>"` (CLI `agentpc create --from <vm>/<label> --name <name>`) makes a new, independent VM from a checkpoint's disk: it boots cold, and the checkpoint's memory, port forwards, `offline` and job records are not carried over.
 
 Dated image tags (`…-YYYYMMDD`) select a published build and are download-only. An image push updates rolling tags but preserves existing dated tags; a refreshed rolling image can differ from its dated build. Publishers on different machines must serialize publication for a new date unless the registry enforces immutable tags.
 

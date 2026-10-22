@@ -12,9 +12,9 @@ can run `agentpc mcp-install` (or install first: see README.md).
 | Tool | Use |
 | --- | --- |
 | `list_vms` | VMs (owner, state, size, checkpoints, viewer and, for running x86apps VMs, `x86_tso`) and the images (with OS version) they come from. Start here. |
-| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?, open_in_browser?)` | New clone: ubuntu/arch ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready; `name` is up to 64 letters, digits, `.` `-` `_`. Retrying with the same `name` and image in the same session returns the VM it already made (booting it if stopped). `memory_gb` 2–64, `cpus` 1–16 (default 4). `offline` cuts off the internet. `open_in_browser: true` opens the ready VM’s viewer in the Mac’s default browser (default false; not a saved VM setting). A browser-launch failure warns without failing creation. |
+| `create_vm(os, version?, name?, memory_gb?, cpus?, offline?, open_in_browser?, from_checkpoint?)` | New clone: ubuntu/arch ~1 s, windows ~4 s (resumed from a snapshot). Returns when ready; `name` is up to 64 letters, digits, `.` `-` `_`. Retrying with the same `name` and image in the same session returns the VM it already made (booting it if stopped). `memory_gb` 2–64, `cpus` 1–16 (default 4). `offline` cuts off the internet. `open_in_browser: true` opens the ready VM’s viewer in the Mac’s default browser (default false; not a saved VM setting). A browser-launch failure warns without failing creation. `from_checkpoint: "<vm>/<label>"` makes a new, independent VM from that checkpoint's disk (the source may be running or stopped; `os` may then be omitted, and `os`/`version`, if given, must be the source's image): it boots cold (~15 s Ubuntu and Arch, ~25 s Windows), so `memory_gb`/`cpus` are free; the checkpoint's memory, port forwards, owner, `offline` and job records are not carried over (`list_jobs` starts empty), and deleting the source or the checkpoint later doesn't affect it. Retrying with the same `name` and `from_checkpoint` returns the VM already made. Errors before any work: `invalid_checkpoint_ref`, `no_such_vm`, `no_such_checkpoint`, `image_mismatch`. |
 | `start_vm` / `stop_vm` / `reset_vm` / `delete_vm` | Lifecycle. `reset_vm` = back to a clean install. |
-| `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save disk + memory before a risky step; restore in seconds; or drop one checkpoint. |
+| `checkpoint_vm(name, label)` / `restore_vm(name, label)` / `delete_checkpoint(name, label)` | Save disk + memory before a risky step; restore in seconds; or drop one checkpoint. On a running VM the guest first writes its pending data to disk (`sync`; `Write-VolumeCache` on Windows; at most ~10 s); if that fails the reply says "not flushed" and the checkpoint is still saved. A checkpoint is also where `create_vm(from_checkpoint)` starts new VMs. |
 | `take_screenshot(name, save_to?)` | Hypervisor screenshot; works even while booting or hung. `save_to` also writes the PNG to a Mac path. |
 | `run_command(name, command, timeout?, background?)` | Shell over SSH: PowerShell on windows, bash on ubuntu and arch. Returns a typed result (`structuredContent`, see "Running commands") plus the readable `exit code: N` / stdout / stderr text; each stream is trimmed to its first and last 10,000 characters. At a foreground run's `timeout` (default 120 s) agentpc attempts to stop it, and the reply says whether that was confirmed; `background: true` returns a job id you poll with `get_job_status`. |
 | `get_job_status(name, id, tail_lines?, wait_seconds?, cursor?)` | State of a background job (queued, running, exited with its code, stopped, ended without an exit code, or missing) plus its log, as a typed result. `wait_seconds` (0 by default, at most 30) waits without ever stopping the job; `cursor` reads the log incrementally. Also takes the `job_id` of a foreground run whose outcome was uncertain. See "Watching jobs". |
@@ -323,6 +323,14 @@ that act, it is marked destructive, and driver updates inside a VM stay blocked.
   create unless the user asks.
 - Don't create instances you won't use, and `delete_vm` your instances when done.
   Each running VM takes 4 GB (ubuntu, arch) or 8 GB (windows) of RAM.
+- To set something up once and start many VMs from it: set up your VM, `checkpoint_vm` it,
+  then `create_vm(from_checkpoint: "<vm>/<label>", name: ...)` for each new VM. Each one is
+  independent (its own disk, owner, size and `offline`), boots cold (Windows takes a normal
+  boot, not the seconds-long resume), and starts with no job records and no port forwards. It
+  keeps the image's guest identity (hostname, agentpc's SSH key). To reuse one VM per task
+  instead, `restore_vm` the checkpoint: that is fastest. Deleting a VM deletes its checkpoints,
+  so create from a checkpoint before deleting its source. CLI: `agentpc create --from
+  <vm>/<label> --name <name>`.
 - `create_vm ubuntu` downloads the Ubuntu image on first use (~1.2 GB); pass `version`
   (e.g. "22.04") for another release, or `version: "x86apps"` (`ubuntu-24.04-x86apps`; also
   "22.04-x86apps": x86apps is for 22.04 and 24.04 only) for Ubuntu that also runs x86 Linux programs (downloaded on first use, or built locally, ~8 min,
@@ -358,6 +366,7 @@ that act, it is marked destructive, and driver updates inside a VM stay blocked.
   `ci:` or `chore:`, then a short imperative subject; add a brief bullet body only if needed.
 - Rust, single binary `agentpc` (CLI + MCP server). `src/main.rs` is the CLI; modules:
   `instance` (VMs, images, on-disk layout), `qemu`, `ops` (lifecycle),
+  `guest` (guest scripts for the checkpoint flush and job-record cleanup),
   `viewer` (browser viewer), `image` (build/snapshot), `registry` (pull/push), `setup` (`doctor`, `mcp-install`, `clean`, `uninstall`), `update` (self-update), `mcp` (the server).
 - Ports derive from the instance slot n: SSH 47000+n, noVNC websocket 47200+n,
   VNC 47300+n; the shared browser viewer is on 8100.

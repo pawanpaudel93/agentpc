@@ -139,6 +139,9 @@
                     <code translate="no">--open</code> (alias <code translate="no">--open-in-browser</code>) opens the ready VM’s viewer in the Mac’s default browser (off by default). Browser-launch failure warns without failing creation. The default name is
                     <code translate="no">&lt;os&gt;-&lt;n&gt;</code>; a name is up to 64 letters, digits,
                     <code translate="no">.</code> <code translate="no">-</code> <code translate="no">_</code>.
+                    <code translate="no">--from &lt;vm&gt;/&lt;label&gt;</code> creates it from a checkpoint of another VM instead
+                    (the image is then optional and must be the source's; <code translate="no">--name</code> names it): a copy of
+                    the checkpoint's disk, booted cold; its memory, port forwards and job records are not carried over.
                   </td>
                 </tr>
                 <tr>
@@ -178,7 +181,7 @@
               <tbody>
                 <tr>
                   <td><code translate="no">agentpc checkpoint &lt;name&gt; &lt;label&gt;</code></td>
-                  <td>Save a VM's disk and memory under a label (letters, digits, <code translate="no">.</code> <code translate="no">-</code> <code translate="no">_</code>). A running VM pauses for a few seconds. <code translate="no">-d</code> / <code translate="no">--delete</code> deletes the checkpoint instead.</td>
+                  <td>Save a VM's disk and memory under a label (letters, digits, <code translate="no">.</code> <code translate="no">-</code> <code translate="no">_</code>). A running VM pauses for a few seconds. <code translate="no">-d</code> / <code translate="no">--delete</code> deletes the checkpoint instead. A running VM's guest first writes its pending data to disk; if it can't within ~10 s the reply says "not flushed".</td>
                 </tr>
                 <tr>
                   <td><code translate="no">agentpc restore &lt;name&gt; &lt;label&gt;</code></td>
