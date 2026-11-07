@@ -741,7 +741,60 @@ impl Qmp {
 
 #[cfg(test)]
 mod tests {
-    use super::tso_on_every_vcpu;
+    use super::{stop_before, tso_on_every_vcpu};
+    use std::cell::{Cell, RefCell};
+    use std::time::{Duration, Instant};
+
+    /// Runs `stop_before` against a fake VM; returns (stopped, commands sent, forced).
+    fn stop_with(
+        deadline: Instant,
+        obeys: &[&str],
+        dies_when_forced: bool,
+    ) -> (bool, Vec<String>, bool) {
+        let up = Cell::new(true);
+        let sent = RefCell::new(Vec::new());
+        let forced = Cell::new(false);
+        let stopped = stop_before(
+            deadline,
+            || up.get(),
+            |cmd, _| {
+                sent.borrow_mut().push(cmd.to_string());
+                if obeys.contains(&cmd) {
+                    up.set(false);
+                }
+                Ok(())
+            },
+            || {
+                forced.set(true);
+                if dies_when_forced {
+                    up.set(false);
+                }
+            },
+        );
+        (stopped, sent.into_inner(), forced.get())
+    }
+
+    #[test]
+    fn stop_asks_for_a_powerdown_first_and_forces_only_last() {
+        // Time to spare: a guest that powers off is never sent anything else.
+        let soon = Instant::now() + Duration::from_secs(30);
+        assert_eq!(
+            stop_with(soon, &["system_powerdown"], false),
+            (true, vec!["system_powerdown".to_string()], false)
+        );
+        // Under 12 s left: no time for a powerdown; quit, then force at 10 s before the end.
+        let start = Instant::now();
+        assert_eq!(
+            stop_with(start + Duration::from_secs(11), &[], true),
+            (true, vec!["quit".to_string()], true)
+        );
+        assert!(start.elapsed() < Duration::from_secs(3), "forced at ~1 s");
+        // Past every stage: forced at once, and a QEMU that survives it is reported.
+        assert_eq!(
+            stop_with(Instant::now() + Duration::from_millis(100), &[], false),
+            (false, vec![], true)
+        );
+    }
 
     #[test]
     fn hardware_tso_needs_every_vcpu() {
