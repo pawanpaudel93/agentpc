@@ -575,32 +575,35 @@ impl Instance {
 
     /// Our QEMU's pid, or `None` if the pid file is missing or stale. A stale file (the
     /// process is gone, or the pid was recycled by something that isn't our QEMU) is
-    /// removed, so an old pid can't make `running()` report a VM that isn't there.
+    /// removed, so an old pid can't make `running()` report a VM that isn't there. When `ps`
+    /// can't run, the answer is None but the file stays: the VM may well be ours.
     pub fn pid(&self) -> Option<i32> {
         let pid: i32 = read_trimmed(&self.pid_file()).ok()?.parse().ok()?;
         // SAFETY: signal 0 only checks that the process exists.
         let alive = unsafe { libc_kill(pid, 0) } == 0;
-        if alive && self.pid_is_our_qemu(pid) {
-            return Some(pid);
+        match alive.then(|| self.pid_is_our_qemu(pid)) {
+            Some(Some(true)) => return Some(pid),
+            Some(None) => return None,
+            None | Some(Some(false)) => {}
         }
         let _ = std::fs::remove_file(self.pid_file());
         None
     }
 
-    /// Confirm `pid` is a QEMU process launched for this instance (its argv names this
-    /// instance's dir), guarding signals against a recycled pid.
-    fn pid_is_our_qemu(&self, pid: i32) -> bool {
-        let Ok(out) = std::process::Command::new("ps")
+    /// Whether `pid` is a QEMU process launched for this instance (its argv names this
+    /// instance's dir), guarding signals against a recycled pid. None when `ps` can't run.
+    fn pid_is_our_qemu(&self, pid: i32) -> Option<bool> {
+        let out = std::process::Command::new("ps")
             .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
             .output()
-        else {
-            return false;
-        };
+            .ok()?;
         let cmd = String::from_utf8_lossy(&out.stdout);
         // The directory with its trailing slash: VM `a`'s path is a prefix of VM `ab`'s.
-        cmd.contains("qemu-system")
-            && (cmd.contains(&format!("{}/", self.dir.display()))
-                || cmd.contains(&*self.qmp_socket().to_string_lossy()))
+        Some(
+            cmd.contains("qemu-system")
+                && (cmd.contains(&format!("{}/", self.dir.display()))
+                    || cmd.contains(&*self.qmp_socket().to_string_lossy())),
+        )
     }
 
     pub fn running(&self) -> bool {
@@ -779,8 +782,10 @@ pub(crate) fn lock(path: &Path, waiting: Option<&str>) -> Result<std::fs::File> 
 
 /// Rename images from before their names carried the full version, and repoint their clones:
 /// `ubuntu.qcow2` → `ubuntu-24.04.qcow2`, and `windows.qcow2` or `windows-11.qcow2` →
-/// `windows-11-<release>.qcow2`. The release comes from the image's recorded info. Waits
-/// while such a clone is running: its disk is locked.
+/// `windows-11-<release>.qcow2`. The release comes from the image's recorded info. Skipped
+/// while such a clone is running (its disk is locked); a later start retries. Clones are
+/// repointed before the image is renamed, so a failed repoint leaves the old image in place
+/// and the next start finishes the job.
 pub fn migrate_legacy_images() -> Result<()> {
     for stem in ["ubuntu", "windows", "windows-11"] {
         let os: Os = stem.split('-').next().unwrap_or(stem).parse()?;
@@ -811,11 +816,7 @@ pub fn migrate_legacy_images() -> Result<()> {
         if clones.iter().any(|i| i.running()) {
             continue;
         }
-        for suffix in IMAGE_FILES {
-            if old(suffix).exists() {
-                std::fs::rename(old(suffix), image.file(suffix))?;
-            }
-        }
+        // `rebase -u` only rewrites the header, so it accepts a base renamed into place below.
         for inst in clones {
             let base = if inst.on_snapshot_base() {
                 image.snapshot_disk()
@@ -835,6 +836,11 @@ pub fn migrate_legacy_images() -> Result<()> {
                 bail!("repointing {} at {image} failed", inst.name);
             }
             std::fs::write(inst.dir.join("image"), image.to_string())?;
+        }
+        for suffix in IMAGE_FILES {
+            if old(suffix).exists() {
+                std::fs::rename(old(suffix), image.file(suffix))?;
+            }
         }
         crate::log!("renamed the {stem} image to {image}");
     }
