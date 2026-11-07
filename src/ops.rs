@@ -677,7 +677,8 @@ fn not_ready(e: anyhow::Error, inst: &Instance) -> anyhow::Error {
 /// Instance file recording the checkpoint a VM was made from (`<vm>/<label>`).
 const FROM_CHECKPOINT: &str = "from_checkpoint";
 /// Instance file present while the job records a VM's disk came with may still be in its
-/// guest. Every boot (`boot`) retries their deletion until it succeeds; a fresh disk
+/// guest. Every boot (`boot`) retries their deletion until it succeeds, and stops the VM when
+/// it fails (so no new job's records are there for the next try to delete); a fresh disk
 /// (`clone_disk`) removes it. `restore` does not run the cleanup (a later boot does), and a
 /// checkpoint of the VM taken while it is pending keeps those records.
 const RECORDS_PENDING: &str = "records-pending";
@@ -785,15 +786,23 @@ fn clear_pending_records(inst: &Instance) -> Result<()> {
     let from = created_from(inst)
         .map_or_else(|| "a checkpoint".to_string(), |f| format!("checkpoint {f}"));
     log!("{}: deleting the job records copied from {from}", inst.name);
-    clear_job_records(inst).map_err(|e| {
-        anyhow::anyhow!(
-            "{e:#}\nThe VM '{}' was made from {from} and is running, but agentpc could not \
-             delete the job records it copied from there, so list_jobs and get_job_status may \
-             still show the source's jobs. Starting it again (start_vm, or create_vm with the \
-             same name and from_checkpoint from the same session) retries; delete_vm removes it.",
-            inst.name
-        )
-    })?;
+    if let Err(e) = clear_job_records(inst) {
+        // Stop it: jobs started now would land in ~/agentpc-bg, which the retry deletes.
+        stop_forwards(inst);
+        let stopped = qemu::stop(inst);
+        viewer::stop_if_idle();
+        bail!(
+            "{e:#}\nThe VM '{}' was made from {from}, but agentpc could not delete the job \
+             records it copied from there, so it {}. Starting it again (start_vm, or create_vm \
+             with the same name and from_checkpoint from the same session) retries; delete_vm \
+             removes it.",
+            inst.name,
+            match stopped {
+                Ok(()) => "was stopped before anything new could run in it".to_string(),
+                Err(s) => format!("is being stopped, but stopping it failed ({s:#})"),
+            }
+        );
+    }
     std::fs::remove_file(&marker).with_context(|| {
         format!(
             "the job records copied from {from} were deleted, but agentpc could not remove its \
@@ -813,39 +822,48 @@ fn clear_job_records(inst: &Instance) -> Result<()> {
         Os::Windows => windows_command(crate::guest::WINDOWS_CLEAR_RECORDS),
         Os::Ubuntu | Os::Arch => crate::guest::LINUX_CLEAR_RECORDS.to_string(),
     };
-    let deadline = Instant::now() + RECORDS_LIMIT;
+    retry_cleanup(
+        &inst.name,
+        |left| ssh_within(inst, &cmd, left),
+        RECORDS_LIMIT,
+        RECORDS_RETRY_PAUSE,
+    )
+}
+
+/// `clear_job_records`' attempts: `run` gets the time left and returns the guest's answer, or
+/// None for no answer.
+fn retry_cleanup(
+    name: &str,
+    mut run: impl FnMut(Duration) -> Option<Output>,
+    limit: Duration,
+    pause: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + limit;
     let mut attempt = 1;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        let Some(out) = ssh_within(inst, &cmd, left) else {
+        let Some(out) = run(left) else {
             // An earlier attempt was answered: the guest is up but never confirmed.
             if attempt > 1 {
                 bail!(
                     "the guest did not confirm that its job records were deleted (after {attempt} \
                      attempts within {} s; the last got no answer)",
-                    RECORDS_LIMIT.as_secs()
+                    limit.as_secs()
                 );
             }
-            bail!(
-                "the guest did not answer within {} s",
-                RECORDS_LIMIT.as_secs()
-            );
+            bail!("the guest did not answer within {} s", limit.as_secs());
         };
         match records_cleared(&out) {
             Ok(()) => return Ok(()),
             Err(e)
                 if attempt >= RECORDS_ATTEMPTS
-                    || deadline.saturating_duration_since(Instant::now())
-                        <= RECORDS_RETRY_PAUSE =>
+                    || deadline.saturating_duration_since(Instant::now()) <= pause =>
             {
                 return Err(e.context(format!("after {attempt} attempts")));
             }
             Err(e) => {
-                log!(
-                    "{}: job-record cleanup not confirmed ({e:#}); retrying",
-                    inst.name
-                );
-                std::thread::sleep(RECORDS_RETRY_PAUSE);
+                log!("{name}: job-record cleanup not confirmed ({e:#}); retrying");
+                std::thread::sleep(pause);
                 attempt += 1;
             }
         }
@@ -2408,6 +2426,57 @@ mod tests {
         assert!(records_cleared(&output(0, "")).is_err(), "no proof");
         assert!(records_cleared(&output(1, "AGENTPC_CLEARED\n")).is_err());
         assert!(records_cleared(&output(0, "not AGENTPC_CLEARED\n")).is_err());
+    }
+
+    /// Runs `retry_cleanup` against scripted guest answers (None = no answer); returns its
+    /// result and how many attempts it made.
+    fn cleanup_against(answers: Vec<Option<std::process::Output>>) -> (Result<()>, usize) {
+        let mut answers = answers.into_iter();
+        let mut calls = 0;
+        let r = retry_cleanup(
+            "vm",
+            |_| {
+                calls += 1;
+                answers.next().expect("no more attempts expected")
+            },
+            Duration::from_secs(60),
+            Duration::from_millis(1),
+        );
+        (r, calls)
+    }
+
+    #[test]
+    fn the_cleanup_retries_a_guest_that_answers_without_confirming() {
+        let (r, calls) = cleanup_against(vec![
+            Some(output(1, "")),
+            Some(output(0, "")),
+            Some(output(0, "AGENTPC_CLEARED\n")),
+        ]);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn the_cleanup_gives_up_after_its_attempts_or_when_the_guest_goes_silent() {
+        let (r, calls) = cleanup_against(vec![Some(output(1, "")); RECORDS_ATTEMPTS as usize]);
+        let e = format!("{:#}", r.unwrap_err());
+        assert_eq!(calls, RECORDS_ATTEMPTS as usize);
+        assert!(
+            e.starts_with(&format!("after {RECORDS_ATTEMPTS} attempts")),
+            "{e}"
+        );
+        // No answer at all is not retried.
+        let (r, calls) = cleanup_against(vec![None]);
+        assert_eq!(calls, 1);
+        assert!(format!("{:#}", r.unwrap_err()).contains("did not answer"));
+        // Silence after an answer says the guest was up but never confirmed.
+        let (r, calls) = cleanup_against(vec![Some(output(1, "")), None]);
+        assert_eq!(calls, 2);
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(
+            e.contains("after 2 attempts") && e.contains("no answer"),
+            "{e}"
+        );
     }
 
     #[test]
