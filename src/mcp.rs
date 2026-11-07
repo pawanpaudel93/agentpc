@@ -401,7 +401,16 @@ impl Gateway {
         if keep_running {
             return;
         }
-        let names: Vec<String> = self.owned.lock().unwrap().iter().cloned().collect();
+        // Every VM carrying this session's tag too: a create_vm without a name whose client
+        // disconnected mid-create never got its generated name into `owned`.
+        let mut names: std::collections::BTreeSet<String> =
+            self.owned.lock().unwrap().iter().cloned().collect();
+        names.extend(
+            Instance::list()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|i| i.name),
+        );
         // Only VMs still ours: another session may have taken one over since (its owner tag
         // then names that session).
         let mine = format!("[{}]", self.session_id);
@@ -2579,10 +2588,18 @@ fn cancel_script(os: Os, id: u64, cause: execution::StopCause) -> String {
     }
 }
 
+/// 10 bits drawn at random once per process (std seeds `RandomState` from the OS). Not the
+/// pid's low bits: two servers whose pids match mod 1024 would share those every time.
+fn process_bits() -> u64 {
+    use std::hash::BuildHasher;
+    static BITS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| std::collections::hash_map::RandomState::new().hash_one(0u8) & 0x3ff)
+}
+
 /// A background job's id, unique in the VM: two jobs sharing one would share their script,
-/// log and exit files. The time in milliseconds, times 1024, plus the low bits of this
-/// process's id (another MCP server may start one in the same millisecond); within this
-/// process each id is above the last.
+/// log and exit files. The time in milliseconds, times 1024, plus this process's random bits
+/// (another MCP server may start one in the same millisecond); within this process each id
+/// is above the last.
 fn job_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST: AtomicU64 = AtomicU64::new(0);
@@ -2590,7 +2607,7 @@ fn job_id() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let candidate = (now << 10) | u64::from(std::process::id() & 0x3ff);
+    let candidate = (now << 10) | process_bits();
     let next = |last: u64| {
         if candidate > last {
             candidate
@@ -3820,8 +3837,8 @@ mod tests {
     fn job_ids_never_repeat() {
         let ids: Vec<u64> = (0..1000).map(|_| super::job_id()).collect();
         assert!(ids.windows(2).all(|w| w[1] > w[0]));
-        // Each keeps this process's bits, which another server's ids don't share.
-        let me = u64::from(std::process::id() & 0x3ff);
+        // Each keeps this process's random bits.
+        let me = super::process_bits();
         assert!(ids.iter().all(|id| id & 0x3ff == me));
     }
 
