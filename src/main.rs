@@ -301,6 +301,18 @@ fn main() {
     }
 }
 
+/// `create --from <vm>/<label> copy`: a lone word that names no image is the new VM's name, so
+/// it isn't refused as an image that doesn't match the checkpoint's.
+fn checkpoint_args(
+    image: Option<String>,
+    name: Option<String>,
+) -> (Option<String>, Option<String>) {
+    match (image, name) {
+        (Some(word), None) if Image::resolve(&word).is_err() => (None, Some(word)),
+        args => args,
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Create {
@@ -315,15 +327,18 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             let name = name.or(name_flag);
             let made = match from {
-                Some(from) => ops::create_from_checkpoint(
-                    &ops::CheckpointRef::parse(&from)?,
-                    image.as_deref(),
-                    name.as_deref(),
-                    memory,
-                    cpus,
-                    offline,
-                    None,
-                ),
+                Some(from) => {
+                    let (image, name) = checkpoint_args(image, name);
+                    ops::create_from_checkpoint(
+                        &ops::CheckpointRef::parse(&from)?,
+                        image.as_deref(),
+                        name.as_deref(),
+                        memory,
+                        cpus,
+                        offline,
+                        None,
+                    )
+                }
                 None => {
                     let image = image.context(
                         "an image is required (ubuntu, windows, arch, ...) unless --from is given",
@@ -598,5 +613,19 @@ mod cli_tests {
             panic!("not create")
         };
         assert_eq!(name_flag.as_deref(), Some("vm1"));
+    }
+
+    #[test]
+    fn with_from_a_lone_word_that_is_no_image_is_the_name() {
+        use super::checkpoint_args;
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(checkpoint_args(s("copy"), None), (None, s("copy")));
+        // An image stays an image (checked against the source), as does a word next to a name.
+        assert_eq!(checkpoint_args(s("ubuntu"), None), (s("ubuntu"), None));
+        assert_eq!(
+            checkpoint_args(s("ubuntu-22.04"), s("copy")),
+            (s("ubuntu-22.04"), s("copy"))
+        );
+        assert_eq!(checkpoint_args(None, s("copy")), (None, s("copy")));
     }
 }

@@ -1119,38 +1119,11 @@ fn validate_source(source: &Instance, label: &str, want_image: Option<&str>) -> 
     Ok(dir)
 }
 
-/// The backing file a qcow2 disk records (relative to the disk's directory), or None for a
-/// standalone disk.
-fn qcow2_backing(path: &Path) -> Result<Option<String>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut h = [0u8; 20];
-    f.read_exact(&mut h)
-        .with_context(|| format!("read the qcow2 header of {}", path.display()))?;
-    if &h[0..4] != b"QFI\xfb" {
-        bail!("{} is not a qcow2 disk", path.display());
-    }
-    let offset = u64::from_be_bytes(h[8..16].try_into()?);
-    let size = u32::from_be_bytes(h[16..20].try_into()?);
-    if offset == 0 || size == 0 {
-        return Ok(None);
-    }
-    if size > 1023 {
-        bail!("{} names a backing file of {size} bytes", path.display());
-    }
-    let mut name = vec![0u8; size as usize];
-    f.seek(SeekFrom::Start(offset))
-        .and_then(|_| f.read_exact(&mut name))
-        .with_context(|| format!("read the backing file name of {}", path.display()))?;
-    Ok(Some(
-        String::from_utf8(name).context("the backing file name is not UTF-8")?,
-    ))
-}
-
 /// Clone checkpoint `cp`'s disk and firmware vars into a new instance (`fs::copy` is an APFS
 /// clone here), owner-writable. The disk keeps its relative backing path
-/// (`../../images/<base>`), which resolves from the instance directory; that is checked. No
-/// resume marker: a VM made from a checkpoint always boots cold.
+/// (`../../images/<base>`), which resolves from the instance directory; that base stays, since
+/// the source VM still uses it and images aren't replaced while VMs use them. No resume
+/// marker: a VM made from a checkpoint always boots cold.
 fn clone_checkpoint_files(cp: &Path, inst: &Instance) -> Result<()> {
     let (disk, vars) = (cp.join("disk.qcow2"), cp.join("vars.fd"));
     if !(disk.is_file() && vars.is_file()) {
@@ -1162,11 +1135,6 @@ fn clone_checkpoint_files(cp: &Path, inst: &Instance) -> Result<()> {
     set_writable(&inst.disk())?;
     std::fs::copy(&vars, inst.vars()).context("copy the checkpoint's firmware vars")?;
     set_writable(&inst.vars())?;
-    if let Some(backing) = qcow2_backing(&inst.disk())?
-        && !inst.dir.join(&backing).is_file()
-    {
-        bail!("the checkpoint's disk is backed by {backing}, which is missing");
-    }
     std::fs::write(inst.dir.join("base"), "checkpoint")?;
     Ok(())
 }
@@ -2254,27 +2222,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_a_qcow2_backing_file_name() {
-        let root = shutdown_fixture();
-        fake_qcow2(&root.join("a.qcow2"), Some("../../images/x.qcow2"));
-        fake_qcow2(&root.join("b.qcow2"), None);
-        std::fs::write(root.join("c.raw"), vec![0u8; 64]).unwrap();
-        assert_eq!(
-            qcow2_backing(&root.join("a.qcow2")).unwrap().as_deref(),
-            Some("../../images/x.qcow2")
-        );
-        assert_eq!(qcow2_backing(&root.join("b.qcow2")).unwrap(), None);
-        assert!(qcow2_backing(&root.join("c.raw")).is_err());
-        // A backing name past the end of a truncated disk is refused with a reason.
-        let mut cut = std::fs::read(root.join("a.qcow2")).unwrap();
-        cut.truncate(512);
-        std::fs::write(root.join("d.qcow2"), cut).unwrap();
-        let e = format!("{:#}", qcow2_backing(&root.join("d.qcow2")).unwrap_err());
-        assert!(e.contains("read the backing file name of"), "{e}");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn clones_a_checkpoint_into_a_new_instance_that_boots_cold() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let (root, _source, new, cp) = checkpoint_fixture();
@@ -2296,23 +2243,12 @@ mod tests {
             std::fs::metadata(cp.join("disk.qcow2")).unwrap().ino(),
             "a copy, not the checkpoint's own file"
         );
-        let backing = qcow2_backing(&new.disk()).unwrap().unwrap();
-        assert!(new.dir.join(&backing).is_file(), "{backing} resolves");
         assert!(!new.resume_marker().exists());
         assert!(!new.dir.join("tz").exists());
         assert_eq!(
             std::fs::read_to_string(new.dir.join("base")).unwrap(),
             "checkpoint"
         );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn a_checkpoint_whose_backing_file_is_gone_is_refused() {
-        let (root, _source, new, cp) = checkpoint_fixture();
-        std::fs::remove_file(root.join("images/ubuntu-24.04.qcow2")).unwrap();
-        let e = format!("{:#}", clone_checkpoint_files(&cp, &new).unwrap_err());
-        assert!(e.contains("missing"), "{e}");
         std::fs::remove_dir_all(root).unwrap();
     }
 
