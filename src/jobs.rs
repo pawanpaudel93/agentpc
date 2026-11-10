@@ -113,6 +113,23 @@ pub enum JobState {
 }
 
 impl JobState {
+    /// The guest scripts' wire name for a state (the same snake_case the JSON uses). One
+    /// table for `get_job_status` and `list_jobs`, so a new state can't be parsed by one and
+    /// rejected by the other.
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "queued" => JobState::Queued,
+            "running" => JobState::Running,
+            "exited" => JobState::Exited,
+            "stopped" => JobState::Stopped,
+            "ended" => JobState::Ended,
+            "not_started" => JobState::NotStarted,
+            "missing" => JobState::Missing,
+            "unknown" => JobState::Unknown,
+            _ => return None,
+        })
+    }
+
     fn terminal(self) -> bool {
         matches!(
             self,
@@ -725,17 +742,7 @@ pub fn parse_report(out: &[u8]) -> Result<GuestReport, String> {
         let num = |v: &str| v.parse::<u64>().map_err(|_| format!("bad {key} '{v}'"));
         match key {
             "state" => {
-                state = Some(match val {
-                    "queued" => JobState::Queued,
-                    "running" => JobState::Running,
-                    "exited" => JobState::Exited,
-                    "stopped" => JobState::Stopped,
-                    "ended" => JobState::Ended,
-                    "not_started" => JobState::NotStarted,
-                    "missing" => JobState::Missing,
-                    "unknown" => JobState::Unknown,
-                    other => return Err(format!("unknown state '{other}'")),
-                })
+                state = Some(JobState::parse(val).ok_or_else(|| format!("unknown state '{val}'"))?)
             }
             "kind" => {
                 r.kind = Some(match val {
@@ -2056,17 +2063,8 @@ pub fn parse_list_report(out: &[u8], q: &ListQuery) -> Result<GuestList, String>
                     }
                     "state" => {
                         state_seen = true;
-                        e.state = match val {
-                            "queued" => JobState::Queued,
-                            "running" => JobState::Running,
-                            "exited" => JobState::Exited,
-                            "stopped" => JobState::Stopped,
-                            "ended" => JobState::Ended,
-                            "not_started" => JobState::NotStarted,
-                            "missing" => JobState::Missing,
-                            "unknown" => JobState::Unknown,
-                            other => return Err(format!("unknown state '{other}'")),
-                        }
+                        e.state =
+                            JobState::parse(val).ok_or_else(|| format!("unknown state '{val}'"))?
                     }
                     // A bad exit code degrades this job only (see `finish`): one malformed
                     // record must not make the page unreadable and hide the older jobs.
@@ -2580,6 +2578,18 @@ pub fn windows_list_script_with(q: &ListQuery, names: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_state_parse_matches_the_json_names() {
+        use JobState::*;
+        for st in [
+            Queued, Running, Exited, Stopped, Ended, NotStarted, Missing, Unknown,
+        ] {
+            let name = serde_json::to_value(st).unwrap();
+            assert_eq!(JobState::parse(name.as_str().unwrap()), Some(st));
+        }
+        assert_eq!(JobState::parse("exploded"), None);
+    }
 
     fn req(cursor: Option<Resume>) -> Request {
         Request::new("vm", 7, 50, Duration::ZERO, cursor, "1:2:3:4".into())

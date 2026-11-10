@@ -149,20 +149,13 @@ pub fn start_windows_installer(inst: &Instance, extra: &[String]) -> Result<()> 
 pub fn start_resumed(inst: &Instance, state: &Path) -> Result<()> {
     launch(inst, &[], Some(state), false)?;
     let mut q = Qmp::connect(inst)?;
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        let st = q.execute("query-migrate", None)?;
-        match st["status"].as_str().unwrap_or("") {
-            "completed" => break,
-            "failed" | "cancelled" => bail!(
-                "restoring {} failed: {}",
-                inst.name,
-                st["error-desc"].as_str().unwrap_or("unknown error")
-            ),
-            _ if Instant::now() > deadline => bail!("restoring {} timed out", inst.name),
-            _ => std::thread::sleep(Duration::from_millis(20)),
-        }
-    }
+    wait_for_migration(
+        inst,
+        &mut q,
+        "restoring",
+        Duration::from_secs(120),
+        Duration::from_millis(20),
+    )?;
     // The snapshot was taken paused, so the restored VM stays paused until told.
     q.execute("cont", None)?;
     Ok(())
@@ -205,28 +198,67 @@ fn pause_and_save(inst: &Instance, q: &mut Qmp, out: &Path) -> Result<()> {
         "migrate",
         Some(json!({ "uri": format!("file:{}", out.display()) })),
     )?;
-    let deadline = Instant::now() + Duration::from_secs(600);
-    loop {
-        let st = q.execute("query-migrate", None)?;
-        match st["status"].as_str().unwrap_or("") {
-            "completed" => {
-                // Record the machine type so this state resumes on the same machine: the one
-                // this VM runs on, not the current default.
-                let machine = std::fs::read_to_string(inst.dir.join("machine"))
-                    .ok()
-                    .map(|m| m.trim().to_string())
-                    .filter(|m| !m.is_empty())
-                    .unwrap_or_else(machine_type);
-                std::fs::write(machine_sidecar(out), machine)?;
-                return Ok(());
-            }
-            "failed" | "cancelled" => bail!(
-                "saving {} failed: {}",
-                inst.name,
-                st["error-desc"].as_str().unwrap_or("unknown error")
+    wait_for_migration(
+        inst,
+        q,
+        "saving",
+        Duration::from_secs(600),
+        Duration::from_millis(100),
+    )?;
+    // Record the machine type so this state resumes on the same machine: the one this VM
+    // runs on, not the current default.
+    let machine = std::fs::read_to_string(inst.dir.join("machine"))
+        .ok()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(machine_type);
+    std::fs::write(machine_sidecar(out), machine)?;
+    Ok(())
+}
+
+/// Where a QEMU migration (`query-migrate`) stands. QEMU has many in-flight statuses
+/// (`setup`, `active`, `device`, …); agentpc only needs to know whether to keep waiting.
+#[derive(Debug, PartialEq, Eq)]
+enum Migration {
+    Completed,
+    /// `failed` or `cancelled`, with QEMU's `error-desc`.
+    Failed(String),
+    InProgress,
+}
+
+impl Migration {
+    fn from_reply(reply: &Value) -> Self {
+        match reply["status"].as_str().unwrap_or("") {
+            "completed" => Migration::Completed,
+            "failed" | "cancelled" => Migration::Failed(
+                reply["error-desc"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_string(),
             ),
-            _ if Instant::now() > deadline => bail!("saving {} timed out", inst.name),
-            _ => std::thread::sleep(Duration::from_millis(100)),
+            _ => Migration::InProgress,
+        }
+    }
+}
+
+/// Poll `query-migrate` until the migration completes; `what` names it in errors
+/// ("saving vm failed: …", "restoring vm timed out").
+fn wait_for_migration(
+    inst: &Instance,
+    q: &mut Qmp,
+    what: &str,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match Migration::from_reply(&q.execute("query-migrate", None)?) {
+            Migration::Completed => return Ok(()),
+            Migration::Failed(why) => bail!("{what} {} failed: {why}", inst.name),
+            Migration::InProgress if Instant::now() > deadline => {
+                bail!("{what} {} timed out", inst.name)
+            }
+            Migration::InProgress => std::thread::sleep(poll),
         }
     }
 }
@@ -550,20 +582,43 @@ fn wait_until(running: &impl Fn() -> bool, deadline: Instant) -> bool {
     true
 }
 
-/// QMP run state ("running", "paused", "postmigrate", "io-error", …), or `None` if the VM
-/// isn't up. Exposed for callers that report state (e.g. `list_json`).
-pub fn status(inst: &Instance) -> Option<String> {
+/// A live VM's QEMU run state (`query-status`). Only `running` means the guest is executing;
+/// every other state (`paused`, `postmigrate` or `io-error` left by an interrupted
+/// checkpoint, …) is one `resume_if_paused` continues from. QEMU's own name is kept, so
+/// `list` shows exactly what QEMU reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunState {
+    Running,
+    Halted(String),
+}
+
+impl RunState {
+    fn parse(status: &str) -> Self {
+        match status {
+            "running" => RunState::Running,
+            other => RunState::Halted(other.to_string()),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            RunState::Running => "running",
+            RunState::Halted(s) => s,
+        }
+    }
+}
+
+/// The VM's QMP run state, or `None` if the VM isn't up (or QMP didn't answer).
+pub fn status(inst: &Instance) -> Option<RunState> {
     let mut q = Qmp::connect(inst).ok()?;
     let r = q.execute("query-status", None).ok()?;
-    r["status"].as_str().map(String::from)
+    r["status"].as_str().map(RunState::parse)
 }
 
 /// Resume a VM that's up but not running — paused, `postmigrate`, or `io-error` left by an
 /// interrupted checkpoint. Best-effort.
 pub fn resume_if_paused(inst: &Instance) {
-    if let Some(st) = status(inst)
-        && st != "running"
-    {
+    if let Some(RunState::Halted(_)) = status(inst) {
         let _ = Qmp::connect(inst).and_then(|mut q| q.execute("cont", None));
     }
 }
@@ -741,7 +796,37 @@ impl Qmp {
 
 #[cfg(test)]
 mod tests {
-    use super::{stop_before, tso_on_every_vcpu};
+
+    #[test]
+    fn migration_status_maps_to_wait_or_stop() {
+        let m = |v: Value| Migration::from_reply(&v);
+        assert_eq!(m(json!({"status": "completed"})), Migration::Completed);
+        assert_eq!(
+            m(json!({"status": "failed", "error-desc": "disk full"})),
+            Migration::Failed("disk full".into())
+        );
+        assert_eq!(
+            m(json!({"status": "cancelled"})),
+            Migration::Failed("unknown error".into())
+        );
+        for busy in ["setup", "active", "device", "pre-switchover", ""] {
+            assert_eq!(m(json!({"status": busy})), Migration::InProgress, "{busy}");
+        }
+        assert_eq!(m(json!({})), Migration::InProgress);
+    }
+
+    #[test]
+    fn run_state_keeps_qemus_name() {
+        assert_eq!(RunState::parse("running"), RunState::Running);
+        for halted in ["paused", "postmigrate", "io-error", "inmigrate"] {
+            let st = RunState::parse(halted);
+            assert!(matches!(st, RunState::Halted(_)), "{halted}");
+            assert_eq!(st.as_str(), halted);
+        }
+        assert_eq!(RunState::Running.as_str(), "running");
+    }
+    use super::{Migration, RunState, stop_before, tso_on_every_vcpu};
+    use serde_json::{Value, json};
     use std::cell::{Cell, RefCell};
     use std::time::{Duration, Instant};
 

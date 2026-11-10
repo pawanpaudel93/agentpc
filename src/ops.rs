@@ -1483,6 +1483,17 @@ pub fn delete(inst: &Instance) -> Result<String> {
     Ok(format!("removed {}", inst.name))
 }
 
+/// A VM's state as `list` and `list_vms` report it: `stopped` when no QEMU process is up,
+/// otherwise QEMU's run state (`running`, or e.g. `paused` after an interrupted checkpoint,
+/// which the next start resumes). `running` when QMP doesn't answer, as the process is up.
+/// One function for the table and the JSON, so the CLI and agents never disagree.
+fn vm_state(i: &Instance) -> String {
+    if !i.running() {
+        return "stopped".to_string();
+    }
+    qemu::status(i).map_or_else(|| "running".to_string(), |s| s.as_str().to_string())
+}
+
 /// VMs and images as JSON: `agentpc list --json` and the MCP `list_vms` tool.
 pub fn list_json() -> Result<String> {
     use serde_json::json;
@@ -1495,7 +1506,7 @@ pub fn list_json() -> Result<String> {
                 "name": i.name,
                 "os": i.os,
                 "image": i.image.to_string(),
-                "state": if running { qemu::status(i).unwrap_or_else(|| "running".into()) } else { "stopped".to_string() },
+                "state": vm_state(i),
                 "slot": i.slot,
                 "memory_gb": memory_gb,
                 "cpus": cpus,
@@ -1542,17 +1553,16 @@ pub fn list_json() -> Result<String> {
 
 pub fn list_table() -> Result<String> {
     let mut s = format!(
-        "{:<14} {:<22} {:<5} {:<8} {}\n",
+        "{:<14} {:<22} {:<5} {:<11} {}\n",
         "NAME", "IMAGE", "SLOT", "STATE", "VIEWER"
     );
     for i in Instance::list()? {
-        let state = if i.running() { "running" } else { "stopped" };
         s += &format!(
-            "{:<14} {:<22} {:<5} {:<8} {}\n",
+            "{:<14} {:<22} {:<5} {:<11} {}\n",
             i.name,
             i.image,
             i.slot,
-            state,
+            vm_state(&i),
             viewer::url(&i)
         );
     }
